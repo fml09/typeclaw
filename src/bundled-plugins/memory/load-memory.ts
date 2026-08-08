@@ -2,6 +2,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
+import { defuseRuntimeMarkers } from '@/agent/tools/runtime-notice'
 
 import { firstBeliefSentence, isTitleLikeHeading } from './belief-sentence'
 import { buildInjectionPlan, type InjectionPlan } from './injection-plan'
@@ -92,11 +93,11 @@ export function renderDedupedRetrievedMemorySection(entries: DedupedRetrievedIte
   if (entries.length === 0) return ''
   const lines = ['# Memory', '', MEMORY_FRAMING, '']
   for (const { item, changed } of entries) {
-    lines.push(`## ${item.heading}`)
+    lines.push(`## ${defuseRuntimeMarkers(item.heading)}`)
     if (changed) {
       const provenance = renderProvenanceLine(item)
       if (provenance !== null) lines.push(provenance)
-      lines.push(item.excerpt.trimEnd(), '')
+      lines.push(defuseRuntimeMarkers(item.excerpt.trimEnd()), '')
     } else {
       lines.push(unchangedRetrievedItemReference(item), '')
     }
@@ -129,10 +130,10 @@ export function renderRetrievedMemorySection(
   const lines = isChannel ? ['# Memory', '', ...CHANNEL_MEMORY_PREAMBLE, ''] : ['# Memory', '', MEMORY_FRAMING, '']
   for (const item of items) {
     if (!isChannel) {
-      lines.push(`## ${item.heading}`)
+      lines.push(`## ${defuseRuntimeMarkers(item.heading)}`)
       const provenance = renderProvenanceLine(item)
       if (provenance !== null) lines.push(provenance)
-      lines.push(item.excerpt.trimEnd(), '')
+      lines.push(defuseRuntimeMarkers(item.excerpt.trimEnd()), '')
     } else if (item.source === 'topic') {
       lines.push(channelTopicEntry(item.heading, item.key, item.excerpt))
     } else if (item.source === 'reference') {
@@ -140,7 +141,7 @@ export function renderRetrievedMemorySection(
     } else {
       const provenance = renderProvenanceLine(item)
       const suffix = provenance === null ? '' : ` ${provenance}`
-      lines.push(`- ${item.heading} _(recent observation)_${suffix}`)
+      lines.push(defuseRuntimeMarkers(`- ${item.heading} _(recent observation)_${suffix}`))
     }
   }
   return lines.join('\n').trimEnd()
@@ -178,7 +179,7 @@ function topicIndexEntry(heading: string, slug: string): string {
   if (slugIsHeadingEcho(heading, slug)) {
     return `- \`${slug}\``
   }
-  return `- ${heading} \`${slug}\``
+  return defuseRuntimeMarkers(`- ${heading} \`${slug}\``)
 }
 
 // Channel turns show headings only (memory-bleed defense). That is safe ONLY when
@@ -190,7 +191,7 @@ function topicIndexEntry(heading: string, slug: string): string {
 function channelTopicEntry(heading: string, slug: string, body: string): string {
   if (!isTitleLikeHeading(heading, slug)) return topicIndexEntry(heading, slug)
   const belief = firstBeliefSentence(body)
-  return belief === undefined ? topicIndexEntry(heading, slug) : `- ${belief} \`${slug}\``
+  return belief === undefined ? topicIndexEntry(heading, slug) : defuseRuntimeMarkers(`- ${belief} \`${slug}\``)
 }
 
 function topicIndexDirective(): string {
