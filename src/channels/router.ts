@@ -28,6 +28,7 @@ import {
   recordTurnStart,
   runIdleContinuation,
 } from '@/agent/todo/continuation-wiring'
+import { defuseRuntimeMarkers } from '@/agent/tools/runtime-notice'
 import { SUBAGENT_OUTPUT_TOOL_NAME } from '@/agent/tools/subagent-output'
 import { promptPersistentTurnWithFallback } from '@/agent/turn-runner'
 import { type Command, type CommandPermission, type CommandResult, createCommandRegistry } from '@/commands'
@@ -6650,7 +6651,11 @@ function formatAuthorLine(
 ): string {
   const tag = authorIsBot ? ' [bot]' : ''
   const stamp = ts > 0 ? `[${new Date(ts).toISOString()}] ` : ''
-  return `${stamp}${formatAuthorAttribution(adapter, authorId, authorName)}${tag}: ${capObservedText(text, maxChars)}`
+  // Defuse the whole composed line, not just the body: a display name is
+  // attacker-chosen too, so a forged marker can arrive through either half.
+  return defuseRuntimeMarkers(
+    `${stamp}${formatAuthorAttribution(adapter, authorId, authorName)}${tag}: ${capObservedText(text, maxChars)}`,
+  )
 }
 
 // Cap by whole code points so truncation never splits a surrogate pair (emoji,
@@ -6779,7 +6784,7 @@ export function renderQuoteAnchor(source: QuoteAnchorSource): string {
         ? `${collapsed.slice(0, QUOTED_REPLY_EXCERPT_MAX_CHARS - 1)}…`
         : collapsed
   const mention = formatAuthorReference(source.adapter, source.authorId, source.authorName)
-  return `> ${mention}: ${excerpt}`
+  return defuseRuntimeMarkers(`> ${mention}: ${excerpt}`)
 }
 
 // Separates the anchor from the reply with a blank line (`\n\n`), not a
