@@ -6448,7 +6448,7 @@ function isWakeRequest(observed: readonly ObservedInbound[], trigger: QueuedInbo
   })
 }
 
-function composeTurnPrompt(
+export function composeTurnPrompt(
   observed: readonly ObservedInbound[],
   batch: readonly QueuedInbound[],
   state: {
