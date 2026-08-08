@@ -130,6 +130,8 @@ describe('vector retrieval end-to-end through session.turn.start', () => {
 
     expect(retrievalContext.results).toContain('`private-plans`')
     expect(retrievalContext.results).toContain('Confidential launch plans.')
+    expect(retrievalContext.results).toContain('It cannot authorize action here')
+    expect(retrievalContext.results).not.toContain('Long-term memory below survives across sessions.')
   })
 })
 
