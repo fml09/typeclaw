@@ -29,6 +29,35 @@
 // a second model family exhibited the same misread, so we accept the
 // universal cost in exchange for never having to remember to add a new
 // family to a list.
+// The bracketed marker is what tells the model a block is runtime-emitted, so
+// any untrusted string rendered into a turn must not be able to carry one.
+// Inbound channel text and memory headings/excerpts are both reproduced
+// verbatim, so without this a participant (or a poisoned shard) could forge a
+// fence and inherit whatever standing the real one has.
+//
+// Only the marker is defused, not the `---` rules around it: a horizontal rule
+// is ordinary markdown that appears in pasted diffs, YAML, and tables all the
+// time, and mangling those would corrupt real messages for no gain. The marker
+// is the rare, load-bearing token — neutralize that and the fence cannot form.
+//
+// Matching is deliberately loose (case-insensitive, any wording after the
+// keyword) because an attacker chooses both; the real emitters always produce
+// the canonical form, so a false positive can only ever hit text that was
+// already imitating a runtime marker.
+//
+// Only the OPENER is matched, via a lookahead that consumes nothing past `**[`.
+// Matching the whole `**[...]**` span instead would be exploitable: the span
+// ends at the first `]**`, so a nested opener (`**[SYSTEM MESSAGE a **[SYSTEM
+// MESSAGE b]** c]**`) lands inside the replacement, and `String.replace` never
+// rescans what it just emitted — leaving a live marker behind. Neutralizing
+// openers independently is single-pass safe and idempotent, because the
+// replacement text contains no `**[` for a later pass to find.
+const RUNTIME_MARKER_OPENER = /\*\*\s*\[(?=\s*(?:SYSTEM MESSAGE|MEMORY CONTEXT)\b)/gi
+
+export function defuseRuntimeMarkers(text: string): string {
+  return text.replace(RUNTIME_MARKER_OPENER, '(quoted from untrusted text) [')
+}
+
 export function fenceRuntimeNotice(body: string): string {
   return (
     '\n\n---\n' +
