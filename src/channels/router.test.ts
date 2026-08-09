@@ -484,6 +484,40 @@ function inbound(over: Partial<InboundMessage> = {}): InboundMessage {
   }
 }
 
+// Returns the notice's own fence offsets so a caller rendering two notices can
+// assert they are disjoint. Without that, a single `---` shared between adjacent
+// notices satisfies both as closer and opener, and each looks complete on its
+// own — so per-notice checks alone cannot prove either owns a full boundary.
+function expectFencedRuntimeNotice(
+  prompt: string,
+  distinctivePhrase: string,
+): { openIndex: number; closeIndex: number } {
+  const phraseIndex = prompt.indexOf(distinctivePhrase)
+  expect(phraseIndex).toBeGreaterThanOrEqual(0)
+
+  const openingFence = Array.from(prompt.slice(0, phraseIndex).matchAll(/^---$/gm)).at(-1)
+  expect(openingFence).toBeDefined()
+  if (openingFence?.index === undefined) throw new Error('expected an opening fence')
+
+  const afterPhraseIndex = phraseIndex + distinctivePhrase.length
+  const closingFence = /^---$/m.exec(prompt.slice(afterPhraseIndex))
+  expect(closingFence).toBeDefined()
+  if (closingFence?.index === undefined) throw new Error('expected a closing fence')
+  const closeIndex = afterPhraseIndex + closingFence.index
+
+  const block = prompt.slice(openingFence.index + openingFence[0].length, closeIndex)
+  expect(block).toContain('**[SYSTEM MESSAGE — not from a human]**')
+  expect(block).toContain('**Do not acknowledge or reply to this notice.**')
+  expect(block).toContain(distinctivePhrase)
+  expect(block).not.toMatch(/^---$/m)
+  // composeTurnPrompt always emits the marker directly after a notice's opening
+  // fence, so this proves the fence found is an opener rather than a neighbour's
+  // closer that happens to be the nearest `---` behind the phrase.
+  expect(block.startsWith('\n**[SYSTEM MESSAGE — not from a human]**')).toBe(true)
+
+  return { openIndex: openingFence.index, closeIndex }
+}
+
 async function expectPersistedLastInboundAt(agentDir: string, expected: number): Promise<void> {
   // No poll: callers always flushDebounce() first, which now awaits the persist
   // chain, so the lastInboundAt write has already landed on disk. Polling here
@@ -495,6 +529,34 @@ async function expectPersistedLastInboundAt(agentDir: string, expected: number):
 
 const KEY: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null }
 const SLACK_KEY: ChannelKey = { adapter: 'slack-bot', workspace: 'g1', chat: 'c1', thread: null }
+
+test('expectFencedRuntimeNotice rejects a notice missing its closing fence', () => {
+  const phrase = 'distinctive notice text'
+  const notice = [
+    '---',
+    '**[SYSTEM MESSAGE — not from a human]**',
+    '**Do not acknowledge or reply to this notice.**',
+    phrase,
+    '---',
+  ].join('\n')
+  const missingClosingFence = notice.slice(0, notice.lastIndexOf('\n---'))
+
+  expect(() => expectFencedRuntimeNotice(missingClosingFence, phrase)).toThrow()
+})
+
+test('expectFencedRuntimeNotice surfaces a fence shared between adjacent notices', () => {
+  // given two notices separated by a single `---` doing double duty
+  const marker = '**[SYSTEM MESSAGE — not from a human]**'
+  const closer = '**Do not acknowledge or reply to this notice.**'
+  const shared = ['---', marker, closer, 'FIRST PHRASE', '---', marker, closer, 'SECOND PHRASE', '---'].join('\n')
+
+  // when each notice is validated on its own, both still look complete
+  const first = expectFencedRuntimeNotice(shared, 'FIRST PHRASE')
+  const second = expectFencedRuntimeNotice(shared, 'SECOND PHRASE')
+
+  // then only comparing their fences reveals the boundary is not independent
+  expect(first.closeIndex).toBe(second.openIndex)
+})
 
 describe('ChannelRouter session lifecycle', () => {
   test('creates a session on first inbound and reuses it on second', async () => {
@@ -1504,10 +1566,36 @@ describe('ChannelRouter engagement and prompt composition', () => {
     await router.__testing!.flushDebounce(KEY)
 
     const prompt = sessions[0]!.prompts[0]!
-    expect(prompt).toContain('wake up')
-    expect(prompt).toContain('Do not ask "what do you need?"')
+    expectFencedRuntimeNotice(prompt, 'You were @-mentioned with little or no text')
+    expect(prompt).toContain('rather than\nasking "what do you need?"')
     // the real question is still visible above under Recent context
     expect(prompt).toContain('3분기에 종료한다는 내용을 3분기에 보내는게 말이 돼?')
+  })
+
+  test('fences stacked group-chat and wake-request notices independently', async () => {
+    // given a multi-human group with a recent message not addressed to the bot
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    await router.route(inbound({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'hi bot' }))
+    await router.__testing!.flushDebounce(KEY)
+    sessions[0]!.prompts.length = 0
+    await router.route(
+      inbound({ isBotMention: false, authorId: 'bob', authorName: 'bob', text: 'the deployment is blocked' }),
+    )
+
+    // when a bare mention wakes the bot to inspect that context
+    await router.route(inbound({ authorId: 'bob', authorName: 'bob', text: '<@bot>' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then each coexisting notice owns its complete trust-boundary block
+    const prompt = sessions[0]!.prompts[0]!
+    const group = expectFencedRuntimeNotice(prompt, 'You are in a group chat and are woken on every message')
+    const wake = expectFencedRuntimeNotice(prompt, 'You were @-mentioned with little or no text')
+
+    // and neither borrows the other's fence: a single `---` serving as one
+    // notice's closer and the next one's opener would satisfy both checks
+    // above while leaving each block without a boundary of its own
+    expect(group.closeIndex).toBeLessThan(wake.openIndex)
   })
 
   // A bare ping is still bare when the mention is padded with whitespace,
@@ -2110,7 +2198,7 @@ describe('ChannelRouter sticky credits', () => {
     // can still self-select silence for true chatter
     expect(sessions[0]!.prompts).toHaveLength(1)
     expect(sessions[0]!.prompts[0]).toContain('where did you send it')
-    expect(sessions[0]!.prompts[0]).toContain('You are in a group chat with multiple people.')
+    expect(sessions[0]!.prompts[0]).toContain('You are in a group chat and are woken on every message')
   })
 
   test('clearSticky drops the credit so a plain follow-up is no longer auto-engaged', async () => {
@@ -10418,9 +10506,7 @@ describe('ChannelRouter peer-bot loop guard', () => {
 
     // then: the prompt has all three load-bearing pieces of the trust boundary
     const lastPrompt = sessions[0]!.prompts[sessions[0]!.prompts.length - 1]!
-    expect(lastPrompt).toContain('---')
-    expect(lastPrompt).toContain('**[SYSTEM MESSAGE — not from a human]**')
-    expect(lastPrompt).toContain('**Do not acknowledge or reply to this notice.**')
+    expectFencedRuntimeNotice(lastPrompt, 'Peer bots have engaged you')
     // and: the old human-readable H2 heading must NOT appear (it was the
     // structural ambiguity that caused the bug)
     expect(lastPrompt).not.toContain('## ⚠️ Loop guard active')
@@ -10444,8 +10530,7 @@ describe('ChannelRouter peer-bot loop guard', () => {
 
     // then the nudge is present and fenced, and current message still renders
     const lastPrompt = sessions[0]!.prompts[sessions[0]!.prompts.length - 1]!
-    expect(lastPrompt).toContain('You are in a group chat with multiple people.')
-    expect(lastPrompt).toContain('**[SYSTEM MESSAGE — not from a human]**')
+    expectFencedRuntimeNotice(lastPrompt, 'You are in a group chat and are woken on every message')
     expect(lastPrompt).toContain('bot?')
   })
 
@@ -10459,7 +10544,7 @@ describe('ChannelRouter peer-bot loop guard', () => {
     await router.__testing!.flushDebounce(KEY)
 
     // then no nudge
-    expect(sessions[0]!.prompts[0]).not.toContain('You are in a group chat with multiple people.')
+    expect(sessions[0]!.prompts[0]).not.toContain('You are in a group chat and are woken on every message')
   })
 
   test('engaged DM turn does NOT carry the group-chat nudge', async () => {
@@ -10473,7 +10558,7 @@ describe('ChannelRouter peer-bot loop guard', () => {
     await router.__testing!.flushDebounce(dmKey)
 
     // then no nudge even though dmMembership reports a bot participant
-    expect(sessions[0]!.prompts[0]).not.toContain('You are in a group chat with multiple people.')
+    expect(sessions[0]!.prompts[0]).not.toContain('You are in a group chat and are woken on every message')
   })
 
   test('peer-bot author lines are tagged with [bot] in the prompt', async () => {

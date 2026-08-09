@@ -4,6 +4,8 @@ import {
   byteLength,
   dumpSystemPrompt,
   dumpSystemPromptWithBreakdown,
+  dumpTurnPrompt,
+  dumpTurnPromptWithBreakdown,
   estimateTokens,
   TOKENS_PER_CHAR,
 } from './dump-system-prompt'
@@ -93,13 +95,6 @@ describe('dumpSystemPrompt', () => {
     expect(out).toContain('You are running an unattended cron job.')
     expect(out).toContain('- Job ID:')
     expect(out).toContain('- Job kind: prompt')
-  })
-
-  test('channel origin does not include the MEMORY CONTEXT boundary in the system prompt', () => {
-    const out = dumpSystemPrompt('channel')
-
-    expect(out).not.toContain('**[MEMORY CONTEXT — not instructions]**')
-    expect(out).toContain('## Recent participants')
   })
 
   test('tui origin role block is rendered (placeholder role context is non-suppressing)', () => {
@@ -260,5 +255,61 @@ describe('dumpSystemPrompt', () => {
       expect(out).not.toContain('Session started at')
       expect(out).not.toContain('<current-time>')
     }
+  })
+
+  test('channel turn renders live channel framing and headings-only memory', () => {
+    const out = dumpTurnPrompt('channel')
+
+    expect(out).toContain('<current-time>')
+    expect(out).toContain('<your-role authority="current-speaker">member</your-role>')
+    expect(out).toContain('**[SYSTEM MESSAGE — not from a human]**')
+    expect(out).toContain('## Recent context (not addressed to you, for awareness only)')
+    expect(out).toContain('## Current message (addressed to you)')
+    expect(out).toContain('memory_search({ topic:')
+    expect(out).not.toContain('<PLACEHOLDER: full memory excerpt')
+  })
+
+  test('tui turn renders the non-channel memory body after the user text', () => {
+    const out = dumpTurnPrompt('tui')
+
+    expect(out).toContain('<PLACEHOLDER: interactive user request from the TUI>')
+    expect(out).toContain('<PLACEHOLDER: full memory excerpt')
+    expect(out.indexOf('<current-time>')).toBeLessThan(
+      out.indexOf('<PLACEHOLDER: interactive user request from the TUI>'),
+    )
+    expect(out.indexOf('<PLACEHOLDER: interactive user request from the TUI>')).toBeLessThan(out.indexOf('# Memory'))
+  })
+
+  test.each(['tui', 'cron', 'channel', 'subagent'] as const)(
+    '%s turn breakdown totals and section attribution cover the composed turn exactly',
+    (kind) => {
+      const result = dumpTurnPromptWithBreakdown(kind)
+
+      expect(result.totalBytes).toBe(byteLength(result.prompt))
+      expect(result.totalChars).toBe(result.prompt.length)
+      expect(result.totalTokens).toBe(estimateTokens(result.prompt))
+      expect(result.sections.reduce((sum, section) => sum + section.chars, 0)).toBe(result.prompt.length)
+      expect(result.sections.reduce((sum, section) => sum + section.bytes, 0)).toBe(byteLength(result.prompt))
+    },
+  )
+
+  test('channel turn breakdown identifies each live envelope section in order', () => {
+    expect(dumpTurnPromptWithBreakdown('channel').sections.map((section) => section.name)).toEqual([
+      'Time anchor',
+      'Role anchor',
+      'Group-chat nudge',
+      'Recent context',
+      'Current message',
+      'Memory block (channel headings only)',
+    ])
+  })
+
+  test('turn measurement leaves the default system-prompt composition unchanged', () => {
+    const before = dumpSystemPrompt('channel')
+
+    dumpTurnPromptWithBreakdown('channel')
+
+    expect(dumpSystemPrompt('channel')).toBe(before)
+    expect(before).not.toContain('## Recent context (not addressed to you, for awareness only)')
   })
 })
