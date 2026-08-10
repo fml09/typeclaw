@@ -88,10 +88,12 @@ export function checkPrivateSurfaceReadGuard(
     const roleEmpty = roleDirs.length === 0 && roleFiles.length === 0
     if (canonicalEmpty && roleEmpty) return undefined
     const realpath = hooks.realpathNative ?? realpathSync.native
+    const nonFile = fileOperands?.nonFile === undefined ? undefined : new Set(fileOperands.nonFile)
+    const localOperands = collectLocalOperandPaths(fileOperands)
 
     if (!canonicalEmpty) {
       const identityScanner = createHardlinkIdentityScanner(agentDir, canonicalDirs, canonicalFiles, hooks)
-      for (const candidate of collectPathCandidates(args, tool, undefined, undefined, true)) {
+      for (const candidate of collectPathCandidates(args, tool, undefined, undefined, true, true)) {
         const hit = matchHidden(candidate, agentDir, canonicalDirs, canonicalFiles, identityScanner, realpath)
         if (hit !== undefined) return privateSurfacePathBlock(tool, candidate, hit)
       }
@@ -99,9 +101,7 @@ export function checkPrivateSurfaceReadGuard(
 
     if (!roleEmpty) {
       const identityScanner = createHardlinkIdentityScanner(agentDir, roleDirs, roleFiles, hooks)
-      const nonFile = fileOperands?.nonFile === undefined ? undefined : new Set(fileOperands.nonFile)
-      const localOperands = collectLocalOperandPaths(fileOperands)
-      for (const candidate of collectPathCandidates(args, tool, nonFile, localOperands, false)) {
+      for (const candidate of collectPathCandidates(args, tool, nonFile, localOperands)) {
         const hit = matchHidden(candidate, agentDir, roleDirs, roleFiles, identityScanner, realpath)
         if (hit !== undefined) return privateSurfacePathBlock(tool, candidate, hit)
       }
@@ -290,6 +290,17 @@ const FREE_TEXT_KEYS_BY_TOOL: Record<string, ReadonlySet<string>> = {
   channel_fetch_attachment: new Set(['filename']),
 }
 
+// Canonical credential checks normally scan every field, including generic
+// prose keys on unknown tools, because an unclassified plugin argument may
+// dereference a local file. These channel tools have an explicit schema:
+// addressing and message fields are remote identifiers or prose, while only
+// attachments[].path can read a local file. Keep this per-tool and per-key so
+// future tools remain fail-closed by default.
+const CANONICAL_FREE_TEXT_KEYS_BY_TOOL: Record<string, ReadonlySet<string>> = {
+  channel_send: new Set(['adapter', 'workspace', 'chat', 'thread', 'text', 'filename']),
+  channel_reply: new Set(['text', 'filename']),
+}
+
 // Trim before the `file:` test: an exempt prose key otherwise lets a
 // leading-whitespace `file:  file://…/memory` URI slip past the scan (the value
 // is not path-shaped and `isFileUrl` misses it), reaching a fetcher that trims
@@ -343,9 +354,10 @@ function collectPathCandidates(
   nonFile?: ReadonlySet<string>,
   localOperands?: ReadonlySet<string>,
   disableExemptions = false,
+  canonicalToolSemantics = false,
 ): string[] {
   const out: string[] = []
-  walk(value, out, tool, false, nonFile, localOperands, '', disableExemptions)
+  walk(value, out, tool, false, nonFile, localOperands, '', disableExemptions, canonicalToolSemantics)
   return out
 }
 
@@ -358,10 +370,11 @@ function walk(
   localOperands: ReadonlySet<string> | undefined,
   operandPath: string,
   disableExemptions: boolean,
+  canonicalToolSemantics: boolean,
   key?: string,
 ): void {
   if (typeof value === 'string') {
-    if (!disableExemptions) {
+    if (!disableExemptions || canonicalToolSemantics) {
       const declaredLocal = localOperands?.has(operandPath) === true
       if (!declaredLocal) {
         if (nonFile?.has(operandPath) === true) return
@@ -375,17 +388,41 @@ function walk(
   }
   if (Array.isArray(value)) {
     for (const item of value) {
-      walk(item, out, tool, underExempt, nonFile, localOperands, operandPath, disableExemptions, key)
+      walk(
+        item,
+        out,
+        tool,
+        underExempt,
+        nonFile,
+        localOperands,
+        operandPath,
+        disableExemptions,
+        canonicalToolSemantics,
+        key,
+      )
     }
     return
   }
   if (value !== null && typeof value === 'object') {
     const toolFreeText = FREE_TEXT_KEYS_BY_TOOL[tool]
+    const canonicalToolFreeText = canonicalToolSemantics ? CANONICAL_FREE_TEXT_KEYS_BY_TOOL[tool] : undefined
     for (const [childKey, item] of Object.entries(value)) {
-      if (disableExemptions && childKey === 'filename' && toolFreeText?.has(childKey) === true) continue
-      const keyIsExempt = !disableExemptions && (NON_PATH_KEYS.has(childKey) || (toolFreeText?.has(childKey) ?? false))
+      const keyIsExempt =
+        (!disableExemptions && (NON_PATH_KEYS.has(childKey) || (toolFreeText?.has(childKey) ?? false))) ||
+        (canonicalToolFreeText?.has(childKey) ?? false)
       const childPath = operandPath === '' ? childKey : `${operandPath}.${childKey}`
-      walk(item, out, tool, underExempt || keyIsExempt, nonFile, localOperands, childPath, disableExemptions, childKey)
+      walk(
+        item,
+        out,
+        tool,
+        underExempt || keyIsExempt,
+        nonFile,
+        localOperands,
+        childPath,
+        disableExemptions,
+        canonicalToolSemantics,
+        childKey,
+      )
     }
   }
 }
