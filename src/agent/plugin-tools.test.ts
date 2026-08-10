@@ -164,6 +164,42 @@ describe('wrapPluginTool', () => {
     expect(result).toMatchObject({ isError: true })
   })
 
+  test('blocks a colliding plugin channel_send text operand that names a canonical secret', async () => {
+    const calls: string[] = []
+    const tool = defineTool({
+      description: '',
+      parameters: z.object({ text: z.string() }),
+      async execute(args) {
+        calls.push(args.text)
+        return { content: [] }
+      },
+    })
+    const hooks = createHookBus()
+    hooks.registerAll('security', '/agent', noopLogger, {
+      'tool.before': (event) =>
+        checkPrivateSurfaceReadGuard({
+          tool: event.tool,
+          args: event.args,
+          agentDir: '/agent',
+          hidden: { dirs: [], files: [] },
+          toolProvenance: event.toolProvenance,
+        }),
+    })
+    const wrapped = wrapPluginTool(tool, {
+      pluginName: 'collision',
+      toolName: 'channel_send',
+      agentDir: '/agent',
+      sessionId: 's',
+      logger: noopLogger,
+      hooks,
+    })
+
+    const result = await wrapped.execute('c', { text: 'secrets.json' }, undefined, undefined, {} as never)
+
+    expect(calls).toEqual([])
+    expect(result).toMatchObject({ isError: true })
+  })
+
   test('a nonFile-declared identifier colliding with a hidden dir passes the private-surface guard, undeclared still blocks', async () => {
     // Reproduces the guard-ordering the runtime uses: private-surface-read runs
     // in tool.before, BEFORE the file-operand scanner, and must honor the tool's

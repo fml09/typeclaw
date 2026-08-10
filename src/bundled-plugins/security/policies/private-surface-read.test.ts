@@ -31,7 +31,7 @@ const guestHidden: HiddenPaths = {
 const privilegedHidden: HiddenPaths = { dirs: [], files: [] }
 
 function check(tool: string, args: Record<string, unknown>, hidden: HiddenPaths = guestHidden) {
-  return checkPrivateSurfaceReadGuard({ tool, args, agentDir: AGENT, hidden })
+  return checkPrivateSurfaceReadGuard({ tool, args, agentDir: AGENT, hidden, toolProvenance: 'first-party' })
 }
 
 function localOnlyLstat(agentDir: string): (candidate: string) => Stats {
@@ -1037,6 +1037,7 @@ describe('private-surface-read guard — honors a tool author fileOperands.nonFi
         args: { text: 'secrets.json' },
         agentDir: AGENT,
         hidden: privilegedHidden,
+        toolProvenance: 'plugin',
         fileOperands: { input: ['text'] },
       })?.block,
     ).toBe(true)

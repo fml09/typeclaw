@@ -114,6 +114,16 @@ describe('security plugin wiring', () => {
     expect(result?.reason).toContain('outboundSecret')
   })
 
+  test('tool.before blocks a plugin-origin channel_send canonical credential argument', async () => {
+    const hook = await toolBeforeHook()
+    const result = await hook(
+      { ...toolEvent('channel_send', { text: 'secrets.json' }), toolProvenance: 'plugin' },
+      hookContext('/agent'),
+    )
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('privateSurfaceRead')
+  })
+
   test('tool.before blocks channel_send leaking env-var names (recon)', async () => {
     const hook = await toolBeforeHook()
     const result = await hook(

@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url'
 
 import { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS } from '@/agent/tools-without-local-file-operands'
 import { RECOVER_MISSING_OR_UNSEARCHABLE, realIntendedPathSync } from '@/path-safety/real-intended-path'
-import type { ToolFileOperands } from '@/plugin'
+import type { ToolFileOperands, ToolProvenance } from '@/plugin'
 import {
   CANONICAL_AGENT_SECRET_FILES,
   CANONICAL_HOME_SECRET_DIRS,
@@ -77,10 +77,11 @@ export function checkPrivateSurfaceReadGuard(
     agentDir: string
     hidden: HiddenPaths
     fileOperands?: ToolFileOperands
+    toolProvenance?: ToolProvenance
   },
   hooks: PrivateSurfaceIdentityScanHooks = {},
 ): SecurityBlock | undefined {
-  const { tool, args, agentDir, hidden, fileOperands } = options
+  const { tool, args, agentDir, hidden, fileOperands, toolProvenance } = options
   if (UNSCANNED_TOOLS.has(tool)) return undefined
   try {
     const { canonicalDirs, canonicalFiles, roleDirs, roleFiles } = deniedSurface(agentDir, hidden)
@@ -93,7 +94,14 @@ export function checkPrivateSurfaceReadGuard(
 
     if (!canonicalEmpty) {
       const identityScanner = createHardlinkIdentityScanner(agentDir, canonicalDirs, canonicalFiles, hooks)
-      for (const candidate of collectPathCandidates(args, tool, undefined, localOperands, true, true)) {
+      for (const candidate of collectPathCandidates(
+        args,
+        tool,
+        undefined,
+        localOperands,
+        true,
+        toolProvenance === 'first-party',
+      )) {
         const hit = matchHidden(candidate, agentDir, canonicalDirs, canonicalFiles, identityScanner, realpath)
         if (hit !== undefined) return privateSurfacePathBlock(tool, candidate, hit)
       }
