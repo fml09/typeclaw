@@ -354,6 +354,8 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
         sessionId: opts.sessionId,
         callId: toolCallId,
         args: mutableArgs,
+        toolProvenance: 'plugin',
+
         ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
         ...(tool.fileOperands !== undefined ? { fileOperands: tool.fileOperands } : {}),
       }
@@ -453,6 +455,7 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
         sessionId: opts.sessionId,
         callId: toolCallId,
         args: mutableArgs,
+        toolProvenance: 'first-party',
         ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
         ...(preflightFileOperands !== undefined ? { fileOperands: preflightFileOperands } : {}),
       })

@@ -31,7 +31,7 @@ const guestHidden: HiddenPaths = {
 const privilegedHidden: HiddenPaths = { dirs: [], files: [] }
 
 function check(tool: string, args: Record<string, unknown>, hidden: HiddenPaths = guestHidden) {
-  return checkPrivateSurfaceReadGuard({ tool, args, agentDir: AGENT, hidden })
+  return checkPrivateSurfaceReadGuard({ tool, args, agentDir: AGENT, hidden, toolProvenance: 'first-party' })
 }
 
 function localOnlyLstat(agentDir: string): (candidate: string) => Stats {
@@ -190,6 +190,13 @@ describe('private-surface-read guard — free-text field scoping (no false posit
     expect(check('look_at_channel_attachment', { prompt: 'sessions' })).toBeUndefined()
   })
 
+  test('does not canonicalize a Korean channel message longer than one filesystem filename', () => {
+    const text = '보안 경로 검사와 무관한 Slack 메시지입니다. '.repeat(20)
+
+    expect(Buffer.byteLength(text, 'utf8')).toBeGreaterThan(255)
+    expect(check('channel_send', { text })).toBeUndefined()
+  })
+
   test('does not block an identifier-only tool whose remote id equals a hidden dir name', () => {
     // These tools read no local path (shared TOOLS_WITHOUT_LOCAL_FILE_OPERANDS
     // set); an id like workspace/target_id/task_id="memory" must not resolve to
@@ -230,6 +237,15 @@ describe('private-surface-read guard — free-text field scoping (no false posit
     expect(check('grep', { pattern: 'token', path: 'sessions' })?.block).toBe(true)
     expect(check('look_at', { images: [{ path: 'memory/x.png' }] })?.block).toBe(true)
     expect(check('channel_send', { text: 'memory', attachments: [{ path: 'sessions/s.jsonl' }] })?.block).toBe(true)
+  })
+
+  test('still blocks a hidden channel attachment path when text is free-form', () => {
+    expect(
+      check('channel_send', {
+        text: '보안 경로 검사와 무관한 Slack 메시지입니다. '.repeat(20),
+        attachments: [{ path: 'sessions/s.jsonl' }],
+      })?.block,
+    ).toBe(true)
   })
 
   test('fail-closed: an UNKNOWN key on an unknown tool is still scanned', () => {
@@ -1010,6 +1026,19 @@ describe('private-surface-read guard — honors a tool author fileOperands.nonFi
         agentDir: AGENT,
         hidden: privilegedHidden,
         fileOperands: { nonFile: ['query'] },
+      })?.block,
+    ).toBe(true)
+  })
+
+  test('blocks a colliding channel_send plugin local text operand from reading a canonical credential', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'channel_send',
+        args: { text: 'secrets.json' },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        toolProvenance: 'plugin',
+        fileOperands: { input: ['text'] },
       })?.block,
     ).toBe(true)
   })

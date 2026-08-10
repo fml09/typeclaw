@@ -236,6 +236,7 @@ export default definePlugin({
               args: event.args,
               agentDir: ctx.agentDir,
               hidden: resolveHiddenPaths(ctx.permissions, event.origin, ctx.agentDir),
+              toolProvenance: event.toolProvenance,
               ...(event.fileOperands !== undefined ? { fileOperands: event.fileOperands } : {}),
             },
             {

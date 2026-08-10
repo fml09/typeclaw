@@ -220,12 +220,21 @@ export type SessionPromptEvent = {
 
 // Fired for plugin-defined tools and TypeClaw-exposed system tools, including
 // built-in pi tools (read/bash/edit/write/grep/find/ls) when plugins are wired.
+//
+// Set exclusively by TypeClaw's tool wrappers before a tool.before hook runs.
+// Tool names and arguments are model/plugin controlled, so guards must not use
+// either as evidence that a call is first-party.
+export type ToolProvenance = 'first-party' | 'plugin'
+
 export type ToolBeforeEvent = {
   tool: string
   sessionId: string
   callId: string
   args: Record<string, unknown>
   origin?: SessionOrigin
+  // Internal wrapper-authenticated provenance. Omitted only by direct callers;
+  // guards must treat an omitted value as untrusted.
+  toolProvenance?: ToolProvenance
   // The tool author's operand declarations (never model-controlled — set on the
   // static Tool definition at registration). Carried so a guard that runs before
   // the file-operand scanner (private-surface-read) can honor the same
