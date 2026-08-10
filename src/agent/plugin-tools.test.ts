@@ -2175,9 +2175,10 @@ describe('wrapSystemTool', () => {
       expect((overflow.error as Error).message).toMatch(/waiter|queue/i)
     } finally {
       for (const controller of controllers) controller.abort()
+      await holder?.cleanup()
+      holder = undefined
       const outcomes = await Promise.all(waiters)
       await Promise.all(outcomes.flatMap((outcome) => ('pinned' in outcome ? [outcome.pinned.cleanup()] : [])))
-      await holder?.cleanup()
       await rm(agentDir, { recursive: true, force: true })
     }
   })
