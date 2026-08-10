@@ -231,6 +231,112 @@ describe('private-surface-read guard — free-text field scoping (no false posit
     expect(check('append', { topic: 'workspace', body: 'about memory' })).toBeUndefined()
   })
 
+  test('does not resolve long first-party edit/write prose as canonical paths', () => {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-private-prose-')))
+    const longProse = 'x'.repeat(300)
+    const internalErrors: unknown[] = []
+    const hooks = { onInternalError: (error: unknown) => internalErrors.push(error) }
+
+    expect(
+      checkPrivateSurfaceReadGuard(
+        {
+          tool: 'edit',
+          args: { path: path.join(agentDir, 'cron.json'), edits: [{ oldText: longProse, newText: longProse }] },
+          agentDir,
+          hidden: privilegedHidden,
+          toolProvenance: 'first-party',
+        },
+        hooks,
+      ),
+    ).toBeUndefined()
+    expect(
+      checkPrivateSurfaceReadGuard(
+        {
+          tool: 'write',
+          args: { path: path.join(agentDir, 'cron.json'), content: longProse },
+          agentDir,
+          hidden: privilegedHidden,
+          toolProvenance: 'first-party',
+        },
+        hooks,
+      ),
+    ).toBeUndefined()
+    expect(internalErrors).toEqual([])
+  })
+
+  test('blocks write.content safe prose but metadata.content: secrets.json (exact operand-path boundary)', () => {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-operand-boundary-write-')))
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'write',
+        args: {
+          path: path.join(agentDir, 'report.md'),
+          content: 'x'.repeat(300),
+          metadata: { content: 'secrets.json' },
+        },
+        agentDir,
+        hidden: privilegedHidden,
+        toolProvenance: 'first-party',
+      })?.block,
+    ).toBe(true)
+  })
+
+  test('blocks edit.edits.oldText safe prose but metadata.oldText: secrets.json (exact operand-path boundary)', () => {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-operand-boundary-edit-')))
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'edit',
+        args: {
+          path: path.join(agentDir, 'report.md'),
+          edits: [{ oldText: 'x'.repeat(300), newText: 'replacement' }],
+          metadata: { oldText: 'secrets.json' },
+        },
+        agentDir,
+        hidden: privilegedHidden,
+        toolProvenance: 'first-party',
+      })?.block,
+    ).toBe(true)
+  })
+
+  test('keeps colliding plugin tools and file URIs in the canonical scan', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'write',
+        args: { path: 'public/report.md', content: 'secrets.json' },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        toolProvenance: 'plugin',
+      })?.block,
+    ).toBe(true)
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'edit',
+        args: { path: 'public/report.md', edits: [{ oldText: 'secrets.json', newText: 'replacement' }] },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        toolProvenance: 'plugin',
+      })?.block,
+    ).toBe(true)
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'write',
+        args: { path: 'public/report.md', content: 'file:///agent/secrets.json' },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        toolProvenance: 'first-party',
+      })?.block,
+    ).toBe(true)
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'channel_read',
+        args: { path: 'secrets.json' },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        toolProvenance: 'plugin',
+      })?.block,
+    ).toBe(true)
+  })
+
   test('STILL blocks a hidden path in a genuine path field (scoping did not open a hole)', () => {
     expect(check('read', { path: 'memory' })?.block).toBe(true)
     expect(check('read', { path: 'workspace/notes.md' })?.block).toBe(true)
@@ -1111,6 +1217,19 @@ describe('private-surface-read guard — honors a tool author fileOperands.nonFi
         agentDir: AGENT,
         hidden: guestHidden,
         fileOperands: { input: ['query'], nonFile: ['query'] },
+      })?.block,
+    ).toBe(true)
+  })
+
+  test('declared local input overrides a first-party write prose exemption for canonical secrets', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'write',
+        args: { path: 'public/report.md', content: 'secrets.json' },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        fileOperands: { input: ['content'] },
+        toolProvenance: 'first-party',
       })?.block,
     ).toBe(true)
   })

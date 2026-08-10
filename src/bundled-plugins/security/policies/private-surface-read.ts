@@ -31,11 +31,11 @@ import type { SecurityBlock } from '../policy'
 
 export const GUARD_PRIVATE_SURFACE_READ = 'privateSurfaceRead'
 
-// bash is excluded: its access to hidden paths is contained by the bwrap
-// sandbox (applyBashSandbox), not by blocking the call. Every OTHER tool is
-// scanned, so a new file-reading tool — bundled or third-party — is covered
-// the day it ships without a whitelist edit. web_search/web_fetch take URLs, not
-// local paths, and the path-plausibility filter keeps their args from matching.
+// First-party bash is excluded: its access to hidden paths is contained by the
+// bwrap sandbox (applyBashSandbox), not by blocking the call. Every OTHER tool
+// is scanned, so a new file-reading tool — bundled or third-party — is covered
+// the day it ships without a whitelist edit. A plugin colliding with an exempt
+// first-party name does not inherit the exemption.
 //
 // TOOLS_WITHOUT_LOCAL_FILE_OPERANDS is the SAME set the file-operand scanner
 // skips: first-party tools whose args are only remote ids/control tokens
@@ -82,7 +82,7 @@ export function checkPrivateSurfaceReadGuard(
   hooks: PrivateSurfaceIdentityScanHooks = {},
 ): SecurityBlock | undefined {
   const { tool, args, agentDir, hidden, fileOperands, toolProvenance } = options
-  if (UNSCANNED_TOOLS.has(tool)) return undefined
+  if (toolProvenance === 'first-party' && UNSCANNED_TOOLS.has(tool)) return undefined
   try {
     const { canonicalDirs, canonicalFiles, roleDirs, roleFiles } = deniedSurface(agentDir, hidden)
     const canonicalEmpty = canonicalDirs.length === 0 && canonicalFiles.length === 0
@@ -309,6 +309,13 @@ const CANONICAL_FREE_TEXT_KEYS_BY_TOOL: Record<string, ReadonlySet<string>> = {
   channel_reply: new Set(['text', 'filename']),
 }
 
+// Unlike channel fields, edit replacement text is nested. Match its complete
+// operand path so another field with the same key remains fail-closed.
+const CANONICAL_FREE_TEXT_OPERANDS_BY_TOOL: Record<string, ReadonlySet<string>> = {
+  edit: new Set(['edits.oldText', 'edits.newText']),
+  write: new Set(['content']),
+}
+
 // Trim before the `file:` test: an exempt prose key otherwise lets a
 // leading-whitespace `file:  file://…/memory` URI slip past the scan (the value
 // is not path-shaped and `isFileUrl` misses it), reaching a fetcher that trims
@@ -414,11 +421,15 @@ function walk(
   if (value !== null && typeof value === 'object') {
     const toolFreeText = FREE_TEXT_KEYS_BY_TOOL[tool]
     const canonicalToolFreeText = canonicalToolSemantics ? CANONICAL_FREE_TEXT_KEYS_BY_TOOL[tool] : undefined
+    const canonicalToolFreeTextOperands = canonicalToolSemantics
+      ? CANONICAL_FREE_TEXT_OPERANDS_BY_TOOL[tool]
+      : undefined
     for (const [childKey, item] of Object.entries(value)) {
+      const childPath = operandPath === '' ? childKey : `${operandPath}.${childKey}`
       const keyIsExempt =
         (!disableExemptions && (NON_PATH_KEYS.has(childKey) || (toolFreeText?.has(childKey) ?? false))) ||
-        (canonicalToolFreeText?.has(childKey) ?? false)
-      const childPath = operandPath === '' ? childKey : `${operandPath}.${childKey}`
+        (canonicalToolFreeText?.has(childKey) ?? false) ||
+        (canonicalToolFreeTextOperands?.has(childPath) ?? false)
       walk(
         item,
         out,

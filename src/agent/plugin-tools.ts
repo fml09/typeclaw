@@ -390,6 +390,7 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
         tool: opts.toolName,
         args: before.args,
         agentDir: opts.agentDir,
+        toolProvenance: 'plugin',
         genericInputs: true,
         fileOperands: tool.fileOperands,
         logger: opts.logger,
@@ -488,6 +489,7 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
         tool: tool.name,
         args: mutableArgs,
         agentDir: opts.agentDir,
+        toolProvenance: 'first-party',
         genericInputs: tool.name !== 'mcp_call',
         ...(opts.permissions !== undefined
           ? { hidden: resolveHiddenPaths(opts.permissions, liveOrigin, opts.agentDir) }
@@ -565,6 +567,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         sessionId: opts.sessionId,
         callId: toolCallId,
         args: mutableArgs,
+        toolProvenance: 'first-party',
         ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
       })
       if (blockResult !== undefined) {
@@ -649,6 +652,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             tool: tool.name,
             args: attemptArgs,
             agentDir: opts.agentDir,
+            toolProvenance: 'first-party',
             ...(opts.permissions !== undefined
               ? {
                   hidden:
