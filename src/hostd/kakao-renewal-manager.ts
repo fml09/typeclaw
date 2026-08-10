@@ -1,4 +1,9 @@
-import { renewCurrentAccount, type AttemptLoginFn } from '@/secrets/kakao-renewal'
+import {
+  renewCurrentAccount,
+  type AttemptLoginFn,
+  type RefreshOAuthTokenFn,
+  type RenewalMethod,
+} from '@/secrets/kakao-renewal'
 import { createKeyStore, type KeyStore } from '@/secrets/keys'
 
 import { keysDir } from './paths'
@@ -19,7 +24,13 @@ export type KakaoRenewalStartInput = {
 export type KakaoRenewalLogEvent =
   | { kind: 'kakao-renewal-tick-start'; containerName: string }
   | { kind: 'kakao-renewal-tick-skipped'; containerName: string; reason: string; ageMs?: number }
-  | { kind: 'kakao-renewal-tick-ok'; containerName: string; accountId: string; previousUpdatedAt: string }
+  | {
+      kind: 'kakao-renewal-tick-ok'
+      containerName: string
+      accountId: string
+      previousUpdatedAt: string
+      method?: RenewalMethod
+    }
   | {
       kind: 'kakao-renewal-tick-reauth-required'
       containerName: string
@@ -37,13 +48,12 @@ export type KakaoRenewalManagerOptions = {
   tickIntervalMs?: number
   keyStoreFactory?: () => KeyStore
   attemptLogin?: AttemptLoginFn
+  refreshOAuthToken?: RefreshOAuthTokenFn
   schedule?: (fn: () => void, intervalMs: number) => { stop: () => void }
-  // Invoked after a successful renewal so the host can restart the container
-  // and the in-memory adapter picks up the fresh tokens. Without this, the
-  // cron writes new tokens to secrets.json but the live LOCO client keeps the
-  // old token in its closure and still hits 401 at the ~7-day wall. Production
-  // wires this to the same restart path the `restart` RPC uses; tests can
-  // observe it via a fake.
+  // Invoked after a successful renewal so the host can hot-reload the adapter
+  // and the in-memory LOCO client picks up the fresh tokens. Production falls
+  // back to recreating the container only when the reload transport fails;
+  // tests can observe the callback via a fake.
   onRenewalOk?: (input: { containerName: string; cwd: string; accountId: string }) => Promise<void>
   // Optional predicate: only start the renewal cron for containers whose
   // `typeclaw.json` actually has a `channels.kakaotalk` block. Without this,
@@ -74,8 +84,8 @@ export function createKakaoRenewalManager(opts: KakaoRenewalManagerOptions = {})
   // one finishes. The Map's value is the most recent input.
   const latestInput = new Map<string, KakaoRenewalStartInput>()
   // Track in-flight tick promises per container so stop()/drain() can await
-  // them. Without this, daemon shutdown abandons an in-flight attemptLogin
-  // HTTPS request mid-write.
+  // them. Without this, daemon shutdown abandons an in-flight renewal HTTPS
+  // request mid-write.
   const inFlight = new Map<string, Promise<void>>()
   // Pending immediate-tick request: set when start() is called while a tick
   // is in flight, so we re-fire one tick after the in-flight settles.
@@ -89,6 +99,7 @@ export function createKakaoRenewalManager(opts: KakaoRenewalManagerOptions = {})
         agentDir: input.cwd,
         keyStore,
         ...(opts.attemptLogin ? { attemptLogin: opts.attemptLogin } : {}),
+        ...(opts.refreshOAuthToken ? { refreshOAuthToken: opts.refreshOAuthToken } : {}),
       })
       if (result.kind === 'skipped') {
         log({
@@ -103,9 +114,10 @@ export function createKakaoRenewalManager(opts: KakaoRenewalManagerOptions = {})
           containerName: input.containerName,
           accountId: result.account_id,
           previousUpdatedAt: result.previousUpdatedAt,
+          method: result.method,
         })
         // A tick that started before stop()/drain() (deregister, shutdown) or
-        // before a re-register with a different cwd can finish the slow login
+        // before a re-register with a different cwd can finish the slow renewal
         // here. Restarting a container that is no longer the current
         // registration would resurrect a just-deregistered agent or fight a
         // shutdown, so skip onRenewalOk unless this container+cwd is still the

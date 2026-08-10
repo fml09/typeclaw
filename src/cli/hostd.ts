@@ -254,7 +254,7 @@ function formatLog(event: DaemonLogEvent | SupervisorLogEvent): string {
     case 'kakao-renewal-tick-skipped':
       return `[hostd] kakao renewal skipped for ${event.containerName}: ${event.reason}${event.ageMs !== undefined ? ` (age=${Math.round(event.ageMs / 1000 / 60 / 60)}h)` : ''}`
     case 'kakao-renewal-tick-ok':
-      return `[hostd] kakao renewal OK for ${event.containerName} account=${event.accountId} (was last updated ${event.previousUpdatedAt})`
+      return `[hostd] kakao renewal OK for ${event.containerName} account=${event.accountId}${event.method ? ` method=${event.method}` : ''} (was last updated ${event.previousUpdatedAt})`
     case 'kakao-renewal-tick-reauth-required':
       return `[hostd] kakao renewal REAUTH REQUIRED for ${event.containerName} account=${event.accountId} reason=${event.reason} — ${event.message}`
     case 'kakao-renewal-tick-transient-failure':

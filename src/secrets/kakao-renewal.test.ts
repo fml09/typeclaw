@@ -3,8 +3,16 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { KakaoOAuthRefreshError } from 'agent-messenger/kakaotalk'
+
 import { encrypt, generateKey } from './encryption'
-import { type AttemptLoginFn, decideRenewal, RENEWAL_THRESHOLD_MS, renewCurrentAccount } from './kakao-renewal'
+import {
+  type AttemptLoginFn,
+  decideRenewal,
+  type RefreshOAuthTokenFn,
+  RENEWAL_THRESHOLD_MS,
+  renewCurrentAccount,
+} from './kakao-renewal'
 import { KeyStoreError, type KeyStore } from './keys'
 import { type KakaoChannelBlock, type KakaoEncryptedPassword } from './schema'
 
@@ -33,6 +41,7 @@ function buildBlock(opts: {
   ageDays: number
   email?: string
   encryptedPassword?: KakaoEncryptedPassword
+  refreshToken?: string
 }): KakaoChannelBlock {
   const updatedAt = new Date(Date.now() - opts.ageDays * 24 * 60 * 60 * 1000).toISOString()
   return {
@@ -42,7 +51,7 @@ function buildBlock(opts: {
         account_id: opts.accountId,
         oauth_token: 'stale-oauth',
         user_id: opts.accountId,
-        refresh_token: 'stale-refresh',
+        ...(opts.refreshToken !== undefined ? { refresh_token: opts.refreshToken } : {}),
         device_uuid: 'device-uuid',
         device_type: 'tablet',
         auth_method: 'login',
@@ -137,7 +146,7 @@ describe('decideRenewal', () => {
       keyStore: fakeKeyStore({ containerName: 'kakao', key }),
     })
     expect(decision.kind).toBe('should_renew')
-    if (decision.kind === 'should_renew') {
+    if (decision.kind === 'should_renew' && decision.method === 'password') {
       expect(decision.account.account_id).toBe('u-1')
       expect(decision.account.email).toBe('u@e.com')
       expect(decision.password).toBe('hunter2')
@@ -202,6 +211,138 @@ describe('renewCurrentAccount', () => {
     })
   })
 
+  test('refreshes OAuth tokens without touching password renewal fields', async () => {
+    await withAgentDir(async (agentDir) => {
+      const block = buildBlock({ accountId: 'u-1', ageDays: 6, refreshToken: 'stale-refresh' })
+      await seedSecrets(agentDir, block)
+      const calls: Parameters<RefreshOAuthTokenFn>[0][] = []
+
+      const result = await renewCurrentAccount({
+        containerName: 'kakao',
+        agentDir,
+        keyStore: fakeKeyStore({ containerName: 'kakao', key: null }),
+        refreshOAuthToken: async (input) => {
+          calls.push(input)
+          return { accessToken: 'fresh-access', refreshToken: 'fresh-refresh' }
+        },
+        attemptLogin: async () => {
+          throw new Error('attemptLogin must not be called after OAuth refresh succeeds')
+        },
+      })
+
+      expect(result.kind).toBe('ok')
+      if (result.kind === 'ok') expect(result.method).toBe('oauth_refresh')
+      expect(calls).toEqual([{ accessToken: 'stale-oauth', refreshToken: 'stale-refresh', deviceUuid: 'device-uuid' }])
+
+      const raw = JSON.parse(await readFile(join(agentDir, 'secrets.json'), 'utf8'))
+      const persisted = raw.channels.kakaotalk.accounts['u-1']
+      expect(persisted.oauth_token).toBe('fresh-access')
+      expect(persisted.refresh_token).toBe('fresh-refresh')
+      expect(persisted.auth_method).toBe('login')
+      expect(persisted.created_at).toBe(block.accounts['u-1']!.created_at)
+    })
+  })
+
+  for (const code of ['refresh_rejected', 'refresh_credentials_missing'] as const) {
+    test(`falls back to password login when OAuth refresh reports ${code}`, async () => {
+      await withAgentDir(async (agentDir) => {
+        const key = generateKey()
+        const encryptedPassword = encrypt('hunter2', key, { containerName: 'kakao', accountId: 'u-1' })
+        const block = buildBlock({
+          accountId: 'u-1',
+          ageDays: 6,
+          email: 'u@e.com',
+          encryptedPassword,
+          refreshToken: 'dead-refresh',
+        })
+        await seedSecrets(agentDir, block)
+        let loginCalls = 0
+
+        const result = await renewCurrentAccount({
+          containerName: 'kakao',
+          agentDir,
+          keyStore: fakeKeyStore({ containerName: 'kakao', key }),
+          refreshOAuthToken: async () => {
+            throw new KakaoOAuthRefreshError(code)
+          },
+          attemptLogin: async (_email, _password, deviceUuid, deviceType) => {
+            loginCalls++
+            return {
+              authenticated: true,
+              credentials: {
+                access_token: 'login-access',
+                refresh_token: 'login-refresh',
+                user_id: 'u-1',
+                device_uuid: deviceUuid,
+                device_type: deviceType,
+              },
+            }
+          },
+        })
+
+        expect(result.kind).toBe('ok')
+        if (result.kind === 'ok') expect(result.method).toBe('password')
+        expect(loginCalls).toBe(1)
+      })
+    })
+  }
+
+  for (const code of ['refresh_rejected', 'refresh_credentials_missing'] as const) {
+    test(`requires reauth when OAuth refresh reports ${code} and no password fallback exists`, async () => {
+      await withAgentDir(async (agentDir) => {
+        const block = buildBlock({ accountId: 'u-1', ageDays: 6, refreshToken: 'dead-refresh' })
+        await seedSecrets(agentDir, block)
+
+        const result = await renewCurrentAccount({
+          containerName: 'kakao',
+          agentDir,
+          keyStore: fakeKeyStore({ containerName: 'kakao', key: null }),
+          refreshOAuthToken: async () => {
+            throw new KakaoOAuthRefreshError(code)
+          },
+          attemptLogin: async () => {
+            throw new Error('attemptLogin must not be called without password renewal fields')
+          },
+        })
+
+        expect(result.kind).toBe('reauth_required')
+        if (result.kind === 'reauth_required') expect(result.reason).toBe('no_email')
+      })
+    })
+  }
+
+  for (const code of ['refresh_timeout', 'refresh_http_error'] as const) {
+    test(`reports transient_failure on ${code} without attempting password login`, async () => {
+      await withAgentDir(async (agentDir) => {
+        const key = generateKey()
+        const encryptedPassword = encrypt('hunter2', key, { containerName: 'kakao', accountId: 'u-1' })
+        const block = buildBlock({
+          accountId: 'u-1',
+          ageDays: 6,
+          email: 'u@e.com',
+          encryptedPassword,
+          refreshToken: 'stale-refresh',
+        })
+        await seedSecrets(agentDir, block)
+
+        const result = await renewCurrentAccount({
+          containerName: 'kakao',
+          agentDir,
+          keyStore: fakeKeyStore({ containerName: 'kakao', key }),
+          refreshOAuthToken: async () => {
+            throw new KakaoOAuthRefreshError(code)
+          },
+          attemptLogin: async () => {
+            throw new Error('attemptLogin must not run after a transient OAuth refresh failure')
+          },
+        })
+
+        expect(result.kind).toBe('transient_failure')
+        if (result.kind === 'transient_failure') expect(result.reason).toContain(code)
+      })
+    })
+  }
+
   test('writes fresh tokens through the store when attemptLogin succeeds, preserving email + encryptedPassword', async () => {
     await withAgentDir(async (agentDir) => {
       const key = generateKey()
@@ -232,6 +373,7 @@ describe('renewCurrentAccount', () => {
       })
 
       expect(result.kind).toBe('ok')
+      if (result.kind === 'ok') expect(result.method).toBe('password')
       expect(calls).toEqual([{ email: 'u@e.com', password: 'hunter2', deviceUuid: 'device-uuid' }])
 
       const raw = JSON.parse(await readFile(join(agentDir, 'secrets.json'), 'utf8'))
@@ -273,6 +415,12 @@ describe('renewCurrentAccount', () => {
         containerName: 'kakao',
         agentDir,
         keyStore: fakeKeyStore({ containerName: 'kakao', key }),
+        // The account carries a refresh_token, so renewal tries OAuth refresh
+        // first — stub it to fall back, otherwise this test would hit the
+        // real agent-messenger/kakaotalk endpoint over the network.
+        refreshOAuthToken: async () => {
+          throw new KakaoOAuthRefreshError('refresh_rejected')
+        },
         attemptLogin: async (_email, _password, deviceUuid, deviceType) => ({
           authenticated: true,
           credentials: {
@@ -286,6 +434,7 @@ describe('renewCurrentAccount', () => {
       })
 
       expect(result.kind).toBe('ok')
+      if (result.kind === 'ok') expect(result.method).toBe('password')
       const raw = JSON.parse(await readFile(join(agentDir, 'secrets.json'), 'utf8'))
       const persisted = raw.channels.kakaotalk.accounts['u-1']
       expect(persisted.created_at).toBe(originalCreatedAt)
@@ -352,6 +501,7 @@ describe('renewCurrentAccount', () => {
       })
 
       expect(result.kind).toBe('reauth_required')
+      if (result.kind === 'reauth_required') expect(result.reason).toBe('no_email')
     })
   })
 })
