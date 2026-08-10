@@ -49,19 +49,19 @@ Unlike the other adapters, `secrets.json#channels.kakaotalk` is not a flat crede
 
 Each record under `accounts.<accountId>`:
 
-| Field               | Notes                                                            |
-| ------------------- | ---------------------------------------------------------------- |
-| `account_id`        | Account identifier (matches the map key)                         |
-| `oauth_token`       | Current session token                                            |
-| `user_id`           | KakaoTalk user ID                                                |
-| `device_uuid`       | Registered device UUID                                           |
-| `device_type`       | `'pc'` or `'tablet'`                                             |
-| `created_at`        | Record creation timestamp                                        |
-| `updated_at`        | Last-update timestamp                                            |
-| `refresh_token`     | _optional_ — refresh token when present                          |
-| `auth_method`       | _optional_ — `'login'` or `'extract'`                            |
-| `email`             | _optional_ — login email (needed for automatic renewal)          |
-| `encryptedPassword` | _optional_ — AES-256-GCM envelope (needed for automatic renewal) |
+| Field               | Notes                                                          |
+| ------------------- | -------------------------------------------------------------- |
+| `account_id`        | Account identifier (matches the map key)                       |
+| `oauth_token`       | Current session token                                          |
+| `user_id`           | KakaoTalk user ID                                              |
+| `device_uuid`       | Registered device UUID                                         |
+| `device_type`       | `'pc'` or `'tablet'`                                           |
+| `created_at`        | Record creation timestamp                                      |
+| `updated_at`        | Last-update timestamp                                          |
+| `refresh_token`     | _optional_ — refresh token when present                        |
+| `auth_method`       | _optional_ — `'login'` or `'extract'`                          |
+| `email`             | _optional_ — login email used by the renewal fallback          |
+| `encryptedPassword` | _optional_ — AES-256-GCM envelope used by the renewal fallback |
 
 A `pendingLogin` record may also appear under `channels.kakaotalk` mid-reauth; see [`secrets.json`](/docs/reference/secrets-json) for the full schema.
 
@@ -82,7 +82,7 @@ CLI: `typeclaw channel add kakaotalk` (interactive). **Do not use `channel set`*
 
 ## Token renewal
 
-Tokens expire after ~7 days. A host-side renewal cron refreshes them automatically. When a token goes stale, renewal can trigger a container restart via the host daemon. If automatic renewal fails, re-authenticate with:
+Tokens expire after ~7 days. A host-side renewal cron first attempts a lightweight OAuth refresh grant using the stored refresh token, without decrypting or sending the password. If the refresh token is absent or KakaoTalk rejects it, renewal falls back to password-based login with the saved device UUID. Transient refresh failures do not trigger password login; the next daily tick retries. A successful renewal hot-reloads the KakaoTalk adapter through the host daemon, with a full container restart only as a transport fallback. If automatic renewal cannot proceed, re-authenticate with:
 
 ```sh
 typeclaw channel reauth kakaotalk
