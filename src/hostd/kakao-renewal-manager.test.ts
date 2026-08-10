@@ -3,8 +3,10 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { KakaoOAuthRefreshInput } from 'agent-messenger/kakaotalk'
+
 import { encrypt } from '@/secrets/encryption'
-import type { AttemptLoginFn } from '@/secrets/kakao-renewal'
+import type { AttemptLoginFn, RefreshOAuthTokenFn } from '@/secrets/kakao-renewal'
 import { createKeyStore } from '@/secrets/keys'
 import type { KakaoChannelBlock } from '@/secrets/schema'
 import { expectStable, waitFor } from '@/test-helpers/wait-for'
@@ -15,6 +17,7 @@ async function setupAgent(opts: {
   agentDir: string
   ageDays: number
   withEncryptedPassword: boolean
+  withRefreshToken?: boolean
   key?: Buffer
 }): Promise<{
   containerName: string
@@ -37,7 +40,7 @@ async function setupAgent(opts: {
         account_id: 'u-1',
         oauth_token: 'old-oauth',
         user_id: 'u-1',
-        refresh_token: 'old-refresh',
+        ...(opts.withRefreshToken ? { refresh_token: 'old-refresh' } : {}),
         device_uuid: 'device-uuid',
         device_type: 'tablet',
         auth_method: 'login',
@@ -261,6 +264,52 @@ describe('createKakaoRenewalManager', () => {
       await manager.drain()
 
       expect(restartCalls).toEqual([{ containerName: setup.containerName, cwd: setup.cwd, accountId: 'u-1' }])
+    })
+  })
+
+  test('threads OAuth refresh through a successful tick and invokes onRenewalOk', async () => {
+    await withAgentDir(async (dir) => {
+      const setup = await setupAgent({
+        agentDir: dir,
+        ageDays: 6,
+        withEncryptedPassword: false,
+        withRefreshToken: true,
+      })
+      const refreshCalls: KakaoOAuthRefreshInput[] = []
+      const restartCalls: Array<{ containerName: string; cwd: string; accountId: string }> = []
+      const events: KakaoRenewalLogEvent[] = []
+      const refreshOAuthToken: RefreshOAuthTokenFn = async (input) => {
+        refreshCalls.push(input)
+        return { accessToken: 'fresh-oauth', refreshToken: 'fresh-refresh' }
+      }
+
+      const manager = createKakaoRenewalManager({
+        keyStoreFactory: () => createKeyStore({ keysDir: setup.keysDir }),
+        refreshOAuthToken,
+        attemptLogin: async () => {
+          throw new Error('attemptLogin must not run after OAuth refresh succeeds')
+        },
+        schedule: (_fn, _ms) => ({ stop: () => {} }),
+        onRenewalOk: async (input) => {
+          restartCalls.push(input)
+        },
+        onLog: (event) => events.push(event),
+      })
+
+      manager.start({ containerName: setup.containerName, cwd: setup.cwd })
+      await manager.drain()
+
+      expect(refreshCalls).toEqual([
+        { accessToken: 'old-oauth', refreshToken: 'old-refresh', deviceUuid: 'device-uuid' },
+      ])
+      expect(restartCalls).toEqual([{ containerName: setup.containerName, cwd: setup.cwd, accountId: 'u-1' }])
+      expect(events).toContainEqual({
+        kind: 'kakao-renewal-tick-ok',
+        containerName: setup.containerName,
+        accountId: 'u-1',
+        previousUpdatedAt: expect.any(String),
+        method: 'oauth_refresh',
+      })
     })
   })
 
