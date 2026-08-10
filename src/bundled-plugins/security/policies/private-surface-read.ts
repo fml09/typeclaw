@@ -93,7 +93,7 @@ export function checkPrivateSurfaceReadGuard(
 
     if (!canonicalEmpty) {
       const identityScanner = createHardlinkIdentityScanner(agentDir, canonicalDirs, canonicalFiles, hooks)
-      for (const candidate of collectPathCandidates(args, tool, undefined, undefined, true, true)) {
+      for (const candidate of collectPathCandidates(args, tool, undefined, localOperands, true, true)) {
         const hit = matchHidden(candidate, agentDir, canonicalDirs, canonicalFiles, identityScanner, realpath)
         if (hit !== undefined) return privateSurfacePathBlock(tool, candidate, hit)
       }

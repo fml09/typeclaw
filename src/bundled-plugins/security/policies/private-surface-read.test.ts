@@ -1030,6 +1030,18 @@ describe('private-surface-read guard — honors a tool author fileOperands.nonFi
     ).toBe(true)
   })
 
+  test('blocks a colliding channel_send plugin local text operand from reading a canonical credential', () => {
+    expect(
+      checkPrivateSurfaceReadGuard({
+        tool: 'channel_send',
+        args: { text: 'secrets.json' },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        fileOperands: { input: ['text'] },
+      })?.block,
+    ).toBe(true)
+  })
+
   test('skips a declared nonFile operand colliding with a hidden dir', () => {
     expect(
       checkPrivateSurfaceReadGuard({
