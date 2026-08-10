@@ -11,7 +11,7 @@ import {
   createPrivateSurfaceReadIdentityVerifier,
   type PrivateSurfaceIdentityVerifier,
 } from '@/bundled-plugins/security/policies/private-surface-read'
-import type { ToolFileOperands, ToolLogger, ToolResult } from '@/plugin'
+import type { ToolFileOperands, ToolLogger, ToolProvenance, ToolResult } from '@/plugin'
 import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
 import type { HiddenPaths } from '@/sandbox/hidden-paths'
 
@@ -84,6 +84,7 @@ export async function enforceAndPinToolFiles(
     hidden?: HiddenPaths
     logger?: Pick<ToolLogger, 'warn'>
     signal?: AbortSignal
+    toolProvenance?: ToolProvenance
   },
   hooks: EnforceAndPinToolFilesHooks = {},
 ): Promise<PinnedToolFiles> {
@@ -97,6 +98,7 @@ export async function enforceAndPinToolFiles(
     options.fileOperands,
     options.agentDir,
     options.logger,
+    options.toolProvenance,
   )
   enforceCanonicalSecretDenial(options)
   const outputs = outputTargets(options.tool, options.args, TOOL_OUTPUT_MAX_COUNT, options.fileOperands)
@@ -254,9 +256,16 @@ export function enforceCanonicalSecretDenial(options: {
   tool: string
   args: Record<string, unknown>
   agentDir: string
+  toolProvenance?: ToolProvenance
 }): void {
-  const { tool, args, agentDir } = options
-  const blocked = checkPrivateSurfaceReadGuard({ tool, args, agentDir, hidden: { dirs: [], files: [] } })
+  const { tool, args, agentDir, toolProvenance } = options
+  const blocked = checkPrivateSurfaceReadGuard({
+    tool,
+    args,
+    agentDir,
+    hidden: { dirs: [], files: [] },
+    ...(toolProvenance !== undefined ? { toolProvenance } : {}),
+  })
   if (blocked !== undefined) throw new Error(`blocked: ${blocked.reason}`)
 }
 
@@ -268,9 +277,10 @@ function fileTargets(
   fileOperands: ToolFileOperands | undefined,
   agentDir: string,
   logger: Pick<ToolLogger, 'warn'> | undefined,
+  toolProvenance: ToolProvenance | undefined,
 ): FileTarget[] {
   if (isOutputTool(tool)) return []
-  if (TOOLS_WITHOUT_LOCAL_FILE_OPERANDS.has(tool)) return []
+  if (toolProvenance === 'first-party' && TOOLS_WITHOUT_LOCAL_FILE_OPERANDS.has(tool)) return []
   if (tool === 'read' && typeof args.path === 'string') return [propertyTarget(args, 'path')]
   if (isTreeInputTool(tool)) {
     if (typeof args.path !== 'string') args.path = '.'

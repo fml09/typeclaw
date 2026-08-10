@@ -854,6 +854,35 @@ describe('wrapPluginTool', () => {
       await rm(agentDir, { recursive: true, force: true })
     }
   })
+
+  test('plugin write tool rejects canonical secret target through enforceAndPinToolFiles without invoking plugin', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-plugin-write-secret-'))
+    let called = false
+    const tool = defineTool({
+      description: '',
+      parameters: z.object({ path: z.string(), content: z.string() }),
+      async execute() {
+        called = true
+        return { content: [] }
+      },
+    })
+    const wrapped = wrapPluginTool(tool, {
+      pluginName: 'writer',
+      toolName: 'write',
+      agentDir,
+      sessionId: 's',
+      logger: noopLogger,
+      hooks: createHookBus(),
+    })
+    try {
+      await expect(
+        wrapped.execute('c', { path: 'public/report.md', content: 'secrets.json' }, undefined, undefined, {} as never),
+      ).rejects.toThrow(/blocked.*privateSurfaceRead/)
+      expect(called).toBeFalse()
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('wrapSystemTool', () => {
@@ -1317,7 +1346,13 @@ describe('wrapSystemTool', () => {
     ]
     for (const [tool, args] of cases) {
       const before = JSON.stringify(args)
-      const pinned = await enforceAndPinToolFiles({ tool, args, agentDir, genericInputs: true })
+      const pinned = await enforceAndPinToolFiles({
+        tool,
+        args,
+        agentDir,
+        genericInputs: true,
+        toolProvenance: 'first-party',
+      })
       await pinned.cleanup()
       expect(JSON.stringify(args)).toBe(before)
     }
@@ -1382,7 +1417,13 @@ describe('wrapSystemTool', () => {
 
     for (const scope of ['cron', 'channels', 'config', 'plugins', 'skills']) {
       const args: Record<string, unknown> = { scope }
-      const pinned = await enforceAndPinToolFiles({ tool: 'reload', args, agentDir, genericInputs: true })
+      const pinned = await enforceAndPinToolFiles({
+        tool: 'reload',
+        args,
+        agentDir,
+        genericInputs: true,
+        toolProvenance: 'first-party',
+      })
       await pinned.cleanup()
       expect(args.scope).toBe(scope)
     }
@@ -1394,7 +1435,13 @@ describe('wrapSystemTool', () => {
     await mkdir(path.join(agentDir, 'cron'), { recursive: true })
 
     const args: Record<string, unknown> = { target_kind: 'cron' }
-    const pinned = await enforceAndPinToolFiles({ tool: 'stream_snapshot', args, agentDir, genericInputs: true })
+    const pinned = await enforceAndPinToolFiles({
+      tool: 'stream_snapshot',
+      args,
+      agentDir,
+      genericInputs: true,
+      toolProvenance: 'first-party',
+    })
     await pinned.cleanup()
     expect(args.target_kind).toBe('cron')
     await rm(agentDir, { recursive: true, force: true })
@@ -1404,7 +1451,13 @@ describe('wrapSystemTool', () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-grant-perm-'))
 
     const args: Record<string, unknown> = { role: 'guest', permission: 'channel.respond' }
-    const pinned = await enforceAndPinToolFiles({ tool: 'grant_role', args, agentDir, genericInputs: true })
+    const pinned = await enforceAndPinToolFiles({
+      tool: 'grant_role',
+      args,
+      agentDir,
+      genericInputs: true,
+      toolProvenance: 'first-party',
+    })
     await pinned.cleanup()
     expect(args.permission).toBe('channel.respond')
     await rm(agentDir, { recursive: true, force: true })
@@ -1484,7 +1537,13 @@ describe('wrapSystemTool', () => {
     ]
     for (const [tool, args] of cases) {
       const before = JSON.stringify(args)
-      const pinned = await enforceAndPinToolFiles({ tool, args, agentDir, genericInputs: true })
+      const pinned = await enforceAndPinToolFiles({
+        tool,
+        args,
+        agentDir,
+        genericInputs: true,
+        toolProvenance: 'first-party',
+      })
       await pinned.cleanup()
       expect(JSON.stringify(args)).toBe(before)
     }
@@ -2679,6 +2738,54 @@ describe('wrapBuiltinToolDefinition (hook + guard pipeline)', () => {
       expect(result.details as Record<string, unknown>).toEqual({ rewritten: true })
       expect((seen[0] as { path: string }).path).not.toBe(mutated)
       expect(observed[0]).toEqual({ path: mutated })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('first-party builtin write accepts long prose through both canonical guard passes', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-builtin-write-prose-'))
+    const workspace = path.join(agentDir, 'workspace')
+    const target = path.join(workspace, 'report.md')
+    const content = 'x'.repeat(300)
+    const provenances: unknown[] = []
+    const tool = {
+      name: 'write',
+      label: 'write',
+      description: '',
+      parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+      async execute(_callId: string, params: { path: string; content: string }) {
+        await writeFile(params.path, params.content)
+        return { content: [{ type: 'text' as const, text: 'written' }], details: undefined }
+      },
+    }
+    const hooks = createHookBus()
+    hooks.registerAll('security', agentDir, noopLogger, {
+      'tool.before': (event) => {
+        provenances.push(event.toolProvenance)
+        return checkPrivateSurfaceReadGuard({
+          tool: event.tool,
+          args: event.args,
+          agentDir,
+          hidden: { dirs: [], files: [] },
+          toolProvenance: event.toolProvenance,
+        })
+      },
+    })
+    const wrapped = wrapBuiltinToolDefinition(tool, { agentDir, sessionId: 's', hooks })
+
+    try {
+      await mkdir(workspace)
+      if (lacksInodeAnchoring) {
+        await expect(
+          wrapped.execute('c', { path: target, content }, undefined, undefined, {} as never),
+        ).rejects.toThrow(/inode anchoring/)
+        expect(provenances).toEqual(['first-party'])
+        return
+      }
+      await wrapped.execute('c', { path: target, content }, undefined, undefined, {} as never)
+      expect(provenances).toEqual(['first-party'])
+      expect(await readFile(target, 'utf8')).toBe(content)
     } finally {
       await rm(agentDir, { recursive: true, force: true })
     }
