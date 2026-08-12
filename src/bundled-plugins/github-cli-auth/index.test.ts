@@ -716,6 +716,18 @@ describe('github-cli-auth plugin', () => {
     }
   })
 
+  test('injects a PAT for literal backslashes inside a single-quoted jq filter', async () => {
+    process.env.GH_TOKEN = 'ghp_primary'
+    const hook = await hookFor(tokenResolver('ghs_minted'), true, { permissions: privilegedPermissions })
+    const filter = '.content | gsub("\\n"; "") | @base64d'
+
+    for (const jqArg of [`--jq '${filter}'`, `-q='${filter}'`]) {
+      const event = bashEvent(`gh api /user ${jqArg}`)
+      expect(await hook(event, hookCtx)).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghp_primary' })
+    }
+  })
+
   test('never injects a PAT into gh alias or extension execution surfaces', async () => {
     process.env.GH_TOKEN = 'ghp_primary'
     const hook = await hookFor(tokenResolver('ghs_minted'), true, { permissions: privilegedPermissions })
