@@ -118,6 +118,21 @@ describe('reviewer subagent — load-bearing prompt phrases', () => {
     expect(lower).toContain('in parallel')
   })
 
+  test('prompt batches independent reads and waits for background completion reminders instead of polling', () => {
+    const lower = REVIEWER_SYSTEM_PROMPT.toLowerCase()
+    expect(lower).toContain('batch independent')
+    expect(lower).toContain('completion `<system-reminder>`')
+    expect(lower).toContain('do not poll `subagent_output`')
+  })
+
+  test('prompt forbids unsupported shell composition and manual review checkouts', () => {
+    const lower = REVIEWER_SYSTEM_PROMPT.toLowerCase()
+    expect(lower).toContain('no shell loops, pipelines, redirects')
+    expect(lower).toContain('never guess or reconstruct a `/tmp` path')
+    expect(lower).not.toContain('one-shot pipelines')
+    expect(lower).not.toContain('git clone`/`fetch`/detached')
+  })
+
   test('prompt still forbids side effects through a delegate (no laundering write access via a subagent)', () => {
     const lower = REVIEWER_SYSTEM_PROMPT.toLowerCase()
     expect(lower).toContain('a subagent you spawn cannot do for you')
@@ -407,6 +422,28 @@ describe('reviewer skill content', () => {
     expect(lower).toContain('do not use `git clone`')
     expect(lower).toContain('never the reviewed artifact')
     expect(lower).toContain('leave cleanup to the session lifecycle')
+    expect(lower).toContain('exactly once')
+    expect(lower).toContain('use the returned receipt path exactly')
+    expect(lower).toContain('never guess, derive, or reconstruct')
+  })
+
+  test('code-review skill reuses prior review work and narrows re-review exploration to intervening changes', () => {
+    const lower = CODE_REVIEW_SKILL.content.toLowerCase()
+    expect(lower).toContain('compare the prior reviewed head with the current head')
+    expect(lower).toContain('intervening changes')
+    expect(lower).toContain('reuse prior findings')
+    expect(lower).toContain('cumulative correctness')
+  })
+
+  test.each([
+    ['doc-review', DOC_REVIEW_SKILL.content],
+    ['plan-review', PLAN_REVIEW_SKILL.content],
+  ])('%s uses the single runtime checkout receipt for broad PR context', (_name, content) => {
+    const lower = content.toLowerCase()
+    expect(content).toContain('github_prepare_review_checkout')
+    expect(lower).toContain('exactly once')
+    expect(lower).toContain('returned receipt path exactly')
+    expect(lower).toContain('never guess')
   })
 
   test('code-review skill accounts for resolved threads in the summary, not as praise findings (re-review noise guard)', () => {
