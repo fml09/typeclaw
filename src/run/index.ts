@@ -17,6 +17,7 @@ import {
   invokeSubagent,
   isSubagentTimeoutError,
   resolveSubagentProfile,
+  SubagentCoalescer,
   type Subagent as InternalSubagent,
   type SubagentConsumer,
   type SubagentRegistry,
@@ -90,6 +91,7 @@ import { installFatalGuard } from './fatal-guard'
 import { installLlmFetchObserver } from './llm-fetch-observer'
 import { createPluginRuntime, type PluginRuntime, type PluginSubagentEntry } from './plugin-runtime'
 import { logResourceReport } from './resource-report'
+import { acquireSubagentCoalesceLease } from './subagent-coalescing'
 
 type BunServer = ReturnType<Server['start']>
 
@@ -439,6 +441,7 @@ async function startAgentRuntime(
   })
 
   const liveSubagentRegistry = new LiveSubagentRegistry()
+  const subagentCoalescer = new SubagentCoalescer()
   const liveSessionRegistry = new LiveSessionRegistry()
 
   const channelManager = createChannelManagerFor({
@@ -459,6 +462,7 @@ async function startAgentRuntime(
       permissions: pluginsLoaded.permissions,
       reloadRoles: () => reloadRolesFromDisk(cwd),
       liveSubagentRegistry,
+      subagentCoalescer,
       liveSessionRegistry,
       subagentRegistry: pluginRuntime.get().subagents,
       getCreateSessionForSubagent: () => createSessionForSubagent,
@@ -569,6 +573,7 @@ async function startAgentRuntime(
         ...(entry.pluginSubagent.canSpawnSubagents === true
           ? {
               liveSubagentRegistry,
+              subagentCoalescer,
               subagentRegistry: snap.subagents,
               createSessionForSubagent,
               allowBackgroundFromSubagent,
@@ -637,17 +642,18 @@ async function startAgentRuntime(
     getRegistry: () => pluginRuntime.get().subagents,
     agentDir: cwd,
     createSessionForSubagent,
-    inFlightKey: (name, payload) => {
-      const entry = pluginSubagentByName.get(name)
-      const fn = entry?.pluginSubagent.inFlightKey
+    coalescer: subagentCoalescer,
+    inFlightKey: (name, payload, parentSessionId) => {
+      const fn = pluginRuntime.get().subagents[name]?.inFlightKey
       if (fn !== undefined) {
         try {
-          return `${name}:${fn(payload)}`
+          const key = `${name}:${fn(payload)}`
+          return parentSessionId === undefined ? key : `${parentSessionId}:${key}`
         } catch {
-          return name
+          return parentSessionId === undefined ? name : `${parentSessionId}:${name}`
         }
       }
-      return name
+      return parentSessionId === undefined ? name : `${parentSessionId}:${name}`
     },
   })
   registerBootCleanup(() => subagentConsumer.stop())
@@ -755,6 +761,7 @@ async function startAgentRuntime(
             }
           : {}),
         liveSubagentRegistry,
+        subagentCoalescer,
         subagentRegistry: pluginRuntime.get().subagents,
         createSessionForSubagent,
         ...containerNameOpt,
@@ -911,23 +918,19 @@ async function startAgentRuntime(
   // subagent declares one, else just `${name}`. Collisions resolve cleanly
   // (logged + return) instead of rejecting, because callers from
   // session.prompt are detached and a colliding spawn is a noop, not an error.
-  const directSpawnInFlight = new Set<string>()
   const dispatchSpawnSubagent: CommandSpawnSubagent = async (name, payload, options) => {
-    const entry = pluginSubagentByName.get(name)
-    const keyFn = entry?.pluginSubagent.inFlightKey
-    let coalesceKey = name
-    if (keyFn !== undefined) {
-      try {
-        coalesceKey = `${name}:${keyFn(payload)}`
-      } catch {
-        coalesceKey = name
-      }
-    }
-    if (directSpawnInFlight.has(coalesceKey)) {
-      console.warn(`[subagent] ${coalesceKey}: previous direct spawn still in progress, skipping`)
+    const registry = pluginRuntime.get().subagents
+    const lease = acquireSubagentCoalesceLease({
+      coalescer: subagentCoalescer,
+      subagentName: name,
+      subagent: registry[name],
+      payload,
+      ...(options?.parentSessionId !== undefined ? { parentSessionId: options.parentSessionId } : {}),
+    })
+    if (lease === null) {
+      console.warn(`[subagent] ${name}: previous direct spawn still in progress, skipping`)
       return
     }
-    directSpawnInFlight.add(coalesceKey)
     try {
       // Resolve the spawning session's role from its origin so the subagent
       // inherits it. Callers (hooks like session.idle) pass the parent origin
@@ -937,7 +940,6 @@ async function startAgentRuntime(
         options?.spawnedByOrigin !== undefined
           ? pluginsLoaded.permissions.resolveRole(options.spawnedByOrigin)
           : undefined
-      const registry = pluginRuntime.get().subagents
       try {
         await awaitWithSubagentTimeout(
           invokeSubagent(name, {
@@ -952,18 +954,18 @@ async function startAgentRuntime(
             ...(options?.spawnedByOrigin !== undefined ? { spawnedByOrigin: options.spawnedByOrigin } : {}),
           }),
           name,
-          coalesceKey,
+          lease.key,
           registry[name]?.timeoutMs,
         )
       } catch (err) {
         if (isSubagentTimeoutError(err)) {
-          console.warn(`[subagent] ${coalesceKey} timed out after ${err.timeoutMs}ms; releasing coalesce key`)
+          console.warn(`[subagent] ${lease.key} timed out after ${err.timeoutMs}ms; releasing coalesce key`)
           return
         }
         throw err
       }
     } finally {
-      directSpawnInFlight.delete(coalesceKey)
+      lease.release()
     }
   }
   pluginsLoaded.setSpawnSubagent(dispatchSpawnSubagent)
@@ -1031,6 +1033,7 @@ async function startAgentRuntime(
     commandRunnerFactory,
     tunnelManager,
     liveSubagentRegistry,
+    subagentCoalescer,
     createSessionForSubagent,
     liveSessionRegistry,
     ...containerNameOpt,
@@ -1310,7 +1313,6 @@ type PluginOnlySubagentKeys = Exclude<keyof import('@/plugin').Subagent<any>, ke
 const PLUGIN_ONLY_KEYS_DROPPED_BY_SHIM = {
   tools: true,
   customTools: true,
-  inFlightKey: true,
 } satisfies Record<PluginOnlySubagentKeys, true>
 // Reference the table so it's not dead code. The value is a runtime no-op;
 // the load-bearing work is the `satisfies` clause above which forces
@@ -1322,15 +1324,13 @@ function pluginSubagentShim(subagent: import('@/plugin').Subagent<any>): Interna
   // `AgentSessionTools` internal-side; `customTools` similarly differs) are
   // resolved later in `createSessionForSubagent` via the
   // `pluginSubagentByShim` lookup, which recovers the original plugin
-  // reference. `inFlightKey` is consumed only by the SubagentConsumer via
-  // `pluginSubagentByName`, not through this shim's registry path. Every
-  // other plugin-side field lives on `SubagentShared` and is structurally
+  // reference. Every other plugin-side field lives on `SubagentShared` and is structurally
   // assignable to the internal `Subagent`, so a rest-spread carries them
   // verbatim — including `visibility` and `requiresSpecificPermission`,
   // whose silent drop in the previous shim made every plugin-contributed
   // public subagent (scout, explorer, operator) invisible to the
   // `spawn_subagent` tool. The list of keys removed here is enforced
   // exhaustive at compile time by `PLUGIN_ONLY_KEYS_DROPPED_BY_SHIM` above.
-  const { tools: _tools, customTools: _customTools, inFlightKey: _inFlightKey, ...shared } = subagent
+  const { tools: _tools, customTools: _customTools, ...shared } = subagent
   return shared
 }

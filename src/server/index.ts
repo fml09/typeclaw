@@ -22,7 +22,7 @@ import { promptWithSameRefRetryOnly } from '@/agent/retry-same-ref'
 import { sessionMetaPayload } from '@/agent/session-meta'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { parseSubagentCompletedPayload, renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
-import type { CreateSessionForSubagent } from '@/agent/subagents'
+import type { CreateSessionForSubagent, SubagentCoalescer } from '@/agent/subagents'
 import { TODO_CONTINUATION_SOURCE } from '@/agent/todo/continuation'
 import {
   armRestartKickForOrigin,
@@ -135,6 +135,7 @@ export type ServerOptions = {
   // surface diverges across origin kinds — exactly the gap PR #281 flagged
   // as out-of-scope follow-up.
   liveSubagentRegistry?: LiveSubagentRegistry
+  subagentCoalescer?: SubagentCoalescer
   createSessionForSubagent?: CreateSessionForSubagent
   // Id-keyed registry of live AgentSessions, used by `/inspect` (and any
   // future read-only session-event consumer) to subscribe to session
@@ -293,6 +294,7 @@ export function createServer({
   claimController,
   commandRunnerFactory,
   liveSubagentRegistry,
+  subagentCoalescer,
   createSessionForSubagent,
   liveSessionRegistry,
 }: ServerOptions) {
@@ -538,6 +540,7 @@ export function createServer({
               ...(containerName !== undefined ? { containerName } : {}),
               ...(runtimeVersion !== undefined ? { runtimeVersion } : {}),
               ...(liveSubagentRegistry !== undefined ? { liveSubagentRegistry } : {}),
+              ...(subagentCoalescer !== undefined ? { subagentCoalescer } : {}),
               ...(subagentRegistry !== undefined ? { subagentRegistry } : {}),
               ...(createSessionForSubagent !== undefined ? { createSessionForSubagent } : {}),
             })

@@ -6,7 +6,7 @@ import { createSession as defaultCreateSession } from '@/agent'
 import type { LiveSessionRegistry } from '@/agent/live-sessions'
 import type { LiveSubagentRegistry } from '@/agent/live-subagents'
 import { sessionMetaPayload } from '@/agent/session-meta'
-import type { CreateSessionForSubagent, SubagentRegistry } from '@/agent/subagents'
+import type { CreateSessionForSubagent, SubagentCoalescer, SubagentRegistry } from '@/agent/subagents'
 import { capJsonlFileInPlace } from '@/bundled-plugins/tool-result-cap/cap-jsonl'
 import type { CapOptions } from '@/bundled-plugins/tool-result-cap/cap-result'
 import type { CreateSessionForChannel, ChannelRouter } from '@/channels'
@@ -70,6 +70,7 @@ export type BuildChannelSessionFactoryDeps = {
   // createSessionForSubagent, which needs channelManager.router. Same shape
   // as `getChannelRouter` above.
   liveSubagentRegistry?: LiveSubagentRegistry
+  subagentCoalescer?: SubagentCoalescer
   subagentRegistry?: SubagentRegistry
   getCreateSessionForSubagent?: () => CreateSessionForSubagent
   liveSessionRegistry?: LiveSessionRegistry
@@ -136,6 +137,7 @@ export function buildChannelSessionFactory(deps: BuildChannelSessionFactoryDeps)
       ...(deps.permissions !== undefined ? { permissions: deps.permissions } : {}),
       ...(deps.reloadRoles !== undefined ? { reloadRoles: deps.reloadRoles } : {}),
       ...(deps.liveSubagentRegistry !== undefined ? { liveSubagentRegistry: deps.liveSubagentRegistry } : {}),
+      ...(deps.subagentCoalescer !== undefined ? { subagentCoalescer: deps.subagentCoalescer } : {}),
       ...(deps.subagentRegistry !== undefined ? { subagentRegistry: deps.subagentRegistry } : {}),
       ...(deps.getCreateSessionForSubagent !== undefined
         ? { createSessionForSubagent: deps.getCreateSessionForSubagent() }
