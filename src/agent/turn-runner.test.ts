@@ -671,6 +671,34 @@ describe('promptPersistentTurnWithFallback no-progress envelope', () => {
     expect(attemptedRefs).toEqual([REF_A, REF_B])
   })
 
+  test('deep patient mode does not stack patient retries onto repeated TTFB failures', async () => {
+    // Three no-progress attempts are the safe minimum: primary + its one
+    // ordinary transient replay + one cross-ref fallback. Patient capacity
+    // retries must not multiply this TTFB envelope.
+    const fake = retryableFakeSession([
+      'soft-observer-ttfb-timeout',
+      'soft-observer-ttfb-timeout',
+      'soft-observer-ttfb-timeout',
+      'success',
+    ])
+
+    const result = await promptPersistentTurnWithFallback({
+      refs: [REF_A, ANTHROPIC_REF],
+      currentModelRef: REF_A,
+      session: fake.session,
+      text: 'review this',
+      retryPolicy: 'patient',
+      circuit: new ThrottleCircuit(),
+      shouldFailover: (err) => isFailoverWorthy(err.message),
+      setModelForRef: async () => {},
+      now: () => 0,
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.refUsed).toBe(ANTHROPIC_REF)
+    expect(fake.attempts()).toBe(3)
+  })
+
   test('surfaces at 60 seconds of cumulative no-progress before three attempts', async () => {
     let nowMs = 0
     const fake = retryableFakeSession(['soft-observer-ttfb-timeout', 'soft-observer-ttfb-timeout', 'success'], () => {
