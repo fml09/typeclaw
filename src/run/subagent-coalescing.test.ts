@@ -9,6 +9,7 @@ const identity = {
   repo: 'acme/widgets',
   pullRequest: 42,
   headSha: 'a'.repeat(40),
+  baseSha: 'b'.repeat(40),
   reviewKind: 'review' as const,
 }
 

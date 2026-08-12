@@ -261,7 +261,54 @@ describe('reviewer subagent declaration', () => {
     expect(timeout).toBeLessThanOrEqual(1_800_000)
   })
 
-  test('inFlightKey returns distinct values for distinct requestId payloads (parallel spawns must not coalesce)', () => {
+  test('inFlightKey coalesces the same PR head and review kind regardless of requestId', () => {
+    const sub = createReviewerSubagent()
+    const reviewIdentity = {
+      repo: 'Acme/Widgets',
+      pullRequest: 42,
+      headSha: 'A'.repeat(40),
+      baseSha: 'B'.repeat(40),
+      reviewKind: 'review' as const,
+    }
+
+    const k1 = sub.inFlightKey?.({ requestId: 'bg_a', reviewIdentity })
+    const k2 = sub.inFlightKey?.({ requestId: 'bg_b', reviewIdentity })
+
+    expect(k1).toBe(`acme/widgets#42#${'a'.repeat(40)}#${'b'.repeat(40)}#review`)
+    expect(k2).toBe(k1)
+  })
+
+  test('inFlightKey keeps changed PR heads and review kinds independent', () => {
+    const sub = createReviewerSubagent()
+    const base = {
+      repo: 'acme/widgets',
+      pullRequest: 42,
+      headSha: 'a'.repeat(40),
+      baseSha: 'c'.repeat(40),
+      reviewKind: 'review' as const,
+    }
+
+    const original = sub.inFlightKey?.({ requestId: 'bg_a', reviewIdentity: base })
+    const changedHead = sub.inFlightKey?.({
+      requestId: 'bg_b',
+      reviewIdentity: { ...base, headSha: 'b'.repeat(40) },
+    })
+    const changedKind = sub.inFlightKey?.({
+      requestId: 'bg_c',
+      reviewIdentity: { ...base, reviewKind: 're-review' },
+    })
+    const changedBase = sub.inFlightKey?.({
+      requestId: 'bg_d',
+      reviewIdentity: { ...base, baseSha: 'd'.repeat(40) },
+    })
+
+    expect(changedHead).not.toBe(original)
+    expect(changedKind).not.toBe(original)
+    expect(changedBase).not.toBe(original)
+    expect(changedHead).not.toBe(changedKind)
+  })
+
+  test('inFlightKey retains unique request identity for non-PR reviews', () => {
     const sub = createReviewerSubagent()
     const k1 = sub.inFlightKey?.({ requestId: 'bg_a' })
     const k2 = sub.inFlightKey?.({ requestId: 'bg_b' })
@@ -600,6 +647,37 @@ describe('reviewerPayloadSchema', () => {
       description: 'PR review',
     })
     expect(result.success).toBe(true)
+  })
+
+  test('accepts a typed PR review identity', () => {
+    const result = reviewerPayloadSchema.safeParse({
+      requestId: 'bg_t1',
+      prompt: 'review PR #42',
+      reviewIdentity: {
+        repo: 'acme/widgets',
+        pullRequest: 42,
+        headSha: 'a'.repeat(40),
+        baseSha: 'b'.repeat(40),
+        reviewKind: 'review',
+      },
+    })
+
+    expect(result.success).toBe(true)
+  })
+
+  test('rejects malformed PR review identities instead of deriving identity from prompt prose', () => {
+    expect(
+      reviewerPayloadSchema.safeParse({
+        prompt: 'review acme/widgets#42 at some moving branch',
+        reviewIdentity: {
+          repo: 'acme/widgets',
+          pullRequest: 0,
+          headSha: 'main',
+          baseSha: 'main',
+          reviewKind: '',
+        },
+      }).success,
+    ).toBe(false)
   })
 
   test('accepts a payload with only requestId (spawn-tool minimum)', () => {

@@ -180,11 +180,22 @@ These three tokens are the universal verdict vocabulary — they apply whether t
 
 You have one shot. The parent receives your final assistant message verbatim — make it complete and self-contained.`
 
+export const reviewerReviewIdentitySchema = z.object({
+  repo: z.string().regex(/^[^/\s]+\/[^/\s]+$/),
+  pullRequest: z.number().int().positive(),
+  headSha: z.string().regex(/^[0-9a-f]{40}$/i),
+  baseSha: z.string().regex(/^[0-9a-f]{40}$/i),
+  reviewKind: z.enum(['review', 're-review']),
+})
+
+export type ReviewerReviewIdentity = z.infer<typeof reviewerReviewIdentitySchema>
+
 export const reviewerPayloadSchema = z
   .object({
     requestId: z.string().optional(),
     prompt: z.string().optional(),
     description: z.string().optional(),
+    reviewIdentity: reviewerReviewIdentitySchema.optional(),
   })
   .passthrough()
 
@@ -225,7 +236,13 @@ If none of the listed skills fit the target, load \`general\`. Keep the skill-se
     canSpawnSubagents: true,
     canBackgroundSpawnSubagents: true,
     timeoutMs: REVIEWER_SPAWN_TIMEOUT_MS,
-    inFlightKey: (payload) => payload?.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    // Only PR jobs opt into stable coalescing. General code/plan/document
+    // reviews retain request-scoped concurrency; deriving identity from prompt
+    // prose would risk collapsing unrelated work or reviews of different heads.
+    inFlightKey: (payload) =>
+      payload.reviewIdentity === undefined
+        ? (payload.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+        : reviewerReviewIdentityKey(payload.reviewIdentity),
     toolResultBudget: {
       // Higher than explorer (256KB) because a reviewer typically reads larger
       // diffs and multiple files plus web sources; lower than operator (1MB)
@@ -234,4 +251,14 @@ If none of the listed skills fit the target, load \`general\`. Keep the skill-se
       toolNames: ['read', 'grep', 'find', 'ls', 'bash', 'web_search', 'web_fetch', 'load_skill'],
     },
   }
+}
+
+export function reviewerReviewIdentityKey(identity: ReviewerReviewIdentity): string {
+  return [
+    identity.repo.toLocaleLowerCase(),
+    identity.pullRequest,
+    identity.headSha.toLocaleLowerCase(),
+    identity.baseSha.toLocaleLowerCase(),
+    identity.reviewKind.toLocaleLowerCase(),
+  ].join('#')
 }
