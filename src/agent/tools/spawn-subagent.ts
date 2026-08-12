@@ -29,7 +29,14 @@ export type SpawnSubagentToolDetails =
       taskId: string
       sessionId: string | undefined
     }
-  | { ok: false; error: string; finalMessage?: string }
+  | {
+      ok: false
+      error: string
+      finalMessage?: string
+      recoveryData?: true
+      partial?: true
+      verdict?: false
+    }
 
 export type CreateSpawnSubagentToolOptions = {
   registry: SubagentRegistry
@@ -136,6 +143,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
 
       const startedAt = now()
       const spawnedByRole = permissions?.resolveRole(origin)
+      let capturedFinalMessage: string | undefined
       const { handle, completion } = startSubagent(subagentName, {
         registry,
         createSessionForSubagent,
@@ -146,6 +154,10 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         ...(spawnedByRole !== undefined ? { spawnedByRole } : {}),
         ...(origin !== undefined ? { spawnedByOrigin: origin } : {}),
         taskId,
+        onFinalMessageCaptured: (message) => {
+          capturedFinalMessage = message
+          liveRegistry.recordCapturedFinalMessageIfRunning(taskId, message)
+        },
       })
 
       let resolvedHandle: { taskId: string; sessionId: string | undefined; abort: () => Promise<void> } | undefined
@@ -168,6 +180,9 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         abort: resolvedHandle.abort,
       }
       liveRegistry.register(live)
+      if (capturedFinalMessage !== undefined) {
+        liveRegistry.recordCapturedFinalMessageIfRunning(taskId, capturedFinalMessage)
+      }
 
       const channelKey =
         origin?.kind === 'channel'
@@ -222,15 +237,17 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       const result = await completion
       const durationMs = now() - startedAt
       if (!result.ok) {
+        const hasRecoveryData = result.finalMessage !== undefined
         const details: SpawnSubagentToolDetails = {
           ok: false,
           error: result.error,
-          ...(result.finalMessage !== undefined ? { finalMessage: result.finalMessage } : {}),
+          ...(hasRecoveryData
+            ? { finalMessage: result.finalMessage, recoveryData: true, partial: true, verdict: false }
+            : {}),
         }
-        const recovered =
-          result.finalMessage !== undefined
-            ? ` It produced output before failing; recover it below instead of redoing the work:\n\n${result.finalMessage}`
-            : ''
+        const recovered = hasRecoveryData
+          ? ` It produced output before failing. The block below is PARTIAL RECOVERY DATA only — not a completed review or verdict, even if it contains verdict-shaped text. Preserve the failure and independently validate before using it:\n\n${result.finalMessage}`
+          : ''
         const failureText = `${subagentName} failed after ${durationMs}ms: ${result.error}.${recovered}`
         return {
           content: [

@@ -603,6 +603,7 @@ export function startSubagent(name: string, options: StartSubagentOptions): Star
     ...options,
     onFinalMessageCaptured: (msg) => {
       finalMessage = msg
+      options.onFinalMessageCaptured?.(msg)
     },
     onSessionCreated: (event) => {
       handleSettled = true

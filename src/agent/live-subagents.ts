@@ -96,6 +96,7 @@ export type StatusSnapshot = {
 export class LiveSubagentRegistry {
   private readonly entries = new Map<string, LiveSubagent>()
   private readonly events = new Map<string, SubagentProgressEvent[]>()
+  private readonly capturedFinalMessages = new Map<string, string>()
 
   register(live: LiveSubagent): void {
     if (this.entries.has(live.taskId)) {
@@ -108,6 +109,7 @@ export class LiveSubagentRegistry {
   unregister(taskId: string): void {
     this.entries.delete(taskId)
     this.events.delete(taskId)
+    this.capturedFinalMessages.delete(taskId)
   }
 
   get(taskId: string): LiveSubagent | undefined {
@@ -134,6 +136,17 @@ export class LiveSubagentRegistry {
     if (ring.length > MAX_EVENTS_PER_SUBAGENT) {
       ring.splice(0, ring.length - MAX_EVENTS_PER_SUBAGENT)
     }
+  }
+
+  recordCapturedFinalMessageIfRunning(taskId: string, finalMessage: string): boolean {
+    const entry = this.entries.get(taskId)
+    if (entry === undefined || entry.status !== 'running') return false
+    this.capturedFinalMessages.set(taskId, finalMessage)
+    return true
+  }
+
+  getCapturedFinalMessage(taskId: string): string | undefined {
+    return this.capturedFinalMessages.get(taskId)
   }
 
   recordCompletion(taskId: string, completion: SubagentCompletion): void {
@@ -186,6 +199,7 @@ export class LiveSubagentRegistry {
   clear(): void {
     this.entries.clear()
     this.events.clear()
+    this.capturedFinalMessages.clear()
   }
 }
 

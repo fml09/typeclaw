@@ -93,13 +93,22 @@ function expireOverdueChildren(
     if (child.startedAt > deadline) continue
     const durationMs = now() - child.startedAt
     const error = `subagent ${child.subagentName} exceeded the ${maxChildWaitMs}ms drain wait and was abandoned`
+    const finalMessage = drain.liveRegistry.getCapturedFinalMessage(child.taskId)
     // Claim the settlement BEFORE aborting. If the child's real completion
     // already won, skip — no double-settle, no broadcast. Awaiting abort here
     // would be the bug the ceiling exists to prevent: a wedged `session.abort()`
     // that never reaches idle would hang the drain, so fire-and-forget instead.
     // Logical settlement can precede physical teardown; startSubagent still
     // disposes the session when its own work settles.
-    if (!drain.liveRegistry.recordCompletionIfRunning(child.taskId, { ok: false, durationMs, error })) continue
+    if (
+      !drain.liveRegistry.recordCompletionIfRunning(child.taskId, {
+        ok: false,
+        durationMs,
+        error,
+        ...(finalMessage !== undefined ? { finalMessage } : {}),
+      })
+    )
+      continue
     drain.stream.publish({
       target: { kind: 'broadcast' },
       payload: {
@@ -110,6 +119,7 @@ function expireOverdueChildren(
         ok: false,
         durationMs,
         error,
+        ...(finalMessage !== undefined ? { hasRecoverableOutput: true } : {}),
       },
     })
     void child.abort().catch(() => {})
