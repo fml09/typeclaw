@@ -2,12 +2,18 @@ import { describe, expect, test } from 'bun:test'
 
 import { z } from 'zod'
 
+import {
+  createReviewerSubagent,
+  type ReviewerPayload,
+  reviewerPayloadSchema,
+} from '@/bundled-plugins/reviewer/reviewer'
 import type { PermissionService } from '@/permissions'
 import { createStream } from '@/stream'
 
 import type { AgentSession } from '../index'
 import { LiveSubagentRegistry } from '../live-subagents'
 import type { SessionOrigin } from '../session-origin'
+import { createSubagentConsumer, SubagentCoalescer } from '../subagents'
 import type {
   CreateSessionForSubagent,
   CreateSessionForSubagentOptions,
@@ -15,6 +21,7 @@ import type {
   SubagentRegistry,
 } from '../subagents'
 import { createSpawnSubagentTool, resolveSpawnMode } from './spawn-subagent'
+import { createSubagentCancelTool } from './subagent-cancel'
 
 const ctx = {} as Parameters<ReturnType<typeof createSpawnSubagentTool>['execute']>[4]
 
@@ -67,6 +74,18 @@ function makeRegistry(overrides: Record<string, Subagent<unknown>> = {}): Subage
     'memory-logger': internalSub,
     ...overrides,
   }
+}
+
+function reviewerRegistry(): { reviewer: Subagent<ReviewerPayload>; registry: SubagentRegistry } {
+  const pluginReviewer = createReviewerSubagent()
+  const reviewer: Subagent<ReviewerPayload> = {
+    systemPrompt: pluginReviewer.systemPrompt,
+    visibility: pluginReviewer.visibility,
+    profile: pluginReviewer.profile,
+    payloadSchema: pluginReviewer.payloadSchema,
+    inFlightKey: pluginReviewer.inFlightKey,
+  }
+  return { reviewer, registry: { reviewer } }
 }
 
 function fixedSpawn(opts: {
@@ -638,6 +657,412 @@ describe('createSpawnSubagentTool — concurrency', () => {
     resolveA()
     resolveB()
     await new Promise((r) => setImmediate(r))
+  })
+
+  test('coalesces duplicate reviewer provider execution by typed PR identity', async () => {
+    let releasePrompt: () => void = () => {}
+    let sessionsCreated = 0
+    let providerExecutions = 0
+    const session = stubSession()
+    session.prompt = () => {
+      providerExecutions++
+      return new Promise<void>((resolve) => {
+        releasePrompt = resolve
+      })
+    }
+    const liveRegistry = new LiveSubagentRegistry()
+    let task = 0
+    const { registry } = reviewerRegistry()
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => {
+        sessionsCreated++
+        return session
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => `bg_review${++task}`,
+      now: () => 1_000,
+    })
+    const review_identity = {
+      repo: 'acme/widgets',
+      pull_request: 42,
+      head_sha: 'a'.repeat(40),
+      base_sha: 'b'.repeat(40),
+      review_kind: 'review',
+    }
+
+    const first = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'review it', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+    const duplicate = await tool.execute(
+      'call_2',
+      { subagent_type: 'reviewer', prompt: 'review it again', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect((first.details as { ok: boolean }).ok).toBe(true)
+    expect((duplicate.details as { ok: boolean; error?: string }).ok).toBe(false)
+    expect((duplicate.details as { error?: string }).error).toContain('already in progress')
+    expect(sessionsCreated).toBe(1)
+    expect(providerExecutions).toBe(1)
+
+    releasePrompt()
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+
+  test('shares reviewer coalescing across spawn-tool and stream dispatch paths', async () => {
+    const stream = createStream()
+    const coalescer = new SubagentCoalescer()
+    const { reviewer, registry } = reviewerRegistry()
+    let releasePrompt: () => void = () => {}
+    let providerExecutions = 0
+    const createSession: CreateSessionForSubagent = async () => {
+      const session = stubSession()
+      session.prompt = () => {
+        providerExecutions++
+        return new Promise<void>((resolve) => {
+          releasePrompt = resolve
+        })
+      }
+      return session
+    }
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry: new LiveSubagentRegistry(),
+      createSessionForSubagent: createSession,
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => 'bg_direct',
+      now: () => 1_000,
+      stream,
+      coalescer,
+    })
+    const warnings: string[] = []
+    const consumer = createSubagentConsumer({
+      stream,
+      getRegistry: () => registry,
+      agentDir: '/agent',
+      createSessionForSubagent: createSession,
+      coalescer,
+      inFlightKey: (name, payload, parentSessionId) => {
+        const key = `${name}:${reviewer.inFlightKey?.(reviewerPayloadSchema.parse(payload)) ?? name}`
+        return parentSessionId === undefined ? key : `${parentSessionId}:${key}`
+      },
+      logger: { info: () => {}, warn: (message) => warnings.push(message), error: () => {} },
+    })
+    consumer.start()
+    const identity = {
+      repo: 'acme/widgets',
+      pullRequest: 42,
+      headSha: 'a'.repeat(40),
+      baseSha: 'b'.repeat(40),
+      reviewKind: 'review',
+    }
+
+    await tool.execute(
+      'call_1',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'review it',
+        review_identity: {
+          repo: identity.repo,
+          pull_request: identity.pullRequest,
+          head_sha: identity.headSha,
+          base_sha: identity.baseSha,
+          review_kind: identity.reviewKind,
+        },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+    stream.publish({
+      target: { kind: 'new-session', subagent: 'reviewer', parentSessionId: 'ses_parent' },
+      payload: { requestId: 'stream-request', prompt: 'duplicate', reviewIdentity: identity },
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(providerExecutions).toBe(1)
+    expect(warnings.some((warning) => warning.includes('previous run still in progress'))).toBe(true)
+    expect(consumer.inFlightCount()).toBe(0)
+
+    releasePrompt()
+    await new Promise((resolve) => setImmediate(resolve))
+    consumer.stop()
+  })
+
+  test('keeps identical reviewer identities independent across parent sessions', async () => {
+    const coalescer = new SubagentCoalescer()
+    const { registry } = reviewerRegistry()
+    let sessionsCreated = 0
+    const createTool = (parentSessionId: string, taskId: string) =>
+      createSpawnSubagentTool({
+        registry,
+        liveRegistry: new LiveSubagentRegistry(),
+        createSessionForSubagent: async () => {
+          sessionsCreated++
+          return stubSession()
+        },
+        agentDir: '/agent',
+        parentSessionId,
+        getOrigin: () => ({ kind: 'tui', sessionId: parentSessionId }),
+        generateTaskId: () => taskId,
+        coalescer,
+      })
+    const review_identity = {
+      repo: 'acme/widgets',
+      pull_request: 42,
+      head_sha: 'a'.repeat(40),
+      base_sha: 'b'.repeat(40),
+      review_kind: 'review' as const,
+    }
+
+    const results = await Promise.all([
+      createTool('ses_a', 'bg_a').execute(
+        'call_1',
+        { subagent_type: 'reviewer', prompt: 'review it', review_identity },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      createTool('ses_b', 'bg_b').execute(
+        'call_2',
+        { subagent_type: 'reviewer', prompt: 'review it', review_identity },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    ])
+
+    expect(results.map((result) => result.details)).toEqual([
+      expect.objectContaining({ ok: true }),
+      expect.objectContaining({ ok: true }),
+    ])
+    expect(sessionsCreated).toBe(2)
+  })
+
+  test('releases reviewer identity when cancellation is accepted even if completion stays wedged', async () => {
+    const coalescer = new SubagentCoalescer()
+    const liveRegistry = new LiveSubagentRegistry()
+    const { registry } = reviewerRegistry()
+    let task = 0
+    let sessionsCreated = 0
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => {
+        sessionsCreated++
+        const session = stubSession()
+        session.prompt = () => new Promise<void>(() => {})
+        return session
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => `bg_review${++task}`,
+      coalescer,
+    })
+    const review_identity = {
+      repo: 'acme/widgets',
+      pull_request: 42,
+      head_sha: 'a'.repeat(40),
+      base_sha: 'b'.repeat(40),
+      review_kind: 'review' as const,
+    }
+
+    const first = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'review it', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+    const cancel = createSubagentCancelTool({
+      liveRegistry,
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      callerSessionId: 'ses_parent',
+    })
+    const cancelled = await cancel.execute('call_cancel', { task_id: 'bg_review1' }, undefined, undefined, ctx)
+    const replacement = await tool.execute(
+      'call_2',
+      { subagent_type: 'reviewer', prompt: 'review it again', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect((first.details as { ok: boolean }).ok).toBe(true)
+    expect((cancelled.details as { ok: boolean }).ok).toBe(true)
+    expect(replacement.details).toEqual(expect.objectContaining({ ok: true }))
+    expect(sessionsCreated).toBe(2)
+  })
+
+  test('keeps reviewer identity leased when cancellation abort rejects', async () => {
+    const coalescer = new SubagentCoalescer()
+    const liveRegistry = new LiveSubagentRegistry()
+    const { registry } = reviewerRegistry()
+    let task = 0
+    let sessionsCreated = 0
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => {
+        sessionsCreated++
+        const session = stubSession()
+        session.prompt = () => new Promise<void>(() => {})
+        session.abort = async () => {
+          throw new Error('provider refused abort')
+        }
+        return session
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => `bg_review${++task}`,
+      coalescer,
+    })
+    const review_identity = {
+      repo: 'acme/widgets',
+      pull_request: 42,
+      head_sha: 'a'.repeat(40),
+      base_sha: 'b'.repeat(40),
+      review_kind: 'review' as const,
+    }
+
+    const first = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'review it', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+    const cancel = createSubagentCancelTool({
+      liveRegistry,
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      callerSessionId: 'ses_parent',
+    })
+    const cancelled = await cancel.execute('call_cancel', { task_id: 'bg_review1' }, undefined, undefined, ctx)
+    const replacement = await tool.execute(
+      'call_2',
+      { subagent_type: 'reviewer', prompt: 'review it again', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect((first.details as { ok: boolean }).ok).toBe(true)
+    expect(cancelled.details).toEqual({ ok: false, error: 'abort failed: provider refused abort' })
+    expect(replacement.details).toEqual(
+      expect.objectContaining({ ok: false, error: expect.stringContaining('already in progress') }),
+    )
+    expect(sessionsCreated).toBe(1)
+  })
+
+  test('does not coalesce reviewer jobs for changed heads, bases, or review kinds', async () => {
+    let sessionsCreated = 0
+    let task = 0
+    const { registry } = reviewerRegistry()
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry: new LiveSubagentRegistry(),
+      createSessionForSubagent: async () => {
+        sessionsCreated++
+        return stubSession()
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => `bg_review${++task}`,
+      now: () => 1_000,
+    })
+    const base = {
+      repo: 'acme/widgets',
+      pull_request: 42,
+      head_sha: 'a'.repeat(40),
+      base_sha: 'b'.repeat(40),
+      review_kind: 'review',
+    }
+
+    const results = await Promise.all([
+      tool.execute(
+        'call_1',
+        { subagent_type: 'reviewer', prompt: 'first', review_identity: base },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      tool.execute(
+        'call_2',
+        {
+          subagent_type: 'reviewer',
+          prompt: 'new head',
+          review_identity: { ...base, head_sha: 'b'.repeat(40) },
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      tool.execute(
+        'call_3',
+        {
+          subagent_type: 'reviewer',
+          prompt: 'different base',
+          review_identity: { ...base, base_sha: 'c'.repeat(40) },
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      tool.execute(
+        'call_4',
+        {
+          subagent_type: 'reviewer',
+          prompt: 'different kind',
+          review_identity: { ...base, review_kind: 're-review' },
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    ])
+
+    expect(results.every((result) => (result.details as { ok: boolean }).ok)).toBe(true)
+    expect(sessionsCreated).toBe(4)
+  })
+
+  test('rejects review_identity for non-reviewer subagents', async () => {
+    const { tool } = fixedSpawn({ createSession: async () => stubSession() })
+
+    const result = await tool.execute(
+      'call_1',
+      {
+        subagent_type: 'explorer',
+        prompt: 'find it',
+        review_identity: {
+          repo: 'acme/widgets',
+          pull_request: 42,
+          head_sha: 'a'.repeat(40),
+          base_sha: 'b'.repeat(40),
+          review_kind: 'review',
+        },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect((result.details as { ok: boolean }).ok).toBe(false)
+    expect((result.details as { error?: string }).error).toContain('only valid for reviewer')
   })
 })
 

@@ -8,7 +8,14 @@ import type { Stream } from '@/stream'
 
 import { type LiveSubagentRegistry, type SubagentCompletion } from '../live-subagents'
 import { MAX_SUBAGENT_DEPTH, type SessionOrigin, subagentDepth } from '../session-origin'
-import { type CreateSessionForSubagent, type Subagent, type SubagentRegistry, startSubagent } from '../subagents'
+import {
+  type CreateSessionForSubagent,
+  type Subagent,
+  SubagentCoalescer,
+  subagentCoalesceKey,
+  type SubagentRegistry,
+  startSubagent,
+} from '../subagents'
 
 export const SPAWN_TASK_ID_PREFIX = 'bg_'
 
@@ -50,6 +57,7 @@ export type CreateSpawnSubagentToolOptions = {
   generateTaskId?: () => string
   now?: () => number
   allowBackgroundFromSubagent?: boolean
+  coalescer?: SubagentCoalescer
 }
 
 export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions) {
@@ -65,6 +73,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
     generateTaskId = () => `${SPAWN_TASK_ID_PREFIX}${randomUUID().replace(/-/g, '').slice(0, 12)}`,
     now = () => Date.now(),
     allowBackgroundFromSubagent,
+    coalescer = new SubagentCoalescer(),
   } = options
 
   return defineTool({
@@ -103,6 +112,29 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
             'Model profile to run this spawn on, overriding the subagent\'s default tier for this one task. Use "deep" for hard work that needs stronger reasoning (gnarly bugs, non-obvious refactors, failures that resisted a quick fix); omit (or "default") for routine work. Resolves against the configured model profiles; an unknown name falls back to default. Most useful on `operator` — leave it off unless the task clearly warrants a heavier model.',
         }),
       ),
+      review_identity: Type.Optional(
+        Type.Object(
+          {
+            repo: Type.String({ description: 'Canonical owner/repo name.' }),
+            pull_request: Type.Integer({ minimum: 1, description: 'Pull request number.' }),
+            head_sha: Type.String({
+              pattern: '^[0-9a-fA-F]{40}$',
+              description: 'Exact 40-character PR head commit SHA being reviewed.',
+            }),
+            base_sha: Type.String({
+              pattern: '^[0-9a-fA-F]{40}$',
+              description: 'Exact 40-character PR base commit OID being reviewed against.',
+            }),
+            review_kind: Type.Union([Type.Literal('review'), Type.Literal('re-review')], {
+              description: 'Canonical PR review class.',
+            }),
+          },
+          {
+            description:
+              'Typed identity for a reviewer PR job. Identical repo/PR/head/base/kind jobs coalesce while in flight. Valid only when subagent_type="reviewer"; omit for general reviews and all other subagents.',
+          },
+        ),
+      ),
     }),
 
     async execute(_toolCallId, params): Promise<ToolReturn> {
@@ -140,6 +172,35 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       const payload: Record<string, unknown> = { requestId: taskId, prompt: params.prompt }
       if (params.description !== undefined) payload.description = params.description
       if (params.profile !== undefined) payload.profile = params.profile
+      if (params.review_identity !== undefined) {
+        if (subagentName !== 'reviewer') {
+          return errorResult('review_identity is only valid for reviewer subagents')
+        }
+        payload.reviewIdentity = {
+          repo: params.review_identity.repo,
+          pullRequest: params.review_identity.pull_request,
+          headSha: params.review_identity.head_sha,
+          baseSha: params.review_identity.base_sha,
+          reviewKind: params.review_identity.review_kind,
+        }
+      }
+
+      const coalesceKey = subagentCoalesceKey({
+        parentSessionId,
+        subagentName,
+        payload,
+        fallbackKey: taskId,
+        ...(subagent.inFlightKey !== undefined ? { inFlightKey: subagent.inFlightKey } : {}),
+      })
+      if (!coalescer.tryAcquire(coalesceKey)) {
+        return errorResult(`subagent ${coalesceKey}: an identical job is already in progress`)
+      }
+      let coalesceKeyHeld = true
+      const releaseCoalesceKey = () => {
+        if (!coalesceKeyHeld) return
+        coalesceKeyHeld = false
+        coalescer.release(coalesceKey)
+      }
 
       const startedAt = now()
       const spawnedByRole = permissions?.resolveRole(origin)
@@ -164,6 +225,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       try {
         resolvedHandle = await handle
       } catch (err) {
+        releaseCoalesceKey()
         const message = err instanceof Error ? err.message : String(err)
         return errorResult(`failed to spawn ${subagentName}: ${message}`)
       }
@@ -178,6 +240,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         startedAt,
         status: 'running' as const,
         abort: resolvedHandle.abort,
+        releaseCoalesceKey,
       }
       liveRegistry.register(live)
       if (capturedFinalMessage !== undefined) {
@@ -190,6 +253,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           : undefined
 
       void completion.then((c) => {
+        releaseCoalesceKey()
         const durationMs = now() - startedAt
         // First-writer-wins: if the parent drain already settled this child by
         // timeout, our real completion lost — skip both the overwrite and the
