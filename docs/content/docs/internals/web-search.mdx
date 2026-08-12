@@ -55,3 +55,88 @@ provide a safely inferable IPv4 field location—not because every member maps
 metadata. It does not guess arbitrary operator-specific RFC 6052 prefixes. The
 two `TYPECLAW_MODEL_HTTP_*` values are withheld from model bash, and raw `.env`
 is masked from model-driven file access.
+
+## Adaptive HTML extraction is a post-fetch fallback, not a retry
+
+`src/agent/tools/webfetch/adaptive-html.ts` only fires when `strategy` is
+auto-detected as `"readability"` (an explicit `strategy: "readability"` skips
+adaptive JSON-LD/classification and returns Readability's result as-is, even
+empty, but still shares parser and deterministic visibility safety checks — see `tool.ts`). It runs
+entirely on the HTML body that `safe-http` already
+fetched. There is no second network call: one fetch happens, then this module
+tries two extraction routes against that same body, in a fixed order.
+
+1. **Adaptive DOM complexity preflight, then Readability.** Before constructing
+   JSDOM, a forward-cursor scanner bounds the adaptive path to **5 MiB**, **20,000
+   tags**, and **256 open-element nesting levels**. It handles valid comments,
+   legacy HTML/XHTML prologs, quoted `>` attributes, HTML void elements,
+   `<plaintext>` through EOF, escaped script states, and raw script/style bodies
+   without regex backtracking. SVG and MathML subtrees, including HTML integration
+   points such as `foreignObject`, remain conservatively suppressed as metadata
+   sources while their lexical tags and depth are still counted. A trailing slash
+   does not close a non-void HTML element. Unterminated comments or quoted opening
+   tags that the scanner cannot model safely fail with a fixed structure-validation
+   diagnostic. Crossing a resource limit records a distinct fixed complexity
+   diagnostic. Either result skips JSDOM and structured fallback because the
+   same lexical context cannot be validated safely. Explicit `strategy: "readability"`
+   uses the same fence before JSDOM but otherwise preserves the existing
+   `applyReadability()` output behavior and skips the adaptive routes. Before
+   extraction, the shared pipeline removes deterministic visually hidden content from
+   attributes (excluding `inert`, which does not itself hide source-visible prose), inline declarations, closed `dialog`/`details` containers, and
+   embedded CSS rules that JSDOM can resolve locally. JSDOM does not load linked
+   stylesheets or other subresources, so source-visible content remains eligible
+   without introducing a second request. Embedded CSS evaluation is fenced by
+   stylesheet bytes, raw segment length, recursive rule count, per-selector
+   length, and a selector-list-component-by-element work budget before any computed-style traversal.
+   The limits protect against known
+   synchronous DOM complexity hazards; they are not a claim that every parser
+   denial-of-service shape is impossible. `applyReadabilityDetailed` preserves the existing
+   `applyReadability()` string API while reporting structural evidence: whether
+   Readability parsed an article, whether conversion fell back to the whole
+   body, semantic/prose containers, and script count. Concise pages remain
+   compatible when Readability identifies real article structure. Generic
+   unstructured output is rejected conservatively when the source instead has
+   the structure of a script-rendered shell; there is no language-specific
+   keyword or universal text-length gate.
+2. **Bounded schema.org Article JSON-LD rescue.** If Readability's output
+   isn't useful or fails after a valid preflight (a JS app shell with no visible
+   content is the common miss),
+   `extractJsonLdArticle` scans `<script type="application/ld+json">` blocks for
+   an `Article`/`NewsArticle`/`BlogPosting` node, skipping complete ordinary
+   script bodies before searching for another script (and recursing through arrays
+   and `@graph` containers to the fixed depth limit) and pulls `headline` +
+   `articleBody`/`description`. Concise structured articles are accepted when
+   Readability is genuinely unusable. Documents with embedded CSS skip this
+   route because the bounded lexical metadata scan does not execute the CSS
+   cascade; this prevents source-hidden structured data from bypassing the DOM
+   visibility checks. The
+   metadata payloads are accepted only from the first 1 MiB, while lexical
+   visibility context is validated across the full 5 MiB adaptive document.
+   Oversized documents skip this route. Block count, per-block bytes, and
+   per-field characters are also bounded, so a pathological page can't turn
+   this into unbounded work.
+3. **Neither worked.** If both routes come up empty, the tool returns an
+   error whose message says browser retrieval may be needed — it does not
+   retry the fetch, switch transport, or spawn a browser itself. Escalating to
+   an actual browser (if one is available) is left to the calling agent.
+
+Each attempt is recorded in order as `{ route, outcome, reason }` and surfaced
+on `details.extractionAttempts`. These structured details are available in the
+live tool result and persisted session records. The normal TUI preview and
+historical inspect text replay render only extracted content or the fixed final
+error, not the structured attempt details. The persisted data still records
+which route ran, why it was rejected, and in what sequence without diagnostics
+echoing fetched content or internal error strings.
+
+None of this touches `safe-http.ts`. The DNS-rebinding guard, redirect
+pinning, and Akamai warmup already produced the one HTML body this module
+works with; adaptive extraction is pure post-processing on that body, so the
+transport-layer guarantees above are unaffected by whether Readability or the
+JSON-LD rescue ends up producing the output.
+
+The bounded, ordered-route-then-validate shape here (try one extractor, fall
+back to a second only on a validated miss, stop rather than escalate) took
+inspiration from [`fivetaku/insane-search`](https://github.com/fivetaku/insane-search).
+TypeClaw does not vendor or execute any code from that project — `adaptive-html.ts`
+is an independent implementation against Readability and schema.org, not a
+port.
