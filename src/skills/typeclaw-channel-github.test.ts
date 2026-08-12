@@ -8,7 +8,9 @@ describe('typeclaw-channel-github PR review instructions', () => {
   test('minimal intake captures identity then delegates immediately without parent diff analysis', () => {
     const lower = skill.toLowerCase()
     expect(lower).toContain('minimal intake')
-    expect(lower).toContain('repo, pr number, current head sha')
+    expect(lower).toContain('repo, pr number, current head sha, exact base oid')
+    expect(skill).toContain('--json author,headRefOid,baseRefOid')
+    expect(skill).toContain('base_sha: "<40-char baseRefOid>"')
     expect(lower).toContain('delegate immediately')
     expect(lower).toContain('do not run `gh pr diff`')
   })
