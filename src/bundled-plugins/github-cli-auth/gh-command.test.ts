@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 
 import {
   analyzeGhCommand,
+  canInjectPatIntoPassThroughGh,
   effectiveGhTokensForAuthenticatedUserEndpoint,
   usesGhApiAuthenticatedUserEndpoint,
 } from './gh-command'
@@ -486,6 +487,28 @@ describe('analyzeGhCommand', () => {
     })
   })
 
+  it('allows literal backslashes inside single-quoted jq filters', () => {
+    for (const filter of ['.patch | split("\\n") | join("\\n")', '.content | gsub("\\n"; "") | @base64d']) {
+      for (const jqArg of [`--jq '${filter}'`, `-q '${filter}'`, `--jq='${filter}'`, `-q='${filter}'`]) {
+        expect(analyzeGhCommand(`gh api /repos/acme/widgets/pulls ${jqArg}`)).toEqual({
+          kind: 'inject',
+          repoSlug: 'acme/widgets',
+        })
+      }
+    }
+  })
+
+  it('keeps shell-active backslashes outside single quotes blocked', () => {
+    for (const command of [
+      'gh api /repos/acme/widgets/pulls --jq split(\\"\\n\\")',
+      'gh api /repos/acme/widgets/pulls --jq "split(\\"\\n\\")"',
+      "gh api /repos/acme/widgets/pulls \\--jq '.patch'",
+      `gh api /repos/acme/widgets/pulls --jq '.patch\\n''; cat /proc/self/environ'`,
+    ]) {
+      expect(analyzeGhCommand(command).kind).toBe('block')
+    }
+  })
+
   it('allows inline raw/typed fields and rejects @file dereferences', () => {
     expect(analyzeGhCommand("gh api /repos/acme/widgets/issues -f body='safe text'")).toMatchObject({ kind: 'inject' })
     expect(analyzeGhCommand('gh api graphql -R acme/widgets -F number=7 -f query=x')).toMatchObject({
@@ -664,6 +687,15 @@ describe('analyzeGhCommand', () => {
         'block',
       )
       expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | jq \\-f/proc/self/environ').kind).toBe('block')
+    })
+
+    it('allows literal backslashes inside a single-quoted stdin-only jq filter', () => {
+      const command = `gh api /repos/acme/widgets/pulls | jq '.patch | split("\\n") | join("\\n")'`
+      expect(analyzeGhCommand(command)).toEqual({
+        kind: 'inject',
+        repoSlug: 'acme/widgets',
+        rewrittenCommand: `gh api /repos/acme/widgets/pulls | /usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN jq '.patch | split("\\n") | join("\\n")'`,
+      })
     })
 
     it('allows known stdin-shaping coreutils flags (wc -l, cat -n, sort -r, uniq -c)', () => {
@@ -874,6 +906,20 @@ describe('analyzeGhCommand', () => {
     expect(nonLiteral.kind === 'block' && nonLiteral.code).toBe('non-literal-repo')
     const composition = analyzeGhCommand('set -e; gh label list -R acme/widgets')
     expect(composition.kind === 'block' && composition.code).toBe('composition')
+  })
+})
+
+describe('canInjectPatIntoPassThroughGh', () => {
+  it('allows literal backslashes inside single-quoted jq filters', () => {
+    const filter = '.content | gsub("\\n"; "") | @base64d'
+    for (const jqArg of [`--jq '${filter}'`, `-q '${filter}'`, `--jq='${filter}'`, `-q='${filter}'`]) {
+      expect(canInjectPatIntoPassThroughGh(`gh api /user ${jqArg}`)).toBe(true)
+    }
+  })
+
+  it('rejects shell-active backslashes outside single quotes', () => {
+    expect(canInjectPatIntoPassThroughGh('gh api /user \\--input /proc/self/environ')).toBe(false)
+    expect(canInjectPatIntoPassThroughGh('gh api /user --jq "gsub(\\"\\n\\"; \\"\\")"')).toBe(false)
   })
 })
 

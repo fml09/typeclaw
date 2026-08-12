@@ -262,7 +262,7 @@ function isAuthStatusTokenDisplayFlag(arg: string): boolean {
 
 export function canInjectPatIntoPassThroughGh(command: string): boolean {
   if (containsReviewGraphqlMutation(command)) return false
-  if (command.includes('\\')) return false
+  if (hasUnsafeGhStageBackslash(command)) return false
   if (!isSingleBareGhCommand(command)) return false
   const tokens = tokenize(command)
   const starts = findGhInvocations(tokens)
@@ -410,7 +410,7 @@ function isCredentialSafeGhCommand(command: string): boolean {
   const stages = splitTopLevelPipeStages(command)
   if (stages === null || stages.length === 0) return false
   const ghStage = (stages[0] as string).trim()
-  if (!isSingleBareGhCommand(ghStage) || ghStage.includes('\\')) return false
+  if (!isSingleBareGhCommand(ghStage) || hasUnsafeGhStageBackslash(ghStage)) return false
   const tokens = tokenize(ghStage)
   return tokens[0] === 'gh' && isCredentialSafeGhArgs(tokens.slice(1))
 }
@@ -568,12 +568,12 @@ const JQ_SAFE_BOOLEAN_SHORT = new Set(['r', 'c', 's', 'n', 'e', 'a', 'S', 'R', '
 // as the forbidden flag — an allowlist-bypass. Rejecting `\` closes that gap.
 function isStdinOnlyReaderStage(stage: string): boolean {
   if (containsShellActiveMetachar(stage)) return false
-  if (stage.includes('\\')) return false
   const tokens = splitStageTokens(stage)
   const cmd = tokens[0]
   if (cmd === undefined || !READER_ALLOWLIST.has(cmd)) return false
 
-  if (cmd === 'jq') return isStdinOnlyJqStage(tokens)
+  if (cmd === 'jq') return !hasUnsafeJqStageBackslash(stage) && isStdinOnlyJqStage(tokens)
+  if (stage.includes('\\')) return false
 
   const allowedFlags = READER_BOOLEAN_FLAGS[cmd]
   if (allowedFlags === undefined) return false
@@ -740,6 +740,99 @@ function splitStageTokens(stage: string): string[] {
   }
   if (has) tokens.push(current)
   return tokens
+}
+
+// Backslashes are shell-active outside single quotes, and the argv-ish tokenizers
+// below deliberately do not interpret shell escapes. The one safe use we support
+// is jq syntax such as `split("\\n")` when the complete filter operand is
+// single-quoted: the shell passes that backslash literally to jq, so it cannot
+// disguise a forbidden gh/jq flag or file operand.
+function hasUnsafeGhStageBackslash(stage: string): boolean {
+  if (!stage.includes('\\')) return false
+  const rawTokens = splitRawStageTokens(stage)
+  if (rawTokens === null) return true
+
+  for (let i = 0; i < rawTokens.length; i++) {
+    const raw = rawTokens[i] as string
+    if (!raw.includes('\\')) continue
+    const previous = rawTokens[i - 1]
+    if ((previous === '--jq' || previous === '-q') && isFullySingleQuoted(raw)) continue
+    const attachedFilter = raw.startsWith('--jq=')
+      ? raw.slice('--jq='.length)
+      : raw.startsWith('-q=')
+        ? raw.slice(3)
+        : null
+    if (attachedFilter !== null && isFullySingleQuoted(attachedFilter)) continue
+    return true
+  }
+  return false
+}
+
+function hasUnsafeJqStageBackslash(stage: string): boolean {
+  if (!stage.includes('\\')) return false
+  const rawTokens = splitRawStageTokens(stage)
+  if (rawTokens === null || rawTokens[0] !== 'jq') return true
+
+  let filterIndex: number | null = null
+  for (let i = 1; i < rawTokens.length; i++) {
+    const token = stripPairedQuotes(rawTokens[i] as string)
+    if (token === '--') return true
+    if (token.startsWith('--')) {
+      const consume = JQ_SAFE_VALUE_LONG[token]
+      if (consume !== undefined) i += consume
+      continue
+    }
+    if (token.startsWith('-') && token.length > 1) continue
+    filterIndex = i
+    break
+  }
+
+  for (let i = 1; i < rawTokens.length; i++) {
+    const raw = rawTokens[i] as string
+    if (!raw.includes('\\')) continue
+    if (i === filterIndex && isFullySingleQuoted(raw)) continue
+    return true
+  }
+  return false
+}
+
+function splitRawStageTokens(stage: string): string[] | null {
+  const tokens: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  for (const ch of stage) {
+    if (quote !== null) {
+      current += ch
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+      continue
+    }
+    if (ch === ' ' || ch === '\t') {
+      if (current !== '') {
+        tokens.push(current)
+        current = ''
+      }
+      continue
+    }
+    current += ch
+  }
+  if (quote !== null) return null
+  if (current !== '') tokens.push(current)
+  return tokens
+}
+
+function isFullySingleQuoted(raw: string): boolean {
+  return raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'") && !raw.slice(1, -1).includes("'")
+}
+
+function stripPairedQuotes(raw: string): string {
+  if (raw.length < 2) return raw
+  const first = raw[0]
+  return first === raw[raw.length - 1] && (first === '"' || first === "'") ? raw.slice(1, -1) : raw
 }
 
 // Removes an unquoted `-R`/`--repo` flag (and its repo-slug value) from a single
