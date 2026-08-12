@@ -657,8 +657,55 @@ describe('analyzeGhCommand', () => {
       expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | less').kind).toBe('block')
     })
 
-    it('blocks grep/head/tail downstream (operand parsing too risky for now)', () => {
-      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep id').kind).toBe('block')
+    it('allows stdin-only grep filters and strips the token from grep', () => {
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -n -E "id|title"')).toEqual({
+        kind: 'inject',
+        repoSlug: 'acme/widgets',
+        rewrittenCommand:
+          'gh api /repos/acme/widgets/issues | /usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN -u GREP_OPTIONS /usr/bin/grep -n -E "id|title"',
+      })
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -inE error').kind).toBe('inject')
+      expect(analyzeGhCommand("gh api /repos/acme/widgets/issues | grep -e error -e 'not found'").kind).toBe('inject')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -eerror').kind).toBe('inject')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -e=error').kind).toBe('inject')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -neerror').kind).toBe('inject')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep --regexp error --regexp=warning').kind).toBe(
+        'inject',
+      )
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep --line-number error').kind).toBe('inject')
+    })
+
+    it('strips grep environment options and pins the executable in multi-reader pipelines', () => {
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep error | cat')).toEqual({
+        kind: 'inject',
+        repoSlug: 'acme/widgets',
+        rewrittenCommand:
+          'gh api /repos/acme/widgets/issues | /usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN -u GREP_OPTIONS /usr/bin/grep error | /usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN cat',
+      })
+    })
+
+    it('blocks grep forms that can read files or do not provide exactly one pattern source', () => {
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep id /proc/1/environ').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -f /proc/1/environ').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -f/proc/1/environ').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -nf/proc/1/environ').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep --file=/proc/1/environ').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -neerror -Z').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -r id').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep --include=id').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep -e id extra').kind).toBe('block')
+    })
+
+    it('blocks grep option ordering that GNU grep could reinterpret as file operands', () => {
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep file -e pattern').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep file --regexp pattern').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep file --regexp=pattern').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep pattern -e file').kind).toBe('block')
+      expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | grep pattern -n').kind).toBe('block')
+    })
+
+    it('blocks head/tail downstream (operand parsing too risky for now)', () => {
       expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | head -n 5').kind).toBe('block')
       expect(analyzeGhCommand('gh api /repos/acme/widgets/issues | tail -n 5').kind).toBe('block')
     })

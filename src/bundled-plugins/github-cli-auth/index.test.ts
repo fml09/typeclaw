@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -120,6 +121,49 @@ describe('github-cli-auth plugin', () => {
       expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
     }
   })
+
+  test('App auth rewrites a stdin-only grep pipeline before brokering the token', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const hook = await hookFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('gh api /repos/acme/widgets/issues | grep -n -E "bug|error"')
+
+    expect(await hook(event, hookCtx)).toBeUndefined()
+    expect(event.args.command).toBe(
+      'gh api /repos/acme/widgets/issues | /usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN -u GREP_OPTIONS /usr/bin/grep -n -E "bug|error"',
+    )
+    expect(event.args.command).not.toContain('ghs_minted')
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    'grep reader sanitizer removes both token names and GREP_OPTIONS at execution',
+    async () => {
+      process.env.GH_TOKEN = 'ghs_seeded'
+      const hook = await hookFor(tokenResolver('ghs_minted'))
+      const event = bashEvent('gh api /repos/acme/widgets/issues | grep error')
+
+      expect(await hook(event, hookCtx)).toBeUndefined()
+      const rewritten = event.args.command
+      if (typeof rewritten !== 'string') throw new Error('expected rewritten command')
+      const reader = rewritten.split(' | ')[1]
+      if (reader === undefined) throw new Error('expected reader stage')
+      const sanitizer = reader.slice(0, reader.indexOf('/usr/bin/grep'))
+      const result = spawnSync('/bin/sh', ['-c', `${sanitizer}/usr/bin/env`], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GH_TOKEN: 'ghs_sentinel',
+          GITHUB_TOKEN: 'github_pat_sentinel',
+          GREP_OPTIONS: '-r -a -e GH_TOKEN= /proc',
+        },
+      })
+
+      expect(result.status).toBe(0)
+      expect(result.stdout).not.toContain('GH_TOKEN=')
+      expect(result.stdout).not.toContain('GITHUB_TOKEN=')
+      expect(result.stdout).not.toContain('GREP_OPTIONS=')
+    },
+  )
 
   test('App auth rejects unsafe create/file/composition forms before minting', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'

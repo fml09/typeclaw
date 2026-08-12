@@ -79,7 +79,7 @@ const COMPOSITION_REASON =
   'newlines, redirections, command/process substitution, subshells, heredocs, or unquoted ' +
   '`$` expansion (any sibling process or expansion would inherit the token and could ' +
   'exfiltrate it). One exception is allowed: a trailing reader pipeline `gh … | <reader>` ' +
-  'where every downstream stage is a stdin-only reader (`jq`, `cat`, `wc`, `sort`, `uniq`) ' +
+  'where every downstream stage is a stdin-only reader (`jq`, `grep`, `cat`, `wc`, `sort`, `uniq`) ' +
   'with no file operand — e.g. `gh api repos/o/r | jq .`. jq/JSON metacharacters are also ' +
   "fine INSIDE single quotes, e.g. `gh api repos/o/r --jq '.[] | {id}'`. File-backed " +
   '`--input`, `--body-file`, templates, aliases, extensions, and auth/config commands remain unavailable.'
@@ -500,9 +500,11 @@ function isSafeGhJqFilter(filter: string): boolean {
 // has gh's output) — they cannot open their own network/file/process sink, so a
 // `gh <repo> | <reader>` pipeline cannot exfiltrate the minted token to a third
 // party. EXCLUDED on purpose: awk (system()/getline|cmd/inet), sed (GNU `e`
-// shell-exec), tee/xargs (write/spawn), less (`!cmd`), and grep/head/tail (their
+// shell-exec), tee/xargs (write/spawn), less (`!cmd`), and head/tail (their
 // file-operand forms are too easy to abuse and not worth the parser risk yet).
-const READER_ALLOWLIST = new Set(['jq', 'cat', 'wc', 'sort', 'uniq'])
+// grep is admitted through a dedicated grammar that requires a pattern and
+// proves there is no file operand or pattern-file/recursive option.
+const READER_ALLOWLIST = new Set(['jq', 'grep', 'cat', 'wc', 'sort', 'uniq'])
 
 // STRICT per-command flag allowlists. We allow ONLY flags known to be pure
 // stdin-shaping (no file/program operand). This is allow-known-good, not
@@ -561,6 +563,22 @@ const JQ_SAFE_VALUE_LONG: Record<string, number> = {
 // (module path) are the fatal ones — and any unknown char also rejects.
 const JQ_SAFE_BOOLEAN_SHORT = new Set(['r', 'c', 's', 'n', 'e', 'a', 'S', 'R', 'j', 'C', 'M', 'b'])
 
+const GREP_SAFE_BOOLEAN_LONG = new Set([
+  '--basic-regexp',
+  '--extended-regexp',
+  '--fixed-strings',
+  '--ignore-case',
+  '--invert-match',
+  '--line-number',
+  '--count',
+  '--only-matching',
+  '--quiet',
+  '--silent',
+  '--word-regexp',
+  '--line-regexp',
+])
+const GREP_SAFE_BOOLEAN_SHORT = new Set(['E', 'F', 'G', 'i', 'v', 'n', 'c', 'o', 'q', 'w', 'x'])
+
 // A reader stage is safe only if it is an allowlisted command using ONLY its
 // known stdin-shaping flags, with no file operand. Backslashes are rejected
 // outright: our tokenizer does not model shell backslash escaping, so a
@@ -574,6 +592,7 @@ function isStdinOnlyReaderStage(stage: string): boolean {
 
   if (cmd === 'jq') return !hasUnsafeJqStageBackslash(stage) && isStdinOnlyJqStage(tokens)
   if (stage.includes('\\')) return false
+  if (cmd === 'grep') return isStdinOnlyGrepStage(tokens)
 
   const allowedFlags = READER_BOOLEAN_FLAGS[cmd]
   if (allowedFlags === undefined) return false
@@ -583,6 +602,65 @@ function isStdinOnlyReaderStage(stage: string): boolean {
     if (!allowedFlags.has(tok)) return false
   }
   return true
+}
+
+// grep reads stdin only when its argv contains one positional pattern OR one or
+// more -e/--regexp patterns, followed by no positional file operands. Keep the
+// option surface intentionally small: unknown options fail closed, especially
+// -f/--file, recursive traversal, and include/exclude selectors.
+function isStdinOnlyGrepStage(tokens: readonly string[]): boolean {
+  let patternCount = 0
+  let usesRegexpFlag = false
+  let sawPositionalPattern = false
+  for (let i = 1; i < tokens.length; i++) {
+    const tok = tokens[i] as string
+    if (tok === '--') return false
+    if (sawPositionalPattern && tok.startsWith('-')) return false
+    if (tok === '-e' || tok === '--regexp') {
+      if (sawPositionalPattern) return false
+      const pattern = tokens[i + 1]
+      if (pattern === undefined) return false
+      patternCount += 1
+      usesRegexpFlag = true
+      i += 1
+      continue
+    }
+    if (tok.startsWith('--regexp=')) {
+      if (sawPositionalPattern) return false
+      patternCount += 1
+      usesRegexpFlag = true
+      continue
+    }
+    if (tok.startsWith('--')) {
+      if (!GREP_SAFE_BOOLEAN_LONG.has(tok)) return false
+      continue
+    }
+    if (tok.startsWith('-') && tok.length > 1) {
+      const shortOptions = tok.slice(1)
+      for (let shortIndex = 0; shortIndex < shortOptions.length; shortIndex++) {
+        const ch = shortOptions[shortIndex] as string
+        if (ch === 'e') {
+          if (sawPositionalPattern) return false
+          patternCount += 1
+          usesRegexpFlag = true
+          // grep treats `e` as a value-taking terminal option: the rest of the
+          // cluster is its pattern (`-neerror`), or the next token is (`-ne x`).
+          // No later cluster character can therefore become another option.
+          if (shortIndex + 1 < shortOptions.length) break
+          const pattern = tokens[i + 1]
+          if (pattern === undefined) return false
+          i += 1
+          break
+        }
+        if (!GREP_SAFE_BOOLEAN_SHORT.has(ch)) return false
+      }
+      continue
+    }
+    if (usesRegexpFlag || patternCount > 0) return false
+    patternCount = 1
+    sawPositionalPattern = true
+  }
+  return patternCount > 0
 }
 
 // jq must run pure-stdin: only known stdin-shaping flags, and EXACTLY one
@@ -641,8 +719,16 @@ function analyzeReaderPipeline(command: string, stripRepoFlag: boolean): string 
   }
 
   const rewrittenGh = stripRepoFlag ? stripRepoFlagFromCommand(ghStage) : ghStage
-  const rewrittenReaders = stages.slice(1).map((s) => `/usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN ${s.trim()}`)
+  const rewrittenReaders = stages.slice(1).map(rewriteReaderStage)
   return [rewrittenGh, ...rewrittenReaders].join(' | ')
+}
+
+function rewriteReaderStage(stage: string): string {
+  const trimmed = stage.trim()
+  if (splitStageTokens(trimmed)[0] === 'grep') {
+    return `/usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN -u GREP_OPTIONS /usr/bin/grep${trimmed.slice('grep'.length)}`
+  }
+  return `/usr/bin/env -u GH_TOKEN -u GITHUB_TOKEN ${trimmed}`
 }
 
 // Quote-aware split on top-level `|`. Returns null if any OTHER shell-active
