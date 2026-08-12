@@ -422,7 +422,8 @@ describe('reviewer skill content', () => {
     expect(lower).toContain('do not use `git clone`')
     expect(lower).toContain('never the reviewed artifact')
     expect(lower).toContain('leave cleanup to the session lifecycle')
-    expect(lower).toContain('exactly once')
+    expect(lower).toContain('only kind of write')
+    expect(lower).toContain('once for initial acquisition')
     expect(lower).toContain('use the returned receipt path exactly')
     expect(lower).toContain('never guess, derive, or reconstruct')
   })
@@ -436,14 +437,27 @@ describe('reviewer skill content', () => {
   })
 
   test.each([
+    ['code-review', CODE_REVIEW_SKILL.content],
     ['doc-review', DOC_REVIEW_SKILL.content],
     ['plan-review', PLAN_REVIEW_SKILL.content],
-  ])('%s uses the single runtime checkout receipt for broad PR context', (_name, content) => {
+  ])('%s permits one tightly bounded recovery when its runtime checkout receipt vanishes', (_name, content) => {
     const lower = content.toLowerCase()
     expect(content).toContain('github_prepare_review_checkout')
-    expect(lower).toContain('exactly once')
+    expect(lower).toContain('once for initial acquisition')
     expect(lower).toContain('returned receipt path exactly')
     expect(lower).toContain('never guess')
+    expect(lower).toContain('if and only if')
+    expect(lower).toContain('read-only operation against that exact returned receipt path')
+    expect(lower).toContain('enoent')
+    expect(lower).toContain('no such file or directory')
+    expect(lower).toContain('one additional time')
+    expect(lower).toContain('same exact repo slug and 40-character head sha')
+    expect(lower).toContain('use only the new returned receipt')
+    expect(lower).toContain('maximum two checkout tool calls')
+    expect(lower).toContain('generic command, tool, or provider failures')
+    expect(lower).toContain('stop checkout attempts')
+    expect(lower).toContain('remote reads')
+    expect(lower).toContain('honest incomplete review')
   })
 
   test('code-review skill accounts for resolved threads in the summary, not as praise findings (re-review noise guard)', () => {

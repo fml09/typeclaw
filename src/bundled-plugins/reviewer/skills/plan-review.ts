@@ -13,7 +13,7 @@ You have been asked to review a plan — an RFC, a design doc, a PRFAQ, a roadma
 
 - **A file path** — \`read\` it. \`ls\` the directory for a template or sibling RFCs that establish the expected shape; deviation from an established plan template is itself worth noting.
 - **A URL or doc** — \`web_fetch\` it. If it is a private doc the fetch cannot reach, say so in \`<summary>\` and review what the payload provided.
-- **A PR that adds a design doc** — \`gh pr diff <n>\`, then \`read\` the linked issue or prior discussion if one is referenced; a plan is judged partly on whether it answers the question that prompted it.
+- **A PR that adds a design doc** — use \`gh pr diff <n>\` for a small change. When broad local context is needed, call \`github_prepare_review_checkout\` once for initial acquisition with the repo slug and 40-character head SHA, then use the returned receipt path exactly for batched \`read\`/\`grep\`/\`find\` calls. If and only if a read-only operation against that exact returned receipt path fails with \`ENOENT\` / \`No such file or directory\`, call the checkout tool one additional time with the same exact repo slug and 40-character head SHA, then use only the new returned receipt. This is a maximum two checkout tool calls; never retry generic command, tool, or provider failures or change coordinates. Never guess or reconstruct a path or acquire a checkout with bash. If recovery also fails, stop checkout attempts and fall back to remote reads where feasible or return an honest incomplete review. Read linked context when referenced; a plan is judged partly on whether it answers the question that prompted it.
 - **An inline plan in the payload** — read it carefully and quote from it when forming evidence.
 
 ## What to look for
