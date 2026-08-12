@@ -37,9 +37,13 @@ type AttemptActivity = {
   startedToolExecution: boolean
 }
 
-// SDK-level attempts already contain pi-ai's internal fetch recovery. Bounding
-// only repeated no-header outcomes limits dead air without timing out healthy
-// reasoning or tool execution.
+// SDK-level attempts already contain pi-ai's internal fetch recovery. Three is
+// the safe minimum for a fallback chain: primary attempt + its one ordinary
+// transient replay + one cross-ref attempt. Lowering it would weaken either the
+// retained transient retry or fallback; raising it would recreate the repeated
+// TTFB bursts reviewer coalescing is intended to prevent from multiplying.
+// Patient overload retries do not apply to observer TTFB errors, so this envelope
+// already bounds deep-review no-progress without a reviewer-specific retry fork.
 const MAX_NO_PROGRESS_ATTEMPTS = 3
 const MAX_CUMULATIVE_NO_PROGRESS_MS = 60_000
 

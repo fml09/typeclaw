@@ -70,6 +70,7 @@ export function createSubagentCancelTool(options: CreateSubagentCancelToolOption
         const message = err instanceof Error ? err.message : String(err)
         return errorResult(`abort failed: ${message}`)
       }
+      live.releaseCoalesceKey?.()
       const details: SubagentCancelToolDetails = {
         ok: true,
         taskId: live.taskId,

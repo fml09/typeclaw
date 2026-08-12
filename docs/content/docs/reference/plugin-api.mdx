@@ -115,11 +115,10 @@ Undeclared filesystem-capable strings fail closed even when the referenced entry
 type Subagent<P = unknown> = SubagentShared<P> & {
   tools?: BuiltinToolRef[] // built-in tools, by tagged ref
   customTools?: Tool<any>[] // plugin-contributed tools
-  inFlightKey?: (payload: P) => string // per-payload coalescing
 }
 ```
 
-A subagent inherits its system prompt and payload schema from `SubagentShared`. `inFlightKey` defaults to the subagent name alone (only one instance runs at a time); override it to allow per-payload concurrency. Memory's `memory-logger` keys by `parentSessionId` so different parent sessions run in parallel while duplicate runs against the same session deduplicate. `defineSubagent(subagent)` is the identity helper.
+A subagent inherits its system prompt, payload schema, and optional `inFlightKey(payload)` from `SubagentShared`. Stream and direct plugin dispatch default to the subagent name; tool spawns without an explicit key remain request-unique. A declared key deduplicates matching work within a trusted parent-session scope when one exists, and process-wide for scheduler dispatches without a parent. Memory's `memory-logger` keys by `parentSessionId` so different parent sessions run in parallel while duplicate runs against the same session deduplicate. `defineSubagent(subagent)` is the identity helper.
 
 ### Cron
 

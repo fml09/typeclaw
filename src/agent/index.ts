@@ -61,7 +61,7 @@ import type { SubagentBashPolicy } from './reviewer-bash-policy'
 import { loadSelf } from './self'
 import { SESSION_META_CUSTOM_TYPE, sessionMetaPayload } from './session-meta'
 import { renderSessionOrigin, type SessionOrigin, type SessionRoleContext } from './session-origin'
-import type { CreateSessionForSubagent, SubagentRegistry } from './subagents'
+import type { CreateSessionForSubagent, SubagentCoalescer, SubagentRegistry } from './subagents'
 import {
   buildDefaultSystemPrompt,
   buildSlimSystemPrompt,
@@ -219,6 +219,7 @@ export type CreateSessionOptions = {
   // (omitting these for subagent sessions) is what prevents recursive
   // spawning.
   liveSubagentRegistry?: LiveSubagentRegistry
+  subagentCoalescer?: SubagentCoalescer
   subagentRegistry?: SubagentRegistry
   createSessionForSubagent?: CreateSessionForSubagent
   allowBackgroundFromSubagent?: boolean
@@ -401,6 +402,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
               permissions: options.permissions,
               stream: options.stream,
               allowBackgroundFromSubagent: options.allowBackgroundFromSubagent,
+              coalescer: options.subagentCoalescer,
             }),
           ]
         : [
@@ -444,6 +446,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
               getOrigin,
               permissions: options.permissions,
               stream: options.stream,
+              coalescer: options.subagentCoalescer,
             }),
             ...buildRoleGrantTools({
               agentDir: options.plugins?.agentDir,
@@ -845,6 +848,7 @@ export function buildSubagentOrchestrationTools(opts: {
   permissions: PermissionService | undefined
   stream: Stream | undefined
   allowBackgroundFromSubagent?: boolean
+  coalescer?: SubagentCoalescer
 }): ToolDefinition[] {
   if (
     opts.liveRegistry === undefined ||
@@ -867,6 +871,7 @@ export function buildSubagentOrchestrationTools(opts: {
       ...(opts.allowBackgroundFromSubagent !== undefined
         ? { allowBackgroundFromSubagent: opts.allowBackgroundFromSubagent }
         : {}),
+      ...(opts.coalescer !== undefined ? { coalescer: opts.coalescer } : {}),
     }),
     createSubagentOutputTool({
       liveRegistry: opts.liveRegistry,

@@ -65,19 +65,9 @@ export type RunSession = (override?: { userPrompt?: string }) => Promise<void>
 // so a new shared field surfaces on both types in one edit. See
 // `SubagentShared`'s doc-comment for the regression history.
 //
-// `inFlightKey` lives here only (not on the shared shape) because it is
-// consumed exclusively by the `SubagentConsumer` via the
-// `pluginSubagentByName` map, which holds the original plugin reference —
-// the registry-flowing shim never needs to carry it.
 export type Subagent<P = unknown> = SubagentShared<P> & {
   tools?: BuiltinToolRef[]
   customTools?: Tool<any>[]
-  // Coalescing key for the SubagentConsumer's in-flight set. Default is the
-  // subagent name alone (only one instance of the subagent runs at a time).
-  // Override to allow per-payload concurrency, e.g. memory-logger keyed by
-  // parentSessionId so different parent sessions run in parallel while
-  // duplicate runs against the same session deduplicate.
-  inFlightKey?: (payload: P) => string
 }
 
 // Cron job map keys are local; the runtime prefixes with `__plugin_<plugin-name>_`
