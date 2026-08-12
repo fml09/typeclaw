@@ -58,6 +58,8 @@ describe('renderSubagentCompletionReminder', () => {
     })
     expect(recoverable).toContain('produced output before failing')
     expect(recoverable).toContain('subagent_output')
+    expect(recoverable).toContain('partial recovery data')
+    expect(recoverable).toContain('not a completed verdict')
 
     // when the flag is absent, the wording stays the plain "inspect" guidance
     const plain = renderSubagentCompletionReminder({
@@ -250,6 +252,23 @@ describe('parseSubagentCompletedPayload', () => {
     })
     expect(parsed?.ok).toBe(false)
     expect(parsed?.error).toBe('provider rate limit')
+  })
+
+  test('failed-completion payload preserves recoverability metadata but drops output bodies', () => {
+    const parsed = parseSubagentCompletedPayload({
+      kind: 'subagent.completed',
+      taskId: 'bg_review',
+      subagent: 'reviewer',
+      parentSessionId: 'ses_abc',
+      ok: false,
+      durationMs: 600_000,
+      error: 'timeout',
+      hasRecoverableOutput: true,
+      finalMessage: '<review>secret body</review>',
+    })
+
+    expect(parsed?.hasRecoverableOutput).toBe(true)
+    expect(parsed).not.toHaveProperty('finalMessage')
   })
 
   test('preserves a valid channelKey (with null thread)', () => {

@@ -58,7 +58,7 @@ export function renderSubagentCompletionReminder(args: CompletionReminderArgs): 
   const err = args.error ?? 'unknown error'
   const recoveryHint =
     args.hasRecoverableOutput === true
-      ? `It produced output before failing — call subagent_output to recover it instead of redoing the work. `
+      ? `It produced output before failing — call subagent_output to recover it as partial recovery data, not a completed verdict, instead of redoing the work. `
       : `Use subagent_output to inspect. `
   return (
     `<system-reminder>\n` +
