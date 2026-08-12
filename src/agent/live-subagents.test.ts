@@ -242,6 +242,18 @@ describe('LiveSubagentRegistry', () => {
     const reg = new LiveSubagentRegistry()
     expect(reg.recordCompletionIfRunning('nope', { ok: true, durationMs: 1 })).toBe(false)
   })
+
+  test('captured final output is readable while running and cannot be added after settlement', () => {
+    const reg = new LiveSubagentRegistry()
+    reg.register(makeLive())
+
+    expect(reg.recordCapturedFinalMessageIfRunning('bg_t1', '<review>safe</review>')).toBe(true)
+    expect(reg.getCapturedFinalMessage('bg_t1')).toBe('<review>safe</review>')
+
+    reg.recordCompletionIfRunning('bg_t1', { ok: false, error: 'timeout', durationMs: 100 })
+    expect(reg.recordCapturedFinalMessageIfRunning('bg_t1', '<review>late</review>')).toBe(false)
+    expect(reg.getCapturedFinalMessage('bg_t1')).toBe('<review>safe</review>')
+  })
 })
 
 describe('snapshot.statusSummary rendering', () => {
