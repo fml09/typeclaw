@@ -1,6 +1,6 @@
 ---
 name: typeclaw-channel-line
-description: Use this skill BEFORE every `channel_reply` or `channel_send` call whose adapter is `line`. LINE renders messages as plain text — `**bold**`, `## headings`, `| tables |`, fenced code blocks, and other markdown all appear literally. There is no `@mention` syntax, no message threads, no replies-with-quote, and no outbound attachments or stickers. Inbound non-text content (images, stickers, files) is not fetchable through this adapter. Read this skill before composing anything on LINE.
+description: Use this skill for LINE inbound non-text content being unfetchable, workspace bucket semantics, or engagement behavior.
 ---
 
 # typeclaw-channel-line
