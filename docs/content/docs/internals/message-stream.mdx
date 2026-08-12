@@ -12,7 +12,7 @@ Four typed kinds:
 
 - **`broadcast`** — fan-out (mood, status, presence). WS server forwards to connected TUIs.
 - **`session: { sessionId }`** — addressed to a live `AgentSession`. WS server publishes; per-session drain loop subscribes.
-- **`new-session: { subagent }`** — spawn a subagent. Published by cron consumer (when a `prompt` job has a `subagent` field) and the WS server (idle → memory-logger). Consumed by `SubagentConsumer`, which validates payload against `payloadSchema` and invokes the registered handler. Coalescing per `inFlightKey(name, payload)`.
+- **`new-session: { subagent }`** — spawn a subagent. Published by cron consumer (when a `prompt` job has a `subagent` field) and the WS server (idle → memory-logger). Consumed by `SubagentConsumer`, which validates payload against `payloadSchema` and invokes the registered handler. Coalescing uses `inFlightKey(name, payload)` within the trusted parent-session scope when present, or process-wide when no parent exists.
 - **`cron: { jobId }`** — fired by the scheduler. `CronConsumer` dispatches to prompt/exec runner and handles per-jobId coalescing.
 
 Adding a fifth kind is a deliberate design choice. No generic `handler` extension point.
@@ -25,7 +25,7 @@ Adding a fifth kind is a deliberate design choice. No generic `handler` extensio
 2. Cron with a `subagent` field → `target: { kind: 'new-session' }` → `SubagentConsumer` → `invokeSubagent`. The Stream path exists so the scheduler doesn't need to import the registry.
 3. `startSubagent` wraps `invokeSubagent` with a live handle and completion result for sync/background tool spawns. Background completions publish `subagent.completed`; failed runs can carry a captured final message as recoverable output without changing the failed lifecycle status.
 
-Production registry is built from plugin contributions. The bundled memory plugin is auto-loaded and contributes `memory-logger` + `dreaming`. Each plugin `Subagent` may declare `inFlightKey(payload)`; consumer uses `${name}:${key}` as the dedup key (both memory-logger and dreaming key by `agentDir`). `payloadSchema` is validated by the cron loader at parse time and on every `reloadAll()`.
+Production registry is built from plugin contributions. The bundled memory plugin is auto-loaded and contributes `memory-logger` + `dreaming`. Each plugin `Subagent` may declare `inFlightKey(payload)`; dispatch uses `${parentSessionId}:${name}:${key}` when a trusted parent exists and `${name}:${key}` for parentless scheduler work. `payloadSchema` is validated by the cron loader at parse time and on every `reloadAll()`.
 
 ### Tool-loop termination
 

@@ -34,7 +34,7 @@ Spawn a subagent. Consumed by `SubagentConsumer` (`src/agent/subagents.ts`), whi
 
 1. looks up `subagent` in the in-process registry
 2. validates the payload against the registered `payloadSchema`
-3. checks per-payload coalescing via `inFlightKey(payload)` — concurrent invocations with the same key serialize
+3. checks per-payload coalescing via `inFlightKey(payload)` — matching keys deduplicate within `parentSessionId` when present, or process-wide for scheduler dispatch without a parent
 4. invokes the `Subagent.handler`
 
 Two production publishers today: the cron consumer (when a `prompt` job carries a `subagent` field) and the WS server (when a session goes idle and `memory-logger` should run).
