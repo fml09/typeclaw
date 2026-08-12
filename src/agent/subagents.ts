@@ -103,6 +103,10 @@ export type SubagentShared<P = unknown> = {
   // caller. See `src/agent/reviewer-bash-policy.ts`. Omit for no restriction
   // (the historical contract — prompt-only enforcement).
   bashPolicy?: SubagentBashPolicy
+  // Stable logical-job key shared by every dispatch path. Subagents that omit
+  // it keep each spawn independent; declarations use it only when duplicate
+  // execution is safe to suppress for a validated payload identity.
+  inFlightKey?: (payload: P) => string
 }
 
 export type Subagent<P = unknown> = SubagentShared<P> & {
@@ -889,7 +893,7 @@ export type SubagentConsumerLogger = {
   error: (msg: string) => void
 }
 
-export type SubagentInFlightKey = (subagent: string, payload: unknown) => string
+export type SubagentInFlightKey = (subagent: string, payload: unknown, parentSessionId?: string) => string
 
 export type CreateSubagentConsumerOptions = {
   stream: Stream
@@ -903,6 +907,7 @@ export type CreateSubagentConsumerOptions = {
   // memory-logger keyed by parentSessionId so different sessions run in parallel
   // while the same session deduplicates).
   inFlightKey?: SubagentInFlightKey
+  coalescer?: SubagentCoalescer
   logger?: SubagentConsumerLogger
 }
 
@@ -910,6 +915,43 @@ export type SubagentConsumer = {
   start: () => void
   stop: () => void
   inFlightCount: () => number
+}
+
+export class SubagentCoalescer {
+  private readonly inFlight = new Set<string>()
+
+  tryAcquire(key: string): boolean {
+    if (this.inFlight.has(key)) return false
+    this.inFlight.add(key)
+    return true
+  }
+
+  release(key: string): void {
+    this.inFlight.delete(key)
+  }
+
+  count(): number {
+    return this.inFlight.size
+  }
+}
+
+export function subagentCoalesceKey<P>(options: {
+  subagentName: string
+  payload: P
+  fallbackKey: string
+  inFlightKey?: (payload: P) => string
+  parentSessionId?: string
+}): string {
+  let payloadKey = options.fallbackKey
+  if (options.inFlightKey !== undefined) {
+    try {
+      payloadKey = options.inFlightKey(options.payload)
+    } catch {
+      payloadKey = options.fallbackKey
+    }
+  }
+  const key = `${options.subagentName}:${payloadKey}`
+  return options.parentSessionId === undefined ? key : `${options.parentSessionId}:${key}`
 }
 
 const consoleLogger: SubagentConsumerLogger = {
@@ -963,10 +1005,11 @@ export function createSubagentConsumer({
   agentDir,
   createSessionForSubagent,
   inFlightKey = (name) => name,
+  coalescer = new SubagentCoalescer(),
   logger = consoleLogger,
 }: CreateSubagentConsumerOptions): SubagentConsumer {
-  const inFlight = new Set<string>()
   let unsubscribe: Unsubscribe | null = null
+  const localInFlight = new Set<string>()
 
   return {
     start() {
@@ -985,12 +1028,12 @@ export function createSubagentConsumer({
           logger.warn(`[subagent] no registered subagent "${name}", ignoring ${msg.id}`)
           return
         }
-        const key = inFlightKey(name, msg.payload)
-        if (inFlight.has(key)) {
+        const key = inFlightKey(name, msg.payload, target.parentSessionId)
+        if (!coalescer.tryAcquire(key)) {
           logger.warn(`[subagent] ${key}: previous run still in progress, skipping`)
           return
         }
-        inFlight.add(key)
+        localInFlight.add(key)
         try {
           const spawnedByOrigin = parseSpawnedByOriginJson(target.spawnedByOriginJson, logger, name)
           await awaitWithSubagentTimeout(
@@ -1017,7 +1060,8 @@ export function createSubagentConsumer({
             logger.error(`[subagent] ${key} failed: ${message}`)
           }
         } finally {
-          inFlight.delete(key)
+          localInFlight.delete(key)
+          coalescer.release(key)
         }
       })
     },
@@ -1026,7 +1070,7 @@ export function createSubagentConsumer({
       unsubscribe = null
     },
     inFlightCount() {
-      return inFlight.size
+      return localInFlight.size
     },
   }
 }

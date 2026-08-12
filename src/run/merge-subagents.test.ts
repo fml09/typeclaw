@@ -132,7 +132,7 @@ describe('mergeSubagents', () => {
   })
 
   test('keeps the original plugin reference recoverable via pluginSubagentByShim', () => {
-    // The shim discards `tools`, `customTools`, and `inFlightKey` from the
+    // The shim discards `tools` and `customTools` from the
     // registry-visible object, but createSessionForSubagent must still be
     // able to recover the original plugin subagent (which carries those
     // fields) so it can resolve BuiltinToolRef[] → AgentSessionTools at
@@ -152,14 +152,14 @@ describe('mergeSubagents', () => {
     expect(pluginSubagentByName.get('roundtrip')?.pluginSubagent).toBe(plugin)
   })
 
-  test('drops tools, customTools, and inFlightKey from the registry-visible shim', () => {
+  test('drops divergent tool fields but preserves inFlightKey in the registry-visible shim', () => {
     // The shim must NOT carry plugin-only fields through to the internal
     // registry. `tools` and `customTools` have different shapes on each side
     // (BuiltinToolRef[] vs AgentSessionTools, Tool<any>[] vs ToolDefinition[]),
     // so they get resolved later via the pluginSubagentByShim WeakMap.
-    // `inFlightKey` is consumed only by the SubagentConsumer via
-    // pluginSubagentByName, not through the registry path. Confirming these
-    // are absent on the shim pins the negative boundary so the rest-spread
+    // `inFlightKey` has the same shape on both types and must reach every
+    // dispatch path. Confirming only divergent tool fields are absent pins the
+    // negative boundary so the rest-spread
     // can't silently leak a future plugin-only field into the internal type.
     const registry = registerSubagent(emptyRegistry(), 'rich', {
       systemPrompt: 'fake',
@@ -181,7 +181,8 @@ describe('mergeSubagents', () => {
 
     expect(Object.hasOwn(shim, 'tools')).toBe(false)
     expect(Object.hasOwn(shim, 'customTools')).toBe(false)
-    expect(Object.hasOwn(shim, 'inFlightKey')).toBe(false)
+    expect(Object.hasOwn(shim, 'inFlightKey')).toBe(true)
+    expect(shim.inFlightKey?.({})).toBe('k')
     expect(Object.hasOwn(shim, 'visibility')).toBe(true)
     expect(Object.hasOwn(shim, 'systemPrompt')).toBe(true)
   })

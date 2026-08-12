@@ -18,7 +18,7 @@ import { renderPublicSubagentRoster, spawnSubagentDescription } from './spawn-su
 // `SubagentShared` fields (`visibility`, `rosterDescription`), which ride this
 // rest-spread verbatim — exactly the runtime path under test.
 function toInternal<P>(sub: PluginSubagent<P>): Subagent<P> {
-  const { tools: _tools, customTools: _customTools, inFlightKey: _inFlightKey, ...shared } = sub
+  const { tools: _tools, customTools: _customTools, ...shared } = sub
   return shared
 }
 
