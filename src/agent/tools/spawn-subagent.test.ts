@@ -228,6 +228,47 @@ describe('createSpawnSubagentTool — sync mode', () => {
     expect(details.error).toBe('provider exploded')
     expect(liveRegistry.get('bg_test1')?.status).toBe('failed')
   })
+
+  test('foreground failure with finalMessage marks output as partial recovery data, not verdict', async () => {
+    const session = emittingSession(() => ({
+      type: 'message_end',
+      message: { content: '<verdict>approve</verdict>' },
+    }))
+    const origPrompt = session.prompt.bind(session)
+    session.prompt = async (text: string) => {
+      await origPrompt(text)
+      throw new Error('crashed after partial output')
+    }
+    const { tool, liveRegistry } = fixedSpawn({ createSession: async () => session })
+
+    const result = await tool.execute(
+      'call_1',
+      { subagent_type: 'explorer', prompt: 'q', run_in_foreground: true },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    const details = result.details as {
+      ok: boolean
+      error?: string
+      finalMessage?: string
+      recoveryData?: boolean
+      partial?: boolean
+      verdict?: boolean
+    }
+    expect(details.ok).toBe(false)
+    expect(details.error).toBe('crashed after partial output')
+    expect(details.finalMessage).toBe('<verdict>approve</verdict>')
+    expect(details.recoveryData).toBe(true)
+    expect(details.partial).toBe(true)
+    expect(details.verdict).toBe(false)
+    const text = result.content[0]?.type === 'text' ? result.content[0].text : ''
+    expect(text).toContain('PARTIAL RECOVERY DATA')
+    expect(text).toContain('not a completed')
+    expect(text).toContain('even if it contains verdict-shaped text')
+    expect(liveRegistry.get('bg_test1')?.status).toBe('failed')
+  })
 })
 
 describe('createSpawnSubagentTool — background mode', () => {
