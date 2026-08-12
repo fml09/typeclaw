@@ -1,6 +1,6 @@
 ---
 name: typeclaw-channel-instagram
-description: Use this skill BEFORE every `channel_reply` or `channel_send` call whose adapter is `instagram`. Instagram DMs render messages as plain text — no markdown, no surfaced @-mention syntax, no threads, and no outbound attachments or stickers. Read this skill before composing anything on Instagram.
+description: Use this skill for Instagram inbound media being metadata-only, workspace types and engagement rules, transport fallback, or operator-side 2FA/checkpoint handling.
 ---
 
 # typeclaw-channel-instagram

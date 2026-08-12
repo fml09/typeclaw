@@ -258,6 +258,95 @@ describe('renderSessionOrigin', () => {
     expect(out).not.toContain('auto-reformats')
   })
 
+  test.each(['kakaotalk', 'line', 'instagram'] as const)(
+    '%s channel origin renders the plain-text response contract',
+    (adapter) => {
+      const out = renderSessionOrigin({
+        kind: 'channel',
+        adapter,
+        workspace: 'workspace-1',
+        chat: 'chat-1',
+        thread: null,
+      })
+      expect(out).toContain('This platform renders messages as PLAIN TEXT with no rich-text formatting.')
+      expect(out).toContain('Do not use markdown bold/italics')
+      expect(out).toContain('Send bare URLs; the client auto-links them.')
+      expect(out).toContain('No threads and no quoted replies; every message is top-level.')
+    },
+  )
+
+  test.each(['discord-bot', 'github'] as const)(
+    '%s channel origin omits the plain-text response contract',
+    (adapter) => {
+      const out = renderSessionOrigin({
+        kind: 'channel',
+        adapter,
+        workspace: 'workspace-1',
+        chat: 'chat-1',
+        thread: null,
+      })
+      expect(out).not.toContain('This platform renders messages as PLAIN TEXT with no rich-text formatting.')
+    },
+  )
+
+  test('plain-text response contract precedes volatile channel addressing and participant data', () => {
+    const now = 100_000
+    const out = renderSessionOrigin(
+      {
+        kind: 'channel',
+        adapter: 'kakaotalk',
+        workspace: 'workspace-1',
+        chat: 'chat-1',
+        chatName: 'General',
+        thread: null,
+        membership: { humans: 2, bots: 1, fetchedAt: now, truncated: false },
+        participants: [
+          {
+            authorId: 'user-1',
+            authorName: 'Alice',
+            firstMessageAt: now - 1000,
+            lastMessageAt: now - 1000,
+            messageCount: 1,
+          },
+        ],
+      },
+      now,
+    )
+    const contractIndex = out.indexOf('This platform renders messages as PLAIN TEXT')
+    expect(contractIndex).toBeGreaterThan(-1)
+    expect(contractIndex).toBeLessThan(out.indexOf('Conversation:'))
+    expect(contractIndex).toBeLessThan(out.indexOf('"chat": "chat-1"'))
+    expect(contractIndex).toBeLessThan(out.indexOf('This channel has 3 members'))
+    expect(contractIndex).toBeLessThan(out.indexOf('## Recent participants'))
+  })
+
+  test('plain-text response contract reflects outbound attachment support', () => {
+    const render = (adapter: 'kakaotalk' | 'line' | 'instagram') =>
+      renderSessionOrigin({ kind: 'channel', adapter, workspace: 'workspace-1', chat: 'chat-1', thread: null })
+
+    const kakaotalk = render('kakaotalk')
+    expect(kakaotalk).toContain('Attachments can be passed via `attachments[]` on `channel_send`/`channel_reply`.')
+    expect(kakaotalk).toContain('Outbound stickers/emoticons are not supported.')
+    for (const adapter of ['line', 'instagram'] as const) {
+      expect(render(adapter)).toContain(
+        'Outbound attachments and stickers are unsupported; send text or a link instead.',
+      )
+    }
+  })
+
+  test('github channel origin states its unconditional rendering capabilities', () => {
+    const out = renderSessionOrigin({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/project',
+      chat: 'pr:7',
+      thread: null,
+    })
+    expect(out).toContain('GitHub renders real Markdown; use it freely.')
+    expect(out).toContain('The GitHub adapter cannot send file attachments.')
+    expect(out).toContain('GitHub has no typing indicator.')
+  })
+
   test('non-github channel origin keeps the "On it." text ack', () => {
     const out = renderSessionOrigin({
       kind: 'channel',
@@ -999,6 +1088,34 @@ describe('renderSessionOrigin', () => {
     expect(out).not.toContain('Discord syntax')
     expect(out).not.toContain('Telegram syntax')
     expect(out).toContain('do not echo them back as outbound mentions')
+  })
+
+  test.each([
+    ['instagram', 'Instagram'],
+    ['line', 'LINE'],
+  ] as const)('%s channel origin uses its own platform name in alias mention guidance', (adapter, displayName) => {
+    const now = Date.now()
+    const out = renderSessionOrigin(
+      {
+        kind: 'channel',
+        adapter,
+        workspace: 'workspace-1',
+        chat: 'chat-1',
+        thread: null,
+        participants: [
+          {
+            authorId: 'user-1',
+            authorName: 'Alice',
+            firstMessageAt: now - 1000,
+            lastMessageAt: now - 1000,
+            messageCount: 1,
+          },
+        ],
+      },
+      now,
+    )
+    expect(out).toContain(`${displayName} has no in-band mention syntax`)
+    expect(out).not.toContain('KakaoTalk')
   })
 
   test('Slack participants block renders `<@id> (name)` addressing per line (angle-id)', () => {

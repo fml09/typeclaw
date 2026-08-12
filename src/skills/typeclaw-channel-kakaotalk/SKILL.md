@@ -1,6 +1,6 @@
 ---
 name: typeclaw-channel-kakaotalk
-description: Use this skill BEFORE every `channel_reply` or `channel_send` call whose adapter is `kakaotalk`, AND before fetching/viewing KakaoTalk inbound attachments. KakaoTalk renders messages as plain text — `**bold**`, `## headings`, `| tables |`, fenced code blocks, and other markdown all appear literally. There is no `@mention` syntax, no message threads, no replies-with-quote, and no outbound stickers. Outbound file attachments (photos, videos, audio, generic files, multi-photo galleries) ARE supported — pass them via `attachments[]` on `channel_send` / `channel_reply` and the adapter routes by MIME. Inbound attachments appear as `[KakaoTalk attachment #N: ...]`; fetch with `channel_fetch_attachment({ attachment_id: N })` or view images with `look_at_channel_attachment({ attachment_id: N })`. Read this skill before composing or fetching anything on KakaoTalk.
+description: Use this skill for KakaoTalk inbound attachment/emoticon handling with `channel_fetch_attachment` or `look_at_channel_attachment`, outbound attachment/gallery MIME routing, engagement/stickiness and group-chat permission questions, mark-read behavior, or self-loop troubleshooting.
 ---
 
 # typeclaw-channel-kakaotalk
