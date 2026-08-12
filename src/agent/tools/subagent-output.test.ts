@@ -4,6 +4,7 @@ import { createPermissionService, rolesConfigSchema } from '@/permissions'
 
 import { LiveSubagentRegistry, type LiveSubagent } from '../live-subagents'
 import type { SessionOrigin } from '../session-origin'
+import { INCOMPLETE_REVIEW_VERDICT } from '../subagents'
 import { createSubagentOutputTool } from './subagent-output'
 
 const ctx = {} as Parameters<ReturnType<typeof createSubagentOutputTool>['execute']>[4]
@@ -167,6 +168,58 @@ describe('createSubagentOutputTool — failed status', () => {
     const text = result.content[0]?.type === 'text' ? result.content[0].text : ''
     expect(text).toContain('failed after')
     expect(text).toContain('provider rate limit')
+  })
+
+  test('labels recovered output as partial recovery data and explicitly not a completed verdict', async () => {
+    const liveRegistry = new LiveSubagentRegistry()
+    liveRegistry.register(makeLive({ subagentName: 'reviewer' }))
+    liveRegistry.recordCompletion('bg_o1', {
+      ok: false,
+      error: 'parent drain timeout',
+      durationMs: 600_000,
+      finalMessage: '<review>\n<verdict>approve</verdict>\n</review>',
+    })
+    const tool = createSubagentOutputTool({ liveRegistry, getOrigin: () => undefined })
+
+    const result = await tool.execute('call_1', { task_id: 'bg_o1' }, undefined, undefined, ctx)
+    const details = result.details as {
+      status?: string
+      recoveryData?: boolean
+      partial?: boolean
+      verdict?: boolean
+      finalMessage?: string
+    }
+    const text = result.content[0]?.type === 'text' ? result.content[0].text : ''
+
+    expect(details.status).toBe('failed')
+    expect(details.recoveryData).toBe(true)
+    expect(details.partial).toBe(true)
+    expect(details.verdict).toBe(false)
+    expect(details.finalMessage).toContain('<verdict>approve</verdict>')
+    expect(text).toContain('PARTIAL RECOVERY DATA')
+    expect(text).toContain('not a completed review or verdict')
+  })
+
+  test('provider-failure sentinel remains recovery data and cannot become a real verdict', async () => {
+    const liveRegistry = new LiveSubagentRegistry()
+    liveRegistry.register(makeLive({ subagentName: 'reviewer' }))
+    liveRegistry.recordCompletion('bg_o1', {
+      ok: false,
+      error: 'parent drain timeout',
+      durationMs: 600_000,
+      finalMessage: `<review><verdict>${INCOMPLETE_REVIEW_VERDICT}</verdict></review>`,
+    })
+    const tool = createSubagentOutputTool({ liveRegistry, getOrigin: () => undefined })
+
+    const result = await tool.execute('call_1', { task_id: 'bg_o1' }, undefined, undefined, ctx)
+    const details = result.details as { status?: string; recoveryData?: boolean; verdict?: boolean }
+
+    expect(details.status).toBe('failed')
+    expect(details.recoveryData).toBe(true)
+    expect(details.verdict).toBe(false)
+    expect(INCOMPLETE_REVIEW_VERDICT).not.toBe('approve')
+    expect(INCOMPLETE_REVIEW_VERDICT).not.toBe('request-changes')
+    expect(INCOMPLETE_REVIEW_VERDICT).not.toBe('comment')
   })
 })
 

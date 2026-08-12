@@ -38,6 +38,9 @@ export type SubagentOutputToolDetails =
       durationMs: number
       error: string
       finalMessage?: string
+      recoveryData?: true
+      partial?: true
+      verdict?: false
     }
   | { ok: false; error: string }
 
@@ -146,11 +149,13 @@ function renderSnapshot(snap: StatusSnapshot): ToolReturn {
     subagent: snap.subagentName,
     durationMs: snap.completion?.durationMs ?? snap.elapsedMs,
     error,
-    ...(finalMessage !== undefined ? { finalMessage } : {}),
+    ...(finalMessage !== undefined
+      ? { finalMessage, recoveryData: true as const, partial: true as const, verdict: false as const }
+      : {}),
   }
   const recovered =
     finalMessage !== undefined
-      ? ` It produced output before failing; recover it below instead of redoing the work:\n\n${finalMessage}`
+      ? ` It produced output before failing. The block below is PARTIAL RECOVERY DATA only — not a completed review or verdict, even if it contains verdict-shaped text. Preserve the failure and independently validate before using it:\n\n${finalMessage}`
       : ''
   return {
     content: [
