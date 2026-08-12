@@ -126,6 +126,9 @@ export const PARTICIPANTS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 type PlatformInfo = {
   displayName: string
   mentionMode: 'angle-id' | 'at-username' | 'alias'
+  // This platform has no rich-text rendering, so markdown markers appear
+  // literally to users.
+  plainTextOnly: boolean
   // Whether this adapter registers a ReactionCallback, i.e. whether
   // `channel_react` actually does anything here. Gates the proactive-reaction
   // prompt guidance so we never tell a KakaoTalk/Telegram agent to react when
@@ -145,28 +148,90 @@ type PlatformInfo = {
 }
 
 const PLATFORM_INFO: Record<AdapterId, PlatformInfo> = {
-  slack: { displayName: 'Slack', mentionMode: 'angle-id', supportsReactions: true, supportsAttachments: true },
-  'slack-bot': { displayName: 'Slack', mentionMode: 'angle-id', supportsReactions: true, supportsAttachments: true },
-  discord: { displayName: 'Discord', mentionMode: 'angle-id', supportsReactions: true, supportsAttachments: true },
-  'discord-bot': {
-    displayName: 'Discord',
+  slack: {
+    displayName: 'Slack',
     mentionMode: 'angle-id',
+    plainTextOnly: false,
     supportsReactions: true,
     supportsAttachments: true,
   },
-  github: { displayName: 'GitHub', mentionMode: 'at-username', supportsReactions: true, supportsAttachments: false },
-  instagram: { displayName: 'Instagram', mentionMode: 'alias', supportsReactions: false, supportsAttachments: false },
+  'slack-bot': {
+    displayName: 'Slack',
+    mentionMode: 'angle-id',
+    plainTextOnly: false,
+    supportsReactions: true,
+    supportsAttachments: true,
+  },
+  discord: {
+    displayName: 'Discord',
+    mentionMode: 'angle-id',
+    plainTextOnly: false,
+    supportsReactions: true,
+    supportsAttachments: true,
+  },
+  'discord-bot': {
+    displayName: 'Discord',
+    mentionMode: 'angle-id',
+    plainTextOnly: false,
+    supportsReactions: true,
+    supportsAttachments: true,
+  },
+  github: {
+    displayName: 'GitHub',
+    mentionMode: 'at-username',
+    plainTextOnly: false,
+    supportsReactions: true,
+    supportsAttachments: false,
+  },
+  instagram: {
+    displayName: 'Instagram',
+    mentionMode: 'alias',
+    plainTextOnly: true,
+    supportsReactions: false,
+    supportsAttachments: false,
+  },
   'telegram-bot': {
     displayName: 'Telegram',
     mentionMode: 'at-username',
+    plainTextOnly: false,
     supportsReactions: false,
     supportsAttachments: true,
   },
-  webex: { displayName: 'Webex', mentionMode: 'angle-id', supportsReactions: false, supportsAttachments: true },
-  'webex-bot': { displayName: 'Webex', mentionMode: 'angle-id', supportsReactions: false, supportsAttachments: false },
-  teams: { displayName: 'Teams', mentionMode: 'alias', supportsReactions: false, supportsAttachments: false },
-  line: { displayName: 'LINE', mentionMode: 'alias', supportsReactions: false, supportsAttachments: false },
-  kakaotalk: { displayName: 'KakaoTalk', mentionMode: 'alias', supportsReactions: false, supportsAttachments: true },
+  webex: {
+    displayName: 'Webex',
+    mentionMode: 'angle-id',
+    plainTextOnly: false,
+    supportsReactions: false,
+    supportsAttachments: true,
+  },
+  'webex-bot': {
+    displayName: 'Webex',
+    mentionMode: 'angle-id',
+    plainTextOnly: false,
+    supportsReactions: false,
+    supportsAttachments: false,
+  },
+  teams: {
+    displayName: 'Teams',
+    mentionMode: 'alias',
+    plainTextOnly: false,
+    supportsReactions: false,
+    supportsAttachments: false,
+  },
+  line: {
+    displayName: 'LINE',
+    mentionMode: 'alias',
+    plainTextOnly: true,
+    supportsReactions: false,
+    supportsAttachments: false,
+  },
+  kakaotalk: {
+    displayName: 'KakaoTalk',
+    mentionMode: 'alias',
+    plainTextOnly: true,
+    supportsReactions: false,
+    supportsAttachments: true,
+  },
 }
 
 function getPlatformInfo(adapter: AdapterId): PlatformInfo {
@@ -375,6 +440,10 @@ function renderChannelOrigin(
       'it via `channel_reply`/`gh pr comment`; that is a visible duplicate.',
       'One verdict, one surface. After submitting the review, use',
       '`skip_response({ reason: "verdict posted as review" })`.',
+      '',
+      'GitHub renders real Markdown; use it freely.',
+      'The GitHub adapter cannot send file attachments.',
+      'GitHub has no typing indicator.',
     )
 
     // Models reliably address review-comment feedback and then end the turn
@@ -413,6 +482,25 @@ function renderChannelOrigin(
       'fence.** Discord lacks table rendering; this session auto-reformats raw',
       'pipe tables into aligned columns, but fenced ```/~~~ tables stay literal.',
       'Use fences only for code/output meant to be verbatim.',
+    )
+  }
+
+  if (platformInfo.plainTextOnly) {
+    lines.push(
+      '',
+      'This platform renders messages as PLAIN TEXT with no rich-text formatting.',
+      'Write plain text from the start.',
+      'Do not use markdown bold/italics, `##` headings, `|` tables, fenced code',
+      'blocks, inline-code backticks, or `[label](url)` links; they appear literally.',
+      'Send bare URLs; the client auto-links them.',
+      'No threads and no quoted replies; every message is top-level.',
+      'Keep replies short and conversational for mobile reading: lead with a',
+      'one-sentence summary, then at most a few short lines.',
+      'If asked for something the platform cannot do, say so plainly.',
+      platformInfo.supportsAttachments
+        ? 'Attachments can be passed via `attachments[]` on `channel_send`/`channel_reply`.'
+        : 'Outbound attachments and stickers are unsupported; send text or a link instead.',
+      ...(platformInfo.supportsAttachments ? ['Outbound stickers/emoticons are not supported.'] : []),
     )
   }
 
@@ -616,18 +704,18 @@ function renderMentionGuidance(
       ]
     case 'at-username':
       return [
-        `To mention someone in your reply, use Telegram syntax \`@username\` in plain text.`,
-        'Telegram usernames are a SEPARATE field from `authorId`; `<@id>` tokens',
+        `To mention someone in your reply, use ${platformInfo.displayName} syntax \`@username\` in plain text.`,
+        `${platformInfo.displayName} usernames are a SEPARATE field from \`authorId\`; \`<@id>\` tokens`,
         'in participants are inbound-only typeclaw markers, so do not echo them back as outbound mentions.',
         'If no `@username` is known, use display name; reply context carries it.',
         ...renderSelfMention(platformInfo, self),
       ]
     case 'alias':
       return [
-        'KakaoTalk has no in-band mention syntax. To address someone, just type their display name as plain text;',
+        `${platformInfo.displayName} has no in-band mention syntax. To address someone, just type their display name as plain text;`,
         "the participants block shows display names. Users get the bot's attention with configured aliases,",
         'not copied tokens. Any `<@id>` marker is inbound-only typeclaw convention;',
-        'do not echo them back as outbound mentions or KakaoTalk renders them literally.',
+        `do not echo them back as outbound mentions or ${platformInfo.displayName} renders them literally.`,
       ]
   }
 }
@@ -763,13 +851,13 @@ function renderParticipantsTrailing(platformInfo: PlatformInfo): string[] {
     case 'at-username':
       return [
         "If a current sender isn't listed, address by `@username` when known.",
-        'Telegram usernames are a SEPARATE field from numeric `authorId`, and',
+        `${platformInfo.displayName} usernames are a SEPARATE field from numeric \`authorId\`, and`,
         'not every user has one. The list is recent context, not a directory.',
       ]
     case 'alias':
       return [
         "If a current sender isn't listed, address by display name as plain text.",
-        'KakaoTalk has no in-band mention syntax; `authorId` is reference only',
+        `${platformInfo.displayName} has no in-band mention syntax; \`authorId\` is reference only`,
         'and must not be echoed back. The list is recent context, not a directory.',
       ]
   }
