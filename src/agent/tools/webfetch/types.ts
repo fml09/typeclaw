@@ -7,6 +7,12 @@ export type AntibotWarmupDetails = {
   replayStatus?: number
 }
 
+export type HtmlExtractionAttempt = {
+  route: 'readability' | 'json_ld'
+  outcome: 'success' | 'unusable' | 'error'
+  reason: string
+}
+
 export type WebFetchDetails = {
   url: string
   finalUrl: string
@@ -19,6 +25,7 @@ export type WebFetchDetails = {
   truncated: boolean
   durationMs: number
   antibotWarmup?: AntibotWarmupDetails
+  extractionAttempts?: HtmlExtractionAttempt[]
   error?: boolean
   message?: string
 }
