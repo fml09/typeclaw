@@ -455,6 +455,55 @@ describe('runSubagentDrain — maxChildWaitMs (wedged-child ceiling)', () => {
     expect(prompts[0]).toContain('FAILED')
   })
 
+  test('timeout winner preserves only final output captured before settlement and broadcasts metadata only', async () => {
+    const { drain, reg } = makeDrain()
+    registerChild(reg, 'bg_review', { startedAt: 0 })
+    const review = '<review>\n<verdict>approve</verdict>\n</review>'
+    reg.recordCapturedFinalMessageIfRunning('bg_review', review)
+    const broadcasts: unknown[] = []
+    drain.stream.subscribe({ target: { kind: 'broadcast' } }, (message) => broadcasts.push(message.payload))
+
+    const watch = beginSubagentDrainWatch(drain)
+    const prompts: string[] = []
+    await runSubagentDrain(watch, {
+      drain,
+      prompt: async (text) => void prompts.push(text),
+      maxChildWaitMs: 5000,
+      now: () => 6000,
+    })
+
+    const completion = reg.get('bg_review')?.completion
+    expect(reg.get('bg_review')?.status).toBe('failed')
+    expect(completion?.error).toContain('drain wait')
+    expect(completion?.finalMessage).toBe(review)
+    expect(prompts[0]).toContain('produced output before failing')
+    expect(broadcasts).toHaveLength(1)
+    expect(broadcasts[0]).toMatchObject({ ok: false, hasRecoverableOutput: true })
+    expect(JSON.stringify(broadcasts[0])).not.toContain(review)
+
+    expect(reg.recordCapturedFinalMessageIfRunning('bg_review', '<review>late</review>')).toBe(false)
+    expect(reg.get('bg_review')?.completion?.finalMessage).toBe(review)
+  })
+
+  test('timeout winner does not claim recoverability for stale analysis captured as progress only', async () => {
+    const { drain, reg } = makeDrain()
+    registerChild(reg, 'bg_analysis', { startedAt: 0 })
+    reg.recordEvent('bg_analysis', { kind: 'message', preview: '<analysis>still working</analysis>', ts: 100 })
+    const broadcasts: unknown[] = []
+    drain.stream.subscribe({ target: { kind: 'broadcast' } }, (message) => broadcasts.push(message.payload))
+
+    const watch = beginSubagentDrainWatch(drain)
+    await runSubagentDrain(watch, {
+      drain,
+      prompt: async () => {},
+      maxChildWaitMs: 5000,
+      now: () => 6000,
+    })
+
+    expect(reg.get('bg_analysis')?.completion?.finalMessage).toBeUndefined()
+    expect(broadcasts[0]).not.toHaveProperty('hasRecoverableOutput')
+  })
+
   test('a timer expiry (no broadcast) wakes the loop and expires the child at the boundary', async () => {
     // given: a fake scheduler so the expiry timer fires on demand — deterministic,
     // no real clock. The child is within the ceiling at loop entry (clock=30 <
