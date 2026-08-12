@@ -1,6 +1,7 @@
 import { Type } from '@mariozechner/pi-ai'
 import { defineTool } from '@mariozechner/pi-coding-agent'
 
+import { extractAdaptiveHtml, validateAdaptiveHtmlComplexity } from './adaptive-html'
 import { fetchWithLimits, normalizeUrl, parseMimeType, WebFetchError } from './fetch'
 import { applyGrep, GrepError } from './strategies/grep'
 import { applyJq, JqError } from './strategies/jq'
@@ -14,6 +15,7 @@ import {
   MAX_TIMEOUT_SECONDS,
   OUTPUT_CAPS,
   type WebFetchDetails,
+  type HtmlExtractionAttempt,
 } from './types'
 
 const STRATEGY_VALUES = ['readability', 'jq', 'selector', 'grep', 'snapshot', 'raw'] as const
@@ -32,7 +34,12 @@ export const webFetchTool = defineTool({
     'fingerprinting (mouse/scroll/timing), interactive CAPTCHAs, or IP-reputation blocks — a 403 from those ' +
     'layers is expected and unrecoverable from this tool. ' +
     'Strategy guide:\n' +
-    '- "readability": extract article content as markdown (blogs, docs, news). Default for HTML.\n' +
+    '- "readability": extract article content as markdown (blogs, docs, news). Default for HTML — when auto-detected, ' +
+    'a linear DOM-complexity preflight (5 MiB scan, 20,000 tags, 256 nesting levels) runs before Readability; a ' +
+    'Readability miss (e.g. a JS app shell with no visible content) is rescued by scanning for a bounded schema.org ' +
+    'Article/NewsArticle/BlogPosting JSON-LD block before giving up; if neither yields meaningful text the error says ' +
+    'browser retrieval may be needed. Passing `strategy: "readability"` explicitly skips adaptive JSON-LD/classification ' +
+    "and returns Readability's result as-is, even when empty, but still shares parser and deterministic visibility safety checks.\n" +
     '- "jq": query JSON APIs (npm registry, GitHub API). Pass `query` (e.g. ".items[].name").\n' +
     '- "selector": extract text from elements matching a CSS selector. Pass `selector` (e.g. ".price").\n' +
     '- "grep": filter lines by regex with optional `before`/`after` context. Pass `pattern`.\n' +
@@ -125,8 +132,41 @@ export const webFetchTool = defineTool({
     }
 
     let output: string
+    let extractionAttempts: HtmlExtractionAttempt[] | undefined
     try {
-      output = await runStrategy(strategy, response.body, response.finalUrl, params)
+      if (strategy === 'readability' && autoDetected) {
+        const extracted = await extractAdaptiveHtml(response.body, response.finalUrl)
+        extractionAttempts = extracted.attempts
+        if (extracted.kind === 'error') {
+          return errorResult(normalizedUrl, extracted.message, {
+            startedAt,
+            finalUrl: response.finalUrl,
+            contentType: response.contentType,
+            httpStatus: response.httpStatus,
+            bytesIn: response.bytesIn,
+            strategy,
+            autoDetected,
+            extractionAttempts,
+          })
+        }
+        output = extracted.output
+      } else {
+        if (strategy === 'readability') {
+          const complexity = validateAdaptiveHtmlComplexity(response.body)
+          if (!complexity.valid) {
+            return errorResult(normalizedUrl, complexity.reason, {
+              startedAt,
+              finalUrl: response.finalUrl,
+              contentType: response.contentType,
+              httpStatus: response.httpStatus,
+              bytesIn: response.bytesIn,
+              strategy,
+              autoDetected,
+            })
+          }
+        }
+        output = await runStrategy(strategy, response.body, response.finalUrl, params)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       return errorResult(normalizedUrl, message, {
@@ -152,6 +192,7 @@ export const webFetchTool = defineTool({
       bytesOut: byteLength(capped.text),
       truncated: capped.truncated,
       durationMs: Date.now() - startedAt,
+      ...(extractionAttempts === undefined ? {} : { extractionAttempts }),
       ...(response.antibotWarmup?.triggered
         ? {
             antibotWarmup: {
@@ -286,6 +327,8 @@ function errorResult(
     bytesOut: byteLength(message),
     truncated: false,
     durationMs: Date.now() - startedAt,
+    ...(rest.antibotWarmup === undefined ? {} : { antibotWarmup: rest.antibotWarmup }),
+    ...(rest.extractionAttempts === undefined ? {} : { extractionAttempts: rest.extractionAttempts }),
     error: true,
     message,
   }
