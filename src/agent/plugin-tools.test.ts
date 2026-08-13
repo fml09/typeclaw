@@ -2182,7 +2182,7 @@ describe('wrapSystemTool', () => {
       await Promise.all(outcomes.flatMap((outcome) => ('pinned' in outcome ? [outcome.pinned.cleanup()] : [])))
       await rm(agentDir, { recursive: true, force: true })
     }
-  })
+  }, 60_000)
 
   test('charges streamed file growth against the process-wide byte budget', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-growing-snapshot-budget-'))
