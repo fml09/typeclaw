@@ -344,10 +344,10 @@ function itemHint(item: ViewerItem): { hint: string } {
   return { hint: '(no prompt)' }
 }
 
-function sessionRowLabel(s: SessionSummary): string {
+export function sessionRowLabel(s: SessionSummary): string {
   const id = shortSessionId(s.sessionId)
   const label = s.origin === null ? '(unknown origin)' : originLabel(s.origin)
-  const when = s.live === true ? c.green('live · replying') : c.dim(formatRelative(s.mtimeMs))
+  const when = s.live === true ? c.green('live') : c.dim(formatRelative(s.mtimeMs))
   return `${c.cyan(id)}  ${label}  ${when}`
 }
 

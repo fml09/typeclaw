@@ -24,6 +24,10 @@ const ID_A = '019ee000-aaaa-7000-9000-00000000aaaa'
 const ID_B = '019ee000-bbbb-7000-9000-00000000bbbb'
 const ID_C = '019ee000-cccc-7000-9000-00000000cccc'
 
+function numberedId(index: number): string {
+  return `019ee000-${index.toString().padStart(4, '0')}-7000-9000-${index.toString().padStart(12, '0')}`
+}
+
 function metaLine(origin: unknown): string {
   return JSON.stringify({
     type: 'custom',
@@ -155,6 +159,52 @@ describe('listViewerItems', () => {
     expect(rows).toHaveLength(1)
     if (rows[0]?.kind === 'logs') throw new Error('unreachable')
     expect(rows[0]?.summary.live).toBeUndefined()
+  })
+
+  test('a registry session below the disk summary limit stays disk-backed and does not expand the picker', async () => {
+    const diskIds: string[] = []
+    for (let index = 0; index < 21; index++) {
+      const id = numberedId(index)
+      diskIds.push(id)
+      await seed(`session_${id}.jsonl`, { kind: 'cron', jobId: `${index}`, jobKind: 'prompt' }, 1000 + index)
+    }
+
+    const { items } = await listViewerItems({
+      sessionsDir,
+      containerRunning: true,
+      interactive: true,
+      includeLogs: false,
+      limit: 20,
+      liveSessions: [{ sessionId: diskIds[0]!, origin: { kind: 'tui' }, registeredAtMs: 9_000_000 }],
+    })
+
+    expect(items).toHaveLength(20)
+    expect(items.some((item) => item.kind !== 'logs' && item.summary.sessionId === diskIds[0])).toBe(false)
+    expect(items.filter((item) => item.kind !== 'logs' && item.summary.live === true)).toHaveLength(0)
+  })
+
+  test('a registry-only session displaces the oldest selected history row within the requested limit', async () => {
+    const diskIds: string[] = []
+    for (let index = 0; index < 21; index++) {
+      const id = numberedId(index)
+      diskIds.push(id)
+      await seed(`session_${id}.jsonl`, { kind: 'cron', jobId: `${index}`, jobKind: 'prompt' }, 1000 + index)
+    }
+    const registryOnlyId = ID_A
+
+    const { items } = await listViewerItems({
+      sessionsDir,
+      containerRunning: true,
+      interactive: true,
+      includeLogs: false,
+      limit: 20,
+      liveSessions: [{ sessionId: registryOnlyId, origin: { kind: 'tui' }, registeredAtMs: 9_000_000 }],
+    })
+
+    expect(items).toHaveLength(20)
+    expect(items[0]).toMatchObject({ summary: { sessionId: registryOnlyId, live: true } })
+    expect(items.some((item) => item.kind !== 'logs' && item.summary.sessionId === diskIds[1])).toBe(false)
+    expect(items.some((item) => item.kind !== 'logs' && item.summary.sessionId === diskIds[20])).toBe(true)
   })
 
   test('non-TTY run classifies the most-recent tui-origin session read-only even with the container up', async () => {

@@ -14,10 +14,9 @@ export type SessionSummary = {
   mtimeMs: number
   origin: MinimalSessionOrigin | null
   firstPrompt: string | null
-  // True only for a registry-derived session with no .jsonl on disk yet (a
-  // reply is in flight). Disk sessions leave this undefined. Selecting one tails
-  // live-only: streamSessionEvents replays an empty file, then the WS delivers
-  // events as they happen.
+  // True only for a registered session with no .jsonl on disk yet. Registration
+  // means the session is warm, not that a reply is currently in flight. Disk
+  // sessions leave this undefined.
   live?: boolean
 }
 
@@ -26,6 +25,7 @@ export type ListSessionsOptions = {
   limit?: number
   sinceMs?: number
   onWarn?: (msg: string) => void
+  liveSessions?: LiveSessionPayload[]
 }
 
 // pi-coding-agent writes session files as `${ISO_TIMESTAMP}_${SESSION_ID}.jsonl`,
@@ -72,17 +72,23 @@ type StatEntry = { path: string; basename: string; sessionId: string; mtimeMs: n
 // Split from listSessions so resolveSession can match ids first and peek only the
 // candidates, instead of reading every file body on disk. Reads no file content.
 async function statSessionFiles(opts: ListSessionsOptions): Promise<StatEntry[]> {
+  return (await scanSessionFiles(opts)).eligible
+}
+
+async function scanSessionFiles(
+  opts: ListSessionsOptions,
+): Promise<{ eligible: StatEntry[]; onDiskSessionIds: Set<string> }> {
   const entries = await readSessionFiles(opts.sessionsDir, opts.onWarn)
   const withStats = await mapConcurrent(entries, SESSION_IO_CONCURRENCY, async (entry) => {
     const s = await safeStat(entry.path)
     if (s === null) return null
     const mtimeMs = s.mtimeMs
-    if (opts.sinceMs !== undefined && mtimeMs < opts.sinceMs) return null
     return { ...entry, mtimeMs }
   })
   const valid = withStats.filter((v): v is StatEntry => v !== null)
-  valid.sort((a, b) => b.mtimeMs - a.mtimeMs)
-  return valid
+  const eligible = opts.sinceMs === undefined ? valid : valid.filter((entry) => entry.mtimeMs >= opts.sinceMs!)
+  eligible.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return { eligible, onDiskSessionIds: new Set(valid.map((entry) => entry.sessionId)) }
 }
 
 async function summarizeEntry(entry: StatEntry, onWarn?: (msg: string) => void): Promise<SessionSummary> {
@@ -98,18 +104,25 @@ async function summarizeEntry(entry: StatEntry, onWarn?: (msg: string) => void):
 }
 
 export async function listSessions(opts: ListSessionsOptions): Promise<SessionSummary[]> {
-  const valid = await statSessionFiles(opts)
-  const limited = opts.limit !== undefined ? valid.slice(0, opts.limit) : valid
-  return mapConcurrent(limited, SESSION_IO_CONCURRENCY, (entry) => summarizeEntry(entry, opts.onWarn))
+  const { eligible, onDiskSessionIds } = await scanSessionFiles(opts)
+  const limited = opts.limit !== undefined ? eligible.slice(0, opts.limit) : eligible
+  const disk = await mapConcurrent(limited, SESSION_IO_CONCURRENCY, (entry) => summarizeEntry(entry, opts.onWarn))
+  if (opts.liveSessions === undefined || opts.liveSessions.length === 0) return disk
+  return mergeLiveSessions(disk, opts.liveSessions, { onDiskSessionIds, limit: opts.limit })
 }
 
 // Overlay container-registry sessions onto the disk listing. A live session
-// already flushed to disk (post-reply) is dropped from the overlay — the disk
+// already flushed to disk is dropped from the overlay — the disk
 // summary wins, carrying its real mtime and prompt preview. Only sessions with
 // no .jsonl yet become synthetic live rows, sorted to the top by registration
-// time so an in-flight reply surfaces above settled history.
-export function mergeLiveSessions(disk: SessionSummary[], live: LiveSessionPayload[]): SessionSummary[] {
-  const onDisk = new Set(disk.map((s) => s.sessionId))
+// time. The final limit applies after merging, so registry-only rows displace
+// older history rather than expanding the picker.
+export function mergeLiveSessions(
+  disk: SessionSummary[],
+  live: LiveSessionPayload[],
+  opts: { onDiskSessionIds?: ReadonlySet<string>; limit?: number } = {},
+): SessionSummary[] {
+  const onDisk = opts.onDiskSessionIds ?? new Set(disk.map((s) => s.sessionId))
   const liveOnly = live
     .filter((l) => !onDisk.has(l.sessionId))
     .map(
@@ -123,7 +136,8 @@ export function mergeLiveSessions(disk: SessionSummary[], live: LiveSessionPaylo
         live: true,
       }),
     )
-  return [...liveOnly, ...disk].sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const merged = [...liveOnly, ...disk].sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return opts.limit !== undefined ? merged.slice(0, opts.limit) : merged
 }
 
 export type ResolveResult =

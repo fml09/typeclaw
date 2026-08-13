@@ -4,9 +4,25 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { sessionRowLabel } from './inspect'
 import { createTailScope } from './inspect-controller'
 
 const CLI_ENTRY = join(import.meta.dir, 'index.ts')
+
+test('registry-only session rows say live without claiming a reply is in flight', () => {
+  const label = sessionRowLabel({
+    sessionId: '0192abcd-1111-7000-8000-000000000001',
+    sessionFile: '',
+    basename: '',
+    mtimeMs: 1,
+    origin: { kind: 'tui' },
+    firstPrompt: null,
+    live: true,
+  })
+
+  expect(label).toContain('live')
+  expect(label).not.toContain('replying')
+})
 
 function tick(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
