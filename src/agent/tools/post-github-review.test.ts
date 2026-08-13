@@ -12,7 +12,7 @@ import {
 } from '@/channels/github-review-verdict-coordinator'
 import { createChannelRouter } from '@/channels/router'
 import { defaultHistoryConfig } from '@/channels/schema'
-import type { SubmitReviewRequest } from '@/channels/types'
+import type { OutboundMessage, SubmitReviewRequest } from '@/channels/types'
 
 import { createPostGithubReviewTool } from './post-github-review'
 
@@ -160,6 +160,210 @@ describe('post_github_review', () => {
     expect(submissions).toBe(1)
     releaseFirst()
     expect((await first).details).toMatchObject({ ok: true })
+  })
+
+  test('posts a duplicate REQUEST_CHANGES as one top-level PR comment', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => 'sha-1',
+    })
+    const channelRouter = router()
+    const reviews: SubmitReviewRequest[] = []
+    const comments: OutboundMessage[] = []
+    channelRouter.registerReviewSubmitter('github', async (request) => {
+      reviews.push(request)
+      return { ok: true, reviewId: 48, state: 'CHANGES_REQUESTED' }
+    })
+    channelRouter.registerOutbound('github', async (message) => {
+      comments.push(message)
+      return { ok: true, messageId: '91', messageIds: ['91'] }
+    })
+    const output: unknown[] = []
+    setReviewOutputObserver((value) => output.push(value))
+
+    const result = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'REQUEST_CHANGES',
+      body: 'The overall flow still needs revision.',
+      comments: [
+        { path: 'src/rules.ts', line: 12, side: 'RIGHT', body: 'Evaluate only the selected offer here.' },
+        {
+          path: 'src/search.ts',
+          line: 30,
+          side: 'RIGHT',
+          start_line: 26,
+          start_side: 'RIGHT',
+          body: 'Keep exhaustive discovery in the automatic path.',
+        },
+        { path: 'src/legacy.ts', line: 14, side: 'LEFT', body: 'This deleted line still carries the bug.' },
+        {
+          path: 'src/removed.ts',
+          line: 24,
+          side: 'LEFT',
+          start_line: 20,
+          start_side: 'LEFT',
+          body: 'This removed block needs a replacement.',
+        },
+      ],
+    })
+
+    expect(reviews).toEqual([])
+    expect(comments).toEqual([
+      {
+        adapter: 'github',
+        workspace: githubOrigin.workspace,
+        chat: githubOrigin.chat,
+        thread: null,
+        text: [
+          'The overall flow still needs revision.',
+          '',
+          '---',
+          '',
+          '**`src/rules.ts:12`**',
+          '',
+          'Evaluate only the selected offer here.',
+          '',
+          '**`src/search.ts:26-30`**',
+          '',
+          'Keep exhaustive discovery in the automatic path.',
+          '',
+          '**`src/legacy.ts:14 (old revision)`**',
+          '',
+          'This deleted line still carries the bug.',
+          '',
+          '**`src/removed.ts:20-24 (old revision)`**',
+          '',
+          'This removed block needs a replacement.',
+        ].join('\n'),
+      },
+    ])
+    expect(result.details).toEqual({ ok: true, fallback: 'comment', messageId: '91', messageIds: ['91'] })
+    expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict: 'REQUEST_CHANGES' })).toBe(
+      false,
+    )
+    expect(output).toEqual([{ sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: 'COMMENT' }])
+  })
+
+  test('serializes duplicate REQUEST_CHANGES fallbacks until outbound delivery completes', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => 'sha-1',
+    })
+    const channelRouter = router()
+    let releaseFirst: () => void = () => {}
+    const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve))
+    const comments: OutboundMessage[] = []
+    channelRouter.registerOutbound('github', async (message) => {
+      comments.push(message)
+      await firstGate
+      return { ok: true }
+    })
+
+    const first = run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'REQUEST_CHANGES',
+      body: 'first',
+    })
+    await Bun.sleep(0)
+    const second = await run(
+      createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId: 'concurrent-session' }),
+      { event: 'REQUEST_CHANGES', body: 'second' },
+    )
+
+    expect(second.details).toMatchObject({ ok: false })
+    expect(comments).toHaveLength(1)
+    releaseFirst()
+    expect((await first).details).toMatchObject({ ok: true, fallback: 'comment' })
+  })
+
+  test('keeps a recent-landed REQUEST_CHANGES cooldown duplicate denied without an authoritative standing block', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
+      resolveHeadSha: async () => 'sha-1',
+    })
+    const channelRouter = router()
+    let submissions = 0
+    channelRouter.registerReviewSubmitter('github', async () => {
+      submissions += 1
+      return { ok: true, reviewId: 49, state: 'CHANGES_REQUESTED' }
+    })
+    const comments: OutboundMessage[] = []
+    channelRouter.registerOutbound('github', async (message) => {
+      comments.push(message)
+      return { ok: true }
+    })
+    const tool = createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId })
+
+    expect((await run(tool, { event: 'REQUEST_CHANGES', body: 'first' })).details).toMatchObject({ ok: true })
+    expect((await run(tool, { event: 'REQUEST_CHANGES', body: 'follow-up' })).details).toMatchObject({ ok: false })
+    expect(submissions).toBe(1)
+    expect(comments).toHaveLength(0)
+  })
+
+  test('keeps adversarial finding paths inside a single Markdown code span', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => 'sha-1',
+    })
+    const channelRouter = router()
+    const comments: OutboundMessage[] = []
+    channelRouter.registerOutbound('github', async (message) => {
+      comments.push(message)
+      return { ok: true }
+    })
+
+    await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'REQUEST_CHANGES',
+      body: 'summary',
+      comments: [{ path: '`@team\n## injected.ts`', line: 4, body: 'finding' }],
+    })
+
+    expect(comments[0]?.text).toContain('`` `@team ## injected.ts`:4 ``')
+    expect(comments[0]?.text).not.toContain('\n## injected.ts')
+  })
+
+  test('keeps concurrent REQUEST_CHANGES blocked instead of posting a fallback comment', async () => {
+    const channelRouter = router()
+    const comments: OutboundMessage[] = []
+    channelRouter.registerOutbound('github', async (message) => {
+      comments.push(message)
+      return { ok: true }
+    })
+    const verdictGuard = {
+      guard: async () => ({ block: true as const, kind: 'concurrent' as const, reason: 'already submitting' }),
+      release: async () => {},
+      noteLandedReview: async () => {},
+    }
+
+    const result = await run(
+      createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId, verdictGuard }),
+      { event: 'REQUEST_CHANGES', body: 'summary' },
+    )
+
+    expect(result.details).toMatchObject({ ok: false, error: 'already submitting' })
+    expect(comments).toEqual([])
+  })
+
+  test('reports a failed duplicate-review comment fallback', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => 'sha-1',
+    })
+    const channelRouter = router()
+    channelRouter.registerOutbound('github', async () => ({
+      ok: false,
+      error: 'GitHub API 403: Issues permission required',
+      code: 'callback-rejected',
+    }))
+
+    const result = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'REQUEST_CHANGES',
+      body: 'summary',
+    })
+
+    expect(result.details).toEqual({
+      ok: false,
+      error: 'GitHub API 403: Issues permission required',
+      code: 'callback-rejected',
+    })
   })
 
   test('retains a conservative dedupe shield when POST succeeded but verification outcome is unknown', async () => {
