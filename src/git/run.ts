@@ -33,10 +33,12 @@ export async function runGit(
   bun: { spawn: typeof Bun.spawn },
   cwd: string,
   args: readonly string[],
+  options: { env?: NodeJS.ProcessEnv } = {},
 ): Promise<RunGitResult> {
   const proc = bun.spawn({
     cmd: ['git', ...hooklessGitArgs(args)],
     cwd,
+    env: options.env,
     stdout: 'pipe',
     stderr: 'pipe',
   })

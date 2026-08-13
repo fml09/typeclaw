@@ -17,6 +17,7 @@ const RUNTIME_GIT_FILES = [
   'src/bundled-plugins/guard/policies/uncommitted-changes.ts',
   'src/dreams/git.ts',
   'src/init/index.ts',
+  'src/git/resolve-identity.ts',
 ] as const
 
 const RUNTIME_COMMIT_PATHS = [
