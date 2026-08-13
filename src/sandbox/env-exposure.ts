@@ -54,6 +54,13 @@ const EXECUTION_CONTROL_ENV_NAMES = new Set<string>([
 
 const EXECUTION_CONTROL_ENV_PREFIXES = ['GIT_CONFIG', 'BASH_FUNC_'] as const
 
+const GIT_IDENTITY_ENV_NAMES = [
+  'GIT_AUTHOR_NAME',
+  'GIT_AUTHOR_EMAIL',
+  'GIT_COMMITTER_NAME',
+  'GIT_COMMITTER_EMAIL',
+] as const
+
 // Withheld ONLY when the name would compromise sandbox integrity or claim a
 // host/container-injected runtime token — not for being credential-shaped. `.env`
 // is the operator's expose-to-the-agent surface: every value they declare there
@@ -66,18 +73,24 @@ function isWithheldEnvName(name: string): boolean {
   return EXECUTION_CONTROL_ENV_PREFIXES.some((prefix) => name === prefix || name.startsWith(prefix))
 }
 
-// Every name an operator declared in the `.env` FILE with a non-empty value,
-// minus the sandbox-integrity/broker withholds. Eligibility is decided from the
-// PARSED `.env` value, never process.env: an empty `.env` line (`X=`) is not an
-// operator expose-choice even if hydrateChannelEnvFromSecrets later fills
-// process.env[X] from secrets.json. The inherited VALUE is still snapshotted
-// from process.env at spawn time.
-export function resolveExposableEnvNames(declaredEnv: ReadonlyMap<string, string>): string[] {
+// Every non-empty name declared in `.env`, minus sandbox-integrity/broker
+// withholds, plus the four Git identity names that `typeclaw start` resolves
+// from the agent repository and owns in the container environment. No other
+// process.env-only name is eligible: an empty `.env` line (`X=`) remains hidden
+// even if secrets.json hydration later fills process.env[X]. Inherited VALUES
+// are snapshotted from process.env at spawn time.
+export function resolveExposableEnvNames(
+  declaredEnv: ReadonlyMap<string, string>,
+  runtimeEnv: Readonly<Record<string, string | undefined>> = {},
+): string[] {
   const out: string[] = []
   for (const [name, fileValue] of declaredEnv) {
     if (fileValue.length === 0) continue
     if (isWithheldEnvName(name)) continue
     out.push(name)
+  }
+  for (const name of GIT_IDENTITY_ENV_NAMES) {
+    if (runtimeEnv[name]?.length && !out.includes(name)) out.push(name)
   }
   return out
 }

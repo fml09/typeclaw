@@ -64,6 +64,19 @@ describe('resolveExposableEnvNames', () => {
     expect(names).toEqual(['OK'])
   })
 
+  test('exposes runtime-injected Git identity without exposing Git config controls', () => {
+    const names = resolveExposableEnvNames(env({ GIT_CONFIG_GLOBAL: '/evil' }), {
+      GIT_AUTHOR_NAME: 'Agent Smith',
+      GIT_AUTHOR_EMAIL: 'agent@example.com',
+      GIT_COMMITTER_NAME: 'Agent Smith',
+      GIT_COMMITTER_EMAIL: 'agent@example.com',
+      GIT_CONFIG_COUNT: '1',
+      UNDECLARED: 'hidden',
+    })
+
+    expect(names).toEqual(['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'])
+  })
+
   test('an EMPTY .env declaration is ineligible even if secrets.json later fills process.env', () => {
     // .env has `DISCORD_BOT_TOKEN=` (empty); hydrateChannelEnvFromSecrets would
     // populate process.env[DISCORD_BOT_TOKEN] from secrets.json. Eligibility is

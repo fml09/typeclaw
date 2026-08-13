@@ -1038,7 +1038,7 @@ function spreadSandboxEnv(policy: ReturnType<typeof buildSandboxEnvPolicy>): {
 
 function resolveExposableBashEnvNames(agentDir: string): { exposable: string[]; withheld: string[] } {
   const declaredEnv = readEnvFile(agentDir)
-  const exposable = resolveExposableEnvNames(declaredEnv)
+  const exposable = resolveExposableEnvNames(declaredEnv, process.env)
   const exposableSet = new Set(exposable)
   const withheld = [...declaredEnv]
     .filter(([name, value]) => value.length > 0 && !exposableSet.has(name))

@@ -43,6 +43,7 @@ import {
   resolvePrivilegedSandboxRuntime,
 } from '@/sandbox'
 import type { SandboxPolicy } from '@/sandbox'
+import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 
 import { URL_FETCH_MAX_BYTES } from './multimodal/looker'
 import {
@@ -3753,6 +3754,51 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     }
   })
 
+  test('inherits runtime Git identity through the production bash sandbox path while withholding Git config', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-git-identity-boundary-'))
+    const previous = new Map<string, string | undefined>()
+    const identity = {
+      GIT_AUTHOR_NAME: 'Runtime Agent',
+      GIT_AUTHOR_EMAIL: 'runtime@example.com',
+      GIT_COMMITTER_NAME: 'Runtime Agent',
+      GIT_COMMITTER_EMAIL: 'runtime@example.com',
+    }
+    for (const [name, value] of Object.entries({ ...identity, GIT_CONFIG_COUNT: '1' })) {
+      previous.set(name, process.env[name])
+      process.env[name] = value
+    }
+    await writeFile(path.join(agentDir, '.env'), 'GIT_CONFIG_GLOBAL=/evil\n')
+    let inherited: string[] | undefined
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'git-identity-boundary',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveRuntime: async () => ({ env: {}, mounts: [] }),
+        buildCommand(command, options) {
+          inherited = options?.env?.inherit
+          return { ...buildSandboxedCommand(command, options), commandString: command }
+        },
+      },
+    })
+
+    try {
+      await wrapped.execute('c', { command: 'git status' }, undefined, undefined, {} as never)
+      expect(inherited).toEqual(Object.keys(identity))
+      expect(inherited).not.toContain('GIT_CONFIG_GLOBAL')
+      expect(inherited).not.toContain('GIT_CONFIG_COUNT')
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
   test('prepends the per-session dependency bin directory to PATH at the bash sandbox boundary', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-dependency-path-'))
     const workspaceRoot = path.join(agentDir, 'packages', 'workspace-cli')
@@ -4666,6 +4712,19 @@ describe('buildSandboxEnvPolicy exposable .env names', () => {
   test('deduplicates a name that is both a secret-pattern overlay and an exposable name', () => {
     const policy = buildSandboxEnvPolicy({ FOO_TOKEN: 'x' }, undefined, ['FOO_TOKEN'])
     expect(policy.inherit).toEqual(['FOO_TOKEN'])
+  })
+
+  test('inherits runtime-injected Git identity by name so values stay out of argv', () => {
+    const names = resolveExposableEnvNames(new Map(), {
+      GIT_AUTHOR_NAME: 'Agent Smith',
+      GIT_AUTHOR_EMAIL: 'agent@example.com',
+      GIT_COMMITTER_NAME: 'Agent Smith',
+      GIT_COMMITTER_EMAIL: 'agent@example.com',
+    })
+
+    const policy = buildSandboxEnvPolicy(undefined, undefined, names)
+
+    expect(policy.inherit).toEqual(['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'])
   })
 })
 
