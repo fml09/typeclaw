@@ -8,6 +8,7 @@ import { migrateAgentMessengerConfigDir, resolveAgentMessengerConfigPolicy } fro
 import { expandMountPath, loadConfigSync, withDefaultPlugins, type Config, type PortForward } from '@/config'
 import { applyBoundGcConfig } from '@/git/bound-gc-config'
 import { commitGitignoreWithUntracks, untrackTrulyIgnoredFiles } from '@/git/reconcile-ignored'
+import { resolveGitIdentity, type GitIdentity } from '@/git/resolve-identity'
 import { commitSystemFile as commitSystemFileShared } from '@/git/system-commit'
 import { send as sendToDaemon } from '@/hostd/client'
 import { ensureModels as ensureHostModels } from '@/hostd/models'
@@ -92,6 +93,7 @@ export type PlanStartOptions = {
   // POSIX identity whose ownership bind-mounted runtime writes must retain.
   // Omitted when unavailable (native Windows and unusual JS hosts).
   hostIdentity?: { uid: number; gid: number } | null
+  gitIdentity?: GitIdentity | null
 }
 
 export type HostDaemonControl = {
@@ -703,6 +705,7 @@ export async function planStart({
   tuiToken = null,
   platform = process.platform,
   hostIdentity = currentHostIdentity(),
+  gitIdentity,
 }: PlanStartOptions): Promise<StartPlan> {
   const containerName = containerNameFromCwd(cwd)
   const imageTag = imageTagFromCwd(cwd)
@@ -855,6 +858,19 @@ export async function planStart({
 
   if (existsSync(join(cwd, ENV_FILE))) {
     runArgs.push('--env-file', join(cwd, ENV_FILE))
+  }
+  const resolvedGitIdentity = gitIdentity === undefined ? await resolveGitIdentity(cwd) : gitIdentity
+  if (resolvedGitIdentity !== null) {
+    runArgs.push(
+      '-e',
+      `GIT_AUTHOR_NAME=${resolvedGitIdentity.name}`,
+      '-e',
+      `GIT_AUTHOR_EMAIL=${resolvedGitIdentity.email}`,
+      '-e',
+      `GIT_COMMITTER_NAME=${resolvedGitIdentity.name}`,
+      '-e',
+      `GIT_COMMITTER_EMAIL=${resolvedGitIdentity.email}`,
+    )
   }
   const agentMessengerPolicy = resolveAgentMessengerConfigPolicy(cwd)
   if (agentMessengerPolicy.override === null) {
