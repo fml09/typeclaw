@@ -4,8 +4,8 @@ import { resolveAgentGit } from './resolve-agent-git'
 // Commits TypeClaw-owned tracked files (.gitignore, package.json,
 // typeclaw.json) if any are dirty in git. Skips silently when the agent
 // folder is not a git repo, when Bun is unavailable, or when every named
-// file is clean. Uses the user's global git config for authorship —
-// TypeClaw does not impersonate the user here.
+// file is clean. Uses Git's ambient identity: host config in host-stage calls,
+// or the agent repo identity injected into the container process at start.
 //
 // Accepts a single file or an array; the array form produces a single
 // atomic commit covering all listed paths (used for migrations that touch

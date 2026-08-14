@@ -231,6 +231,63 @@ describe('start() model-provisioning anti-flake guard', () => {
 })
 
 describe('planStart', () => {
+  test('resolves repository-local Git identity through the production host-to-container path', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeFile(join(root, '.env'), 'GIT_AUTHOR_NAME=stale\n')
+    await gitInit(root)
+    await runGit(root, ['config', '--local', 'user.name', 'Resolved Agent'])
+    await runGit(root, ['config', '--local', 'user.email', 'resolved@example.com'])
+
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+    const envFileIndex = plan.runArgs.indexOf('--env-file')
+    for (const value of [
+      'GIT_AUTHOR_NAME=Resolved Agent',
+      'GIT_AUTHOR_EMAIL=resolved@example.com',
+      'GIT_COMMITTER_NAME=Resolved Agent',
+      'GIT_COMMITTER_EMAIL=resolved@example.com',
+    ]) {
+      expect(plan.runArgs.indexOf(value)).toBeGreaterThan(envFileIndex)
+    }
+  })
+
+  test('injects repository-local Git identity after the operator env file', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeFile(join(root, '.env'), 'GIT_AUTHOR_NAME=stale\n')
+
+    const plan = await planStart({
+      cwd: root,
+      hostPort: 8973,
+      imageExists: true,
+      gitIdentity: { name: 'Agent Smith', email: 'agent@example.com' },
+    })
+
+    const envFileIndex = plan.runArgs.indexOf('--env-file')
+    const expected = [
+      'GIT_AUTHOR_NAME=Agent Smith',
+      'GIT_AUTHOR_EMAIL=agent@example.com',
+      'GIT_COMMITTER_NAME=Agent Smith',
+      'GIT_COMMITTER_EMAIL=agent@example.com',
+    ]
+    for (const value of expected) {
+      const index = plan.runArgs.indexOf(value)
+      expect(plan.runArgs[index - 1]).toBe('-e')
+      expect(index).toBeGreaterThan(envFileIndex)
+      expect(index).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
+    }
+  })
+
+  test('omits Git identity variables when the agent repository has no complete identity', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true, gitIdentity: null })
+
+    expect(plan.runArgs.filter((arg) => /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)=/.test(arg))).toEqual([])
+  })
+
   test('publishes the TUI websocket port on host loopback by default', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
@@ -1376,9 +1433,9 @@ async function isGitIgnored(cwd: string, path: string): Promise<boolean> {
 }
 
 async function gitInit(cwd: string): Promise<void> {
-  // The commitSystemFile path uses the user's global git config for authorship,
-  // but tests can run in CI with no global user.name/user.email. Set repo-local
-  // identity here so commits succeed deterministically without polluting global config.
+  // Runtime-owned commits use Git's ambient identity (host config or injected
+  // container author/committer variables), but CI may have neither. Set a local
+  // fixture identity without polluting global config.
   for (const cmd of [
     ['init', '-b', 'main'],
     ['config', 'user.name', 'Test User'],

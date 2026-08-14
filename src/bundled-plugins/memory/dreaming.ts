@@ -745,8 +745,9 @@ async function ensureMemoryFiles(agentDir: string): Promise<void> {
 
 // Force-add gitignored memory artifacts so the agent folder's git history
 // captures consolidation as a single recoverable snapshot. Skips silently when
-// the folder is not a git repo or bun is unavailable. Uses the user's global
-// git config for authorship.
+// the folder is not a git repo or bun is unavailable. Uses Git's ambient
+// identity: host config in host-stage calls, or the agent repo identity
+// injected into the container process at start.
 //
 // After committing, the tracked memory artifacts get the `skip-worktree` index
 // flag set so manual `git status` / `git diff` ignore future runtime edits.

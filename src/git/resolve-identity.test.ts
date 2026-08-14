@@ -1,0 +1,142 @@
+import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { _internal, resolveGitIdentity } from './resolve-identity'
+
+const roots: string[] = []
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+})
+
+async function tempDir(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix))
+  roots.push(dir)
+  return dir
+}
+
+async function git(cwd: string, args: string[]): Promise<void> {
+  const proc = Bun.spawn({
+    cmd: ['git', '-c', 'core.hooksPath=/dev/null', ...args],
+    cwd,
+    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  expect(await proc.exited).toBe(0)
+}
+
+describe('resolveGitIdentity', () => {
+  test('reads a complete repository-local identity', async () => {
+    const repo = await tempDir('typeclaw-git-identity-')
+    await git(repo, ['init', '-q'])
+    await git(repo, ['config', '--local', 'user.name', 'Agent Smith'])
+    await git(repo, ['config', '--local', 'user.email', 'agent@example.com'])
+
+    await expect(resolveGitIdentity(repo)).resolves.toEqual({ name: 'Agent Smith', email: 'agent@example.com' })
+  })
+
+  test('reads identity through a linked worktree git pointer', async () => {
+    const repo = await tempDir('typeclaw-git-identity-main-')
+    const worktree = await tempDir('typeclaw-git-identity-worktree-')
+    await rm(worktree, { recursive: true })
+    await git(repo, ['init', '-q'])
+    await git(repo, ['config', '--local', 'user.name', 'Worktree Agent'])
+    await git(repo, ['config', '--local', 'user.email', 'worktree@example.com'])
+    await writeFile(join(repo, 'README.md'), 'test\n')
+    await git(repo, ['add', 'README.md'])
+    await git(repo, ['commit', '-qm', 'init'])
+    await git(repo, ['worktree', 'add', '-q', '-b', 'test-worktree', worktree])
+    await git(repo, ['config', 'extensions.worktreeConfig', 'true'])
+    await git(worktree, ['config', '--worktree', 'user.name', 'Worktree Override'])
+
+    await expect(resolveGitIdentity(worktree)).resolves.toEqual({
+      name: 'Worktree Override',
+      email: 'worktree@example.com',
+    })
+  })
+
+  test('reads identity from a relocated .gitstore repository', async () => {
+    const repo = await tempDir('typeclaw-git-identity-store-')
+    await git(repo, ['init', '-q', '--separate-git-dir', join(repo, '.gitstore')])
+    await rm(join(repo, '.git'))
+    await git(repo, [
+      '--git-dir',
+      join(repo, '.gitstore'),
+      '--work-tree',
+      repo,
+      'config',
+      '--local',
+      'user.name',
+      'Store Agent',
+    ])
+    await git(repo, [
+      '--git-dir',
+      join(repo, '.gitstore'),
+      '--work-tree',
+      repo,
+      'config',
+      '--local',
+      'user.email',
+      'store@example.com',
+    ])
+
+    await expect(resolveGitIdentity(repo)).resolves.toEqual({ name: 'Store Agent', email: 'store@example.com' })
+  })
+
+  test('returns null for a partial identity or a non-repository', async () => {
+    const partial = await tempDir('typeclaw-git-identity-partial-')
+    const plain = await tempDir('typeclaw-git-identity-plain-')
+    await git(partial, ['init', '-q'])
+    await git(partial, ['config', '--local', 'user.name', 'Name Only'])
+
+    await expect(resolveGitIdentity(partial)).resolves.toBeNull()
+    await expect(resolveGitIdentity(plain)).resolves.toBeNull()
+  })
+
+  test('ignores ambient Git config injection when resolving repository identity', async () => {
+    const repo = await tempDir('typeclaw-git-identity-injection-')
+    await git(repo, ['init', '-q'])
+    const previous = {
+      count: process.env.GIT_CONFIG_COUNT,
+      key0: process.env.GIT_CONFIG_KEY_0,
+      value0: process.env.GIT_CONFIG_VALUE_0,
+      key1: process.env.GIT_CONFIG_KEY_1,
+      value1: process.env.GIT_CONFIG_VALUE_1,
+    }
+    process.env.GIT_CONFIG_COUNT = '2'
+    process.env.GIT_CONFIG_KEY_0 = 'user.name'
+    process.env.GIT_CONFIG_VALUE_0 = 'Injected Agent'
+    process.env.GIT_CONFIG_KEY_1 = 'user.email'
+    process.env.GIT_CONFIG_VALUE_1 = 'injected@example.com'
+    try {
+      await expect(resolveGitIdentity(repo)).resolves.toBeNull()
+    } finally {
+      for (const [name, value] of [
+        ['GIT_CONFIG_COUNT', previous.count],
+        ['GIT_CONFIG_KEY_0', previous.key0],
+        ['GIT_CONFIG_VALUE_0', previous.value0],
+        ['GIT_CONFIG_KEY_1', previous.key1],
+        ['GIT_CONFIG_VALUE_1', previous.value1],
+      ] as const) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  })
+
+  test('scrubs Git controls case-insensitively for Windows environment semantics', () => {
+    expect(
+      _internal.withoutGitOverrides({
+        git_config_count: '1',
+        Git_Config_Key_0: 'user.name',
+        GIT_CONFIG_VALUE_0: 'Injected Agent',
+        Git_Dir: 'decoy',
+        git_work_tree: 'decoy',
+        PATH: 'safe',
+      }),
+    ).toEqual({ PATH: 'safe' })
+  })
+})
