@@ -16435,3 +16435,224 @@ describe('injectPrVerdictActivity (PR-keyed verdict liveness)', () => {
     expect(sessions.map((s) => s.prompts.length)).toEqual(before)
   })
 })
+
+describe('ChannelRouter background-child await suppression', () => {
+  const CHILD_STARTED_AT = 1000
+  const ACK = '변경사항을 검토 중입니다. 완료되는 대로 정식 리뷰로 남기겠습니다.'
+
+  const runningChild = (sessionId: string): number | null => (sessionId === 'ses_fake_1' ? CHILD_STARTED_AT : null)
+
+  function continueReplyAck(replyText: string): AfterToolCallContext {
+    return {
+      assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
+      toolCall: {
+        type: 'toolCall',
+        id: 'tc-ack',
+        name: 'channel_reply',
+        arguments: { text: replyText },
+      } as AfterToolCallContext['toolCall'],
+      args: { text: replyText },
+      result: {
+        content: [{ type: 'text' as const, text: 'ignored' }],
+        details: { ok: true, more_work_this_turn: true },
+      } as AfterToolCallContext['result'],
+      isError: false,
+      context: { systemPrompt: '', messages: [], tools: [] },
+    }
+  }
+
+  test('a bare-empty stop while a background child runs stays silent instead of retrying', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs, newestRunningChildSubagentStartedAt: runningChild })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // given: the model does tool work (spawning a background child), then ends the turn empty
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the recovery ladder does not manufacture a status message
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toEqual([])
+    expect(logs.some((m) => m.includes('empty_turn_retry'))).toBe(false)
+    expect(logs.some((m) => m.includes('empty_turn_fallback'))).toBe(false)
+    expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(true)
+  })
+
+  test('a more_work_this_turn ack is not re-nudged into a second status post while the child runs', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs, newestRunningChildSubagentStartedAt: runningChild })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // given: the production incident shape — one progress ack, then a fresh empty
+    // stop while the spawned reviewer is still running
+    await router.route(inbound({ text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: ACK })
+      await sessions[0]!.agent.afterToolCall!(continueReplyAck(ACK))
+      emptyStopAfterToolWork(sessions[0]!)
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: exactly one ack reaches the channel — no duplicate
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toEqual([ACK])
+    expect(logs.some((m) => m.includes('send_willingness_nudge'))).toBe(false)
+  })
+
+  test('a child past the stuck backstop stops suppressing and the normal retry resumes', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const nowRef = { value: CHILD_STARTED_AT + SESSION_CHILD_STUCK_BACKSTOP_MS + 1 }
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef,
+      newestRunningChildSubagentStartedAt: runningChild,
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    // given: a wedged child that has outlived the backstop must not mute the channel
+    await router.route(inbound({ isBotMention: true, text: 'check this' }))
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(logs.some((m) => m.includes('empty_turn_retry') && m.includes('cause=empty_stop_after_tool_work'))).toBe(
+      true,
+    )
+    expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(false)
+  })
+
+  test('the deferred answer lands once the child completes and its reminder wakes the session', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    let childRunning = true
+    const { router, sessions } = makeRouter(dir, {
+      newestRunningChildSubagentStartedAt: (sessionId) =>
+        childRunning && sessionId === 'ses_fake_1' ? CHILD_STARTED_AT : null,
+    })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // given: the turn goes silent while the child works
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent).toEqual([])
+
+    // when: the child finishes and the completion reminder wakes the parent
+    childRunning = false
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '리뷰 완료: APPROVE' })
+      sessions[0]!.setAssistantText('')
+    }
+    router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'reviewer',
+      taskId: 'bg_reviewer',
+      ok: true,
+      durationMs: 5_000,
+    })
+
+    // then: silence was delivery deferred, not delivery dropped
+    await waitFor(() => sent.length > 0)
+    expect(sent).toEqual(['리뷰 완료: APPROVE'])
+  })
+
+  test('a leaf carrying real text is still delivered while a background child runs', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs, newestRunningChildSubagentStartedAt: runningChild })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // given: a live child, but the model DID write user-facing prose (not NO_REPLY)
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('먼저 확인한 부분은 이렇습니다.')
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the documented exemption holds — an answer the model already wrote lands
+    expect(sent).toEqual(['먼저 확인한 부분은 이렇습니다.'])
+    expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(false)
+  })
+
+  test("a later unrelated turn keeps ordinary recovery while an EARLIER turn's child runs", async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const nowRef = { value: CHILD_STARTED_AT }
+    // given: the child was spawned by turn N, and is still running
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef,
+      newestRunningChildSubagentStartedAt: runningChild,
+    })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!, 'n')
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent).toEqual([])
+    const promptsAfterTurnN = sessions[0]!.prompts.length
+
+    // when: turn N+1 is unrelated work arriving while that child is STILL running
+    nowRef.value = CHILD_STARTED_AT + 1_000
+    logs.length = 0
+    let attempt = 0
+    sessions[0]!.onPrompt = () => {
+      attempt++
+      if (attempt === 1) emptyStopAfterToolWork(sessions[0]!, 'n1')
+      else sessions[0]!.setAssistantText('네, 그건 이렇게 하면 됩니다.')
+    }
+    await router.route(inbound({ isBotMention: true, text: '다른 질문인데 이거 어떻게 해?' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the later turn is NOT suppressed — it retries and delivers its own answer
+    expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(false)
+    expect(logs.some((m) => m.includes('empty_turn_retry') && m.includes('cause=empty_stop_after_tool_work'))).toBe(
+      true,
+    )
+    expect(sessions[0]!.prompts.length).toBeGreaterThan(promptsAfterTurnN + 1)
+    expect(sent).toEqual(['네, 그건 이렇게 하면 됩니다.'])
+  })
+
+  test('todo continuation does not re-wake a session that is waiting on a background child', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    let continuationRuns = 0
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      newestRunningChildSubagentStartedAt: runningChild,
+      runIdleContinuation: async () => {
+        continuationRuns++
+        return false
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    // given: the pending todo is the very work the child was spawned to do
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(continuationRuns).toBe(0)
+    expect(logs.some((m) => m.includes('skipping todo continuation while background child runs'))).toBe(true)
+  })
+})
