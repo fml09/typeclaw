@@ -1,7 +1,5 @@
-import type { LiveSessionPayload } from '@/shared'
-
 import type { ViewerItem } from './item'
-import { listSessions, type ListSessionsOptions, mergeLiveSessions, type SessionSummary } from './session-list'
+import { listSessions, type ListSessionsOptions, type SessionSummary } from './session-list'
 
 export type ListViewerItemsOptions = ListSessionsOptions & {
   containerRunning: boolean
@@ -16,9 +14,6 @@ export type ListViewerItemsOptions = ListSessionsOptions & {
   // (most-recent) tui transcript — and any older tui transcript the heuristic
   // would otherwise promote — must NOT be offered as a writable live row.
   allowWritable?: boolean
-  // Registry sessions not yet flushed to disk, fetched by the CLI over the
-  // /inspect WS. The lib layer stays I/O-free; the caller owns the connection.
-  liveSessions?: LiveSessionPayload[]
 }
 
 export type ViewerList = {
@@ -34,11 +29,7 @@ export type ViewerList = {
 // `logs` row is appended last (container stdout, available offline) so it sits
 // below the divider in the picker.
 export async function listViewerItems(opts: ListViewerItemsOptions): Promise<ViewerList> {
-  const diskSessions = await listSessions(opts)
-  const sessions =
-    opts.liveSessions !== undefined && opts.liveSessions.length > 0
-      ? mergeLiveSessions(diskSessions, opts.liveSessions)
-      : diskSessions
+  const sessions = await listSessions(opts)
   const allowWritable = opts.interactive && opts.allowWritable !== false
   const writableSessionId = opts.containerRunning && allowWritable ? pickWritableSession(sessions) : null
 
