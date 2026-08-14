@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 
-import { analyzeGitCommand, type GitResolvers, parseGithubRepoFromGitUrl } from './git-command'
+import {
+  analyzeGitCommand,
+  createSessionTmpGitResolvers,
+  type GitResolvers,
+  parseGithubRepoFromGitUrl,
+} from './git-command'
 
 const CWD = '/agent'
 
@@ -840,5 +845,120 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
     // `git fetch origin main #` must not reach an inject decision through the
     // escape-blind tokenizer; the early gate blocks it before minting.
     expect((await analyze('git fetch origin main #', ghRemote)).kind).not.toBe('inject')
+  })
+})
+
+describe('createSessionTmpGitResolvers', () => {
+  const SESSION = 'ses-1'
+  const backingOf = (p: string): string => `/tmp/typeclaw-session/${SESSION}${p.slice('/tmp'.length)}`
+
+  function recordingResolvers(url: string | null = null): { seen: string[]; resolvers: GitResolvers } {
+    const seen: string[] = []
+    return {
+      seen,
+      resolvers: {
+        resolveRemoteUrl: async (cwd) => {
+          seen.push(cwd)
+          return url
+        },
+        resolveConfig: async (cwd) => {
+          seen.push(cwd)
+          return null
+        },
+        resolveCurrentBranch: async (cwd) => {
+          seen.push(cwd)
+          return null
+        },
+      },
+    }
+  }
+
+  test('probes the session backing dir for a model-facing /tmp path', async () => {
+    const base = recordingResolvers()
+    const mapped = createSessionTmpGitResolvers(CWD, SESSION, base.resolvers)
+
+    await mapped.resolveRemoteUrl('/tmp/clone', 'origin', true)
+    await mapped.resolveConfig('/tmp/clone', 'remote.pushDefault')
+    await mapped.resolveCurrentBranch('/tmp/clone')
+
+    expect(base.seen).toEqual([backingOf('/tmp/clone'), backingOf('/tmp/clone'), backingOf('/tmp/clone')])
+  })
+
+  test('leaves agent-dir paths untouched', async () => {
+    const base = recordingResolvers()
+    const mapped = createSessionTmpGitResolvers(CWD, SESSION, base.resolvers)
+
+    await mapped.resolveRemoteUrl('/agent/workspace/repo', 'origin', false)
+
+    expect(base.seen).toEqual(['/agent/workspace/repo'])
+  })
+
+  test('a repo cloned under /tmp resolves to its slug and mints', async () => {
+    // given a repo that exists ONLY at the session backing path
+    const base: GitResolvers = {
+      resolveRemoteUrl: async (cwd) => (cwd === backingOf('/tmp/clone') ? 'https://github.com/acme/widgets.git' : null),
+      resolveConfig: async () => null,
+      resolveCurrentBranch: async () => null,
+    }
+
+    const result = await analyzeGitCommand('git -C /tmp/clone push -u origin topic', {
+      cwd: CWD,
+      resolvers: createSessionTmpGitResolvers(CWD, SESSION, base),
+    })
+
+    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+  })
+
+  test('without the mapping the same command falls through unbrokered', async () => {
+    const base: GitResolvers = {
+      resolveRemoteUrl: async (cwd) => (cwd === backingOf('/tmp/clone') ? 'https://github.com/acme/widgets.git' : null),
+      resolveConfig: async () => null,
+      resolveCurrentBranch: async () => null,
+    }
+
+    const result = await analyzeGitCommand('git -C /tmp/clone push -u origin topic', {
+      cwd: CWD,
+      resolvers: base,
+    })
+
+    expect(result).toEqual({ kind: 'pass-through' })
+  })
+
+  test('a compound touching a /tmp repo still blocks', async () => {
+    // Evidence discovery shares these resolvers, so an unmapped /tmp would find no
+    // repo and downgrade a should-block compound into a silent pass-through.
+    const base: GitResolvers = {
+      resolveRemoteUrl: async (cwd) => (cwd === backingOf('/tmp/clone') ? 'https://github.com/acme/widgets.git' : null),
+      resolveConfig: async () => null,
+      resolveCurrentBranch: async () => null,
+    }
+
+    const result = await analyzeGitCommand('git -C /tmp/clone push origin main && ls', {
+      cwd: CWD,
+      resolvers: createSessionTmpGitResolvers(CWD, SESSION, base),
+    })
+
+    expect(result.kind).toBe('block')
+  })
+
+  test('rewrittenCommand keeps the model-facing /tmp path, not the backing dir', async () => {
+    // The rewritten command runs INSIDE the sandbox, where /tmp is the bind —
+    // emitting the backing path there would point at a directory that does not exist.
+    const base: GitResolvers = {
+      resolveRemoteUrl: async (cwd) => (cwd === backingOf('/tmp/clone') ? 'https://github.com/acme/widgets.git' : null),
+      resolveConfig: async () => null,
+      resolveCurrentBranch: async () => null,
+    }
+
+    const result = await analyzeGitCommand('cd /tmp/clone && git push', {
+      cwd: CWD,
+      resolvers: createSessionTmpGitResolvers(CWD, SESSION, base),
+    })
+
+    expect(result).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      rewrittenCommand: "git -C '/tmp/clone' push",
+    })
   })
 })
