@@ -8,6 +8,7 @@ import {
   type SubagentProgressEvent,
   attachProgressCapture,
   coarsen,
+  newestRunningBackgroundChildStartedAt,
 } from './live-subagents'
 
 function makeLive(overrides: Partial<LiveSubagent> = {}): LiveSubagent {
@@ -330,5 +331,51 @@ describe('attachProgressCapture', () => {
     expect(tools).toHaveLength(1)
     expect((tools[0] as Extract<SubagentProgressEvent, { kind: 'tool' }>).name).toBe('read')
     unsub()
+  })
+})
+
+describe('newestRunningBackgroundChildStartedAt', () => {
+  function child(over: Partial<LiveSubagent>): LiveSubagent {
+    return {
+      taskId: 'bg_t',
+      sessionId: 'ses_child',
+      subagentName: 'reviewer',
+      startedAt: 1_000,
+      status: 'running',
+      background: true,
+      abort: async () => {},
+      ...over,
+    }
+  }
+
+  test('no children means nothing to wait for', () => {
+    expect(newestRunningBackgroundChildStartedAt([])).toBeNull()
+  })
+
+  test('ignores a running FOREGROUND child: it returns inline, so no parent waits on it', () => {
+    expect(newestRunningBackgroundChildStartedAt([child({ background: false })])).toBeNull()
+    expect(newestRunningBackgroundChildStartedAt([child({ background: undefined })])).toBeNull()
+  })
+
+  test('ignores finished children', () => {
+    const finished = [child({ status: 'completed' }), child({ status: 'failed' })]
+    expect(newestRunningBackgroundChildStartedAt(finished)).toBeNull()
+  })
+
+  test('returns the NEWEST running background child so an older sibling cannot unpin the parent', () => {
+    const children = [
+      child({ taskId: 'bg_old', startedAt: 1_000 }),
+      child({ taskId: 'bg_new', startedAt: 9_000 }),
+      child({ taskId: 'bg_mid', startedAt: 5_000 }),
+    ]
+    expect(newestRunningBackgroundChildStartedAt(children)).toBe(9_000)
+  })
+
+  test('a newer foreground child does not mask an older running background child', () => {
+    const children = [
+      child({ taskId: 'bg_bg', startedAt: 1_000 }),
+      child({ taskId: 'bg_fg', startedAt: 9_000, background: false }),
+    ]
+    expect(newestRunningBackgroundChildStartedAt(children)).toBe(1_000)
   })
 })
