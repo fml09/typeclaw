@@ -7370,6 +7370,33 @@ describe('ChannelRouter consecutive-send accounting', () => {
     expect(router.getConsecutiveSendCount({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1' })).toBe(3)
   })
 
+  test('accounts a root delivery against its originating thread session', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const delivered: Array<{ thread?: string | null; text?: string; replyTo?: unknown; typingThread?: string }> = []
+    router.registerOutbound('discord-bot', async (message) => {
+      delivered.push({
+        thread: message.thread,
+        text: message.text,
+        ...(message.replyTo !== undefined ? { replyTo: message.replyTo } : {}),
+        ...(message.typingThread !== undefined ? { typingThread: message.typingThread } : {}),
+      })
+      return { ok: true }
+    })
+    const origin = { adapter: 'discord-bot' as const, workspace: 'g1', chat: 'c1', thread: 'thread-1' }
+    await router.route(inbound({ thread: origin.thread }))
+    await router.__testing!.flushDebounce(origin)
+
+    const result = await router.send(
+      { adapter: origin.adapter, workspace: origin.workspace, chat: origin.chat, thread: null, text: 'root comment' },
+      { accountingTarget: origin },
+    )
+
+    expect(result).toEqual({ ok: true })
+    expect(delivered).toEqual([{ thread: null, text: 'root comment' }])
+    expect(router.getConsecutiveSendCount(origin)).toBe(1)
+  })
+
   test('does not increment on failed delivery', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)

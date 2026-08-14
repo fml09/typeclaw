@@ -14,6 +14,9 @@ type PostGithubReviewDetails = {
   ok: boolean
   error?: string
   code?: string
+  fallback?: 'comment'
+  messageId?: string
+  messageIds?: readonly string[]
   reviewId?: number
   state?: string
   downgraded?: boolean
@@ -63,8 +66,32 @@ export function createPostGithubReviewTool(options: {
           workspace: origin.workspace,
           prNumber,
           verdict,
+          retainDuplicateLease: params.event === 'REQUEST_CHANGES',
         })
-        if (blocked !== null) return denied(logger, blocked.reason)
+        if (blocked !== null) {
+          if (
+            params.event === 'REQUEST_CHANGES' &&
+            blocked.kind === 'duplicate' &&
+            blocked.duplicateSource === 'standing'
+          ) {
+            try {
+              return await postDuplicateRequestChangesComment({
+                router,
+                origin,
+                sessionId,
+                prNumber,
+                body: params.body,
+                comments: (params.comments ?? []).map(toReviewFinding),
+                logger,
+              })
+            } finally {
+              if (blocked.leaseRetained === true) {
+                await verdictGuard.release({ callId: coordinationCallId, succeeded: false })
+              }
+            }
+          }
+          return denied(logger, blocked.reason)
+        }
       }
       const request: SubmitReviewRequest = {
         adapter: 'github',
@@ -111,6 +138,79 @@ export function createPostGithubReviewTool(options: {
       }
     },
   })
+}
+
+async function postDuplicateRequestChangesComment(args: {
+  router: ChannelRouter
+  origin: ChannelReplyOrigin
+  sessionId: string
+  prNumber: number
+  body: string
+  comments: readonly ReviewFinding[]
+  logger: ChannelToolLogger
+}) {
+  const result = await args.router.send(
+    {
+      adapter: 'github',
+      workspace: args.origin.workspace,
+      chat: args.origin.chat,
+      thread: null,
+      text: renderFallbackComment(args.body, args.comments),
+    },
+    { accountingTarget: args.origin },
+  )
+  if (!result.ok) return denied(args.logger, result.error, result.code)
+
+  recordReviewOutput({
+    sessionId: args.sessionId,
+    workspace: args.origin.workspace,
+    prNumber: args.prNumber,
+    state: 'COMMENT',
+  })
+
+  const details: PostGithubReviewDetails = {
+    ok: true,
+    fallback: 'comment',
+    ...(result.messageId !== undefined ? { messageId: result.messageId } : {}),
+    ...(result.messageIds !== undefined ? { messageIds: result.messageIds } : {}),
+  }
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: fenceToolResult(
+          'GitHub PR comment posted because the existing CHANGES_REQUESTED review is still active.',
+        ),
+      },
+    ],
+    details,
+  }
+}
+
+function renderFallbackComment(body: string, comments: readonly ReviewFinding[]): string {
+  if (comments.length === 0) return body
+  return [
+    body,
+    '',
+    '---',
+    '',
+    ...comments.flatMap((comment) => [`**${markdownCodeSpan(renderLocation(comment))}**`, '', comment.body, '']),
+  ]
+    .slice(0, -1)
+    .join('\n')
+}
+
+function renderLocation(comment: ReviewFinding): string {
+  const lines = comment.startLine !== undefined ? `${comment.startLine}-${comment.line}` : String(comment.line)
+  const side = comment.side === 'LEFT' ? ' (old revision)' : ''
+  return `${comment.path.replace(/[\r\n]+/g, ' ')}:${lines}${side}`
+}
+
+function markdownCodeSpan(value: string): string {
+  const longestRun = Math.max(0, ...Array.from(value.matchAll(/`+/g), (match) => match[0].length))
+  const delimiter = '`'.repeat(longestRun + 1)
+  const padded = value.startsWith('`') || value.endsWith('`') ? ` ${value} ` : value
+  return `${delimiter}${padded}${delimiter}`
 }
 
 function parsePrNumber(chat: string): number | null {

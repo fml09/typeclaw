@@ -39,7 +39,7 @@ describe('review verdict idempotency guard', () => {
     // when: a second session attempts any formal verdict for the same PR
     const second = await g.guard({ callId: 'a2', workspace: WS, prNumber: 7, verdict: 'APPROVE' })
     // then: it is blocked while the first is mid-flight
-    expect(second?.block).toBe(true)
+    expect(second).toMatchObject({ block: true, kind: 'concurrent' })
   })
 
   test('separate plugin instances share the in-flight lease (process-wide singleton)', async () => {
@@ -79,7 +79,7 @@ describe('review verdict idempotency guard', () => {
   test('blocks an APPROVE when the bot already effectively approved the PR on GitHub', async () => {
     const g = makeGuard({ [`${WS}#9`]: 'APPROVED' })
     const decision = await g.guard({ callId: 'a1', workspace: WS, prNumber: 9, verdict: 'APPROVE' })
-    expect(decision?.block).toBe(true)
+    expect(decision).toMatchObject({ block: true, kind: 'duplicate', duplicateSource: 'standing' })
   })
 
   test('allows APPROVE when the bot previously requested changes (a real re-review)', async () => {
@@ -91,7 +91,37 @@ describe('review verdict idempotency guard', () => {
   test('blocks a REQUEST_CHANGES when the bot already holds a standing CHANGES_REQUESTED', async () => {
     const g = makeGuard({ [`${WS}#23`]: 'CHANGES_REQUESTED' })
     const decision = await g.guard({ callId: 'a1', workspace: WS, prNumber: 23, verdict: 'REQUEST_CHANGES' })
-    expect(decision?.block).toBe(true)
+    expect(decision).toMatchObject({ block: true, kind: 'duplicate', duplicateSource: 'standing' })
+  })
+
+  test('can retain a duplicate REQUEST_CHANGES lease through a caller-managed fallback', async () => {
+    const g = makeGuard({ [`${WS}#54`]: 'CHANGES_REQUESTED' })
+    const decision = await g.guard({
+      callId: 'a1',
+      workspace: WS,
+      prNumber: 54,
+      verdict: 'REQUEST_CHANGES',
+      retainDuplicateLease: true,
+    })
+    expect(decision).toMatchObject({
+      block: true,
+      kind: 'duplicate',
+      duplicateSource: 'standing',
+      leaseRetained: true,
+    })
+
+    const concurrent = await g.guard({
+      callId: 'a2',
+      workspace: WS,
+      prNumber: 54,
+      verdict: 'REQUEST_CHANGES',
+      retainDuplicateLease: true,
+    })
+    expect(concurrent).toMatchObject({ block: true, kind: 'concurrent' })
+
+    await g.release({ callId: 'a1', succeeded: false })
+    const next = await g.guard({ callId: 'a3', workspace: WS, prNumber: 54, verdict: 'REQUEST_CHANGES' })
+    expect(next).toMatchObject({ block: true, kind: 'duplicate' })
   })
 
   test('allows REQUEST_CHANGES when the bot previously approved (a real demotion)', async () => {

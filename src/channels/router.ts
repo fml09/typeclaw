@@ -1286,6 +1286,10 @@ export type SendSource = 'tool' | 'system'
 
 export type SendOptions = {
   source?: SendSource
+  // Apply tool-send accounting to the originating conversation while delivering
+  // elsewhere. The outbound target remains unchanged; only per-turn cap/dedup,
+  // output bookkeeping, and continuation state use this key.
+  accountingTarget?: ChannelKey
   // Classifies what the human saw, independently of which router path sent it.
   // Tool calls omit this: substantive text is the default, while the shared
   // multilingual willingness detector recognizes status updates. System paths
@@ -4601,14 +4605,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (!flood.ok) return { ok: false, error: OUTBOUND_FLOOD_ERROR, code: 'outbound-flood' }
     }
 
-    const keyId = channelKeyId({
+    const accountingTarget = opts?.accountingTarget ?? {
       adapter: msg.adapter,
       workspace: msg.workspace,
       chat: msg.chat,
       thread: msg.thread ?? null,
-    })
+    }
+    const deliveryMatchesAccounting =
+      accountingTarget.adapter === msg.adapter &&
+      accountingTarget.workspace === msg.workspace &&
+      accountingTarget.chat === msg.chat &&
+      accountingTarget.thread === (msg.thread ?? null)
+    const keyId = channelKeyId(accountingTarget)
     const live = liveSessions.get(keyId)
-    const sendKey = consecutiveSendKey(msg.chat, msg.thread)
+    const sendKey = consecutiveSendKey(accountingTarget.chat, accountingTarget.thread)
     // Tool-source sends consume the captured quote candidate exactly
     // once per turn — the intervening-observed check runs HERE against
     // the live buffer so the relevant signal is actual channel chatter
@@ -4618,7 +4628,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // before the model's own first reply lands. Even when the decision
     // returns null (nothing intervened), the candidate is cleared — a
     // multi-part reply must not retroactively anchor chunk 2.
-    if (live && source === 'tool' && live.pendingQuoteCandidate !== null) {
+    if (live && deliveryMatchesAccounting && source === 'tool' && live.pendingQuoteCandidate !== null) {
       const quoteCandidate = refreshQuoteCandidate(live.pendingQuoteCandidate, live.contextBuffer)
       const anchor = decideQuoteAnchor(quoteCandidate, now(), options.configForAdapter(msg.adapter))
       if (anchor !== null) {
@@ -4713,7 +4723,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // The adapter needs the typing anchor to clear a flat-DM status (msg.thread
     // is null there, so a thread-keyed clear would no-op). Kept off msg.thread
     // to leave reply threading untouched.
-    if (live?.currentTurnTypingThread != null && msg.typingThread === undefined) {
+    if (live?.currentTurnTypingThread != null && deliveryMatchesAccounting && msg.typingThread === undefined) {
       msg = { ...msg, typingThread: live.currentTurnTypingThread }
     }
 

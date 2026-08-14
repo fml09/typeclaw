@@ -23,7 +23,13 @@ export type EffectiveApprovalResolver = (target: {
 // push-during-review still blocks a same-verdict duplicate for the lag window.
 export type HeadShaResolver = (target: { workspace: string; prNumber: number }) => Promise<string | null>
 
-export type ApproveBlock = { block: true; reason: string }
+export type ApproveBlock = {
+  block: true
+  kind: 'concurrent' | 'duplicate'
+  reason: string
+  duplicateSource?: 'standing' | 'recent'
+  leaseRetained?: boolean
+}
 
 export type ReviewVerdictGuard = {
   guard: (args: {
@@ -31,6 +37,7 @@ export type ReviewVerdictGuard = {
     workspace: string
     prNumber: number
     verdict: ReviewVerdict
+    retainDuplicateLease?: boolean
   }) => Promise<ApproveBlock | null>
   release: (args: { callId: string; succeeded: boolean }) => Promise<void>
   // Arms the read-after-write lag shield for a verdict that landed WITHOUT a prior
@@ -203,7 +210,7 @@ export function createApproveIdempotencyGuard(deps: {
       // reclaimable so a crash cannot permanently strand the PR.
       const held = inFlightByPr.get(key)
       if (held !== undefined && now() - held.createdAt < LEASE_TTL_MS) {
-        return { block: true, reason: CONCURRENT_REASON }
+        return { block: true, kind: 'concurrent', reason: CONCURRENT_REASON }
       }
       const reservation: Reservation = {
         key,
@@ -232,8 +239,14 @@ export function createApproveIdempotencyGuard(deps: {
         // now: a blocked command never reaches tool.after, so release() won't run
         // for this callId. Leaving the lease set would resurrect the strand bug —
         // the GitHub read is authoritative for the standing case.
-        releaseReservation(args.callId, reservation)
-        return { block: true, reason: duplicateReason(args.verdict) }
+        if (args.retainDuplicateLease !== true) releaseReservation(args.callId, reservation)
+        return {
+          block: true,
+          kind: 'duplicate',
+          reason: duplicateReason(args.verdict),
+          duplicateSource: 'standing',
+          ...(args.retainDuplicateLease === true ? { leaseRetained: true } : {}),
+        }
       }
 
       // Layer 3 — duplicate-review cooldown. A recently-landed SAME verdict on the
@@ -254,7 +267,12 @@ export function createApproveIdempotencyGuard(deps: {
         recentlyLandedSame(key, args.verdict, headSha, now)
       ) {
         releaseReservation(args.callId, reservation)
-        return { block: true, reason: duplicateReason(args.verdict) }
+        return {
+          block: true,
+          kind: 'duplicate',
+          reason: duplicateReason(args.verdict),
+          duplicateSource: 'recent',
+        }
       }
 
       return null
