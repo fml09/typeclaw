@@ -1,6 +1,8 @@
 // Plain-`git` analog of analyzeGhCommand. Git names its target indirectly, so
 // this analyzer resolves configured remotes before selecting a per-repo token.
 
+import { mapVirtualTmpPath } from '@/sandbox'
+
 export type GitCommandDecision =
   | { kind: 'pass-through' }
   | { kind: 'block'; reason: string }
@@ -39,6 +41,27 @@ export const defaultGitResolvers: GitResolvers = {
     runGit(cwd, forPush ? ['remote', 'get-url', '--push', remote] : ['remote', 'get-url', remote]),
   resolveConfig: (cwd, key) => runGit(cwd, ['config', '--get', key]),
   resolveCurrentBranch: (cwd) => runGit(cwd, ['symbolic-ref', '--short', 'HEAD']),
+}
+
+// Sandboxed bash sees the per-session scratch dir bound over `/tmp`
+// (applyBashSandbox), but these resolvers spawn `git` from the runtime process
+// against the REAL container `/tmp` — so a repo the model cloned to `/tmp/foo`
+// resolves to nothing here and the command falls through UNBROKERED, leaving git
+// to die on a credential prompt it can never answer. Same class of bug the file
+// tools solve with TMP_REDIRECT_TOOLS. Only the filesystem probe is redirected:
+// the analyzer must keep reasoning in model-facing paths so `rewrittenCommand`
+// stays valid inside the sandbox.
+export function createSessionTmpGitResolvers(
+  agentDir: string,
+  sessionId: string,
+  base: GitResolvers = defaultGitResolvers,
+): GitResolvers {
+  const backing = (cwd: string): string => mapVirtualTmpPath(agentDir, sessionId, cwd) ?? cwd
+  return {
+    resolveRemoteUrl: (cwd, remote, forPush) => base.resolveRemoteUrl(backing(cwd), remote, forPush),
+    resolveConfig: (cwd, key) => base.resolveConfig(backing(cwd), key),
+    resolveCurrentBranch: (cwd) => base.resolveCurrentBranch(backing(cwd)),
+  }
 }
 
 const MULTI_OWNER_REASON =
