@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1490,5 +1491,77 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
     // then: the legitimate concurrent-duplicate guard still fires (only a BLOCKED
     // first submission releases early)
     expect(second).toMatchObject({ block: true })
+  })
+})
+
+describe('github-cli-auth plugin — git in the sandbox /tmp bind', () => {
+  // SESSION_TMP_ROOT is a real shared path, so a fixed id lets concurrent test
+  // processes delete each other's repo mid-run.
+  const sessionId = `ses-git-tmp-bind-${process.pid}-${randomUUID()}`
+  const sessionTmp = join('/tmp/typeclaw-session', sessionId)
+  const repoDir = join(sessionTmp, 'clone')
+  let askpassDir: string
+  let askpassPath: string
+
+  beforeEach(() => {
+    askpassDir = mkdtempSync(join(tmpdir(), 'tc-askpass-'))
+    askpassPath = join(askpassDir, 'typeclaw-git-askpass')
+    process.env.TYPECLAW_GIT_ASKPASS_PATH = askpassPath
+    resetGitAskPassHelperForTests()
+
+    rmSync(sessionTmp, { recursive: true, force: true })
+    mkdirSync(repoDir, { recursive: true })
+    spawnSync('git', ['init', '-q'], { cwd: repoDir })
+    spawnSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/widgets.git'], { cwd: repoDir })
+  })
+
+  afterEach(() => {
+    delete process.env.TYPECLAW_GIT_ASKPASS_PATH
+    resetGitAskPassHelperForTests()
+    rmSync(askpassDir, { recursive: true, force: true })
+    rmSync(sessionTmp, { recursive: true, force: true })
+  })
+
+  // The model clones to /tmp/clone; bwrap binds the session dir over /tmp, so the
+  // repo really lives at <SESSION_TMP_ROOT>/<sid>/clone. The broker resolves repos
+  // from the runtime process, which sees the real /tmp — it must follow the bind or
+  // the push falls through unbrokered and git dies on an unanswerable prompt.
+  test('mints for a repo the model cloned under /tmp', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const seen: string[] = []
+    const hook = await hookFor(async (slug) => {
+      seen.push(slug)
+      return { kind: 'token', token: 'ghs_minted' }
+    })
+    const event: ToolBeforeEvent = {
+      tool: 'bash',
+      sessionId,
+      callId: 'c',
+      args: { command: 'git -C /tmp/clone push -u origin topic' },
+    }
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(seen).toEqual(['acme/widgets'])
+    const env = (event.args[TYPECLAW_INTERNAL_BASH_ENV] ?? {}) as Record<string, string>
+    expect(env.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
+    expect(env.GIT_ASKPASS).toBe(askpassPath)
+  })
+
+  test('a /tmp path with no repo behind it still passes through', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const hook = await hookFor(tokenResolver('ghs_minted'))
+    const event: ToolBeforeEvent = {
+      tool: 'bash',
+      sessionId,
+      callId: 'c',
+      args: { command: 'git -C /tmp/absent push -u origin topic' },
+    }
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 })

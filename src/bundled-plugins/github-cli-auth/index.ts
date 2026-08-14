@@ -16,7 +16,12 @@ import {
   usesGhApiGraphqlEndpoint,
 } from './gh-command'
 import { ensureGitAskPassHelper, resolveSandboxGitAskPassPath } from './git-askpass'
-import { analyzeGitCommand, defaultGitResolvers, resolveGhDefaultRepoFromCwd } from './git-command'
+import {
+  analyzeGitCommand,
+  createSessionTmpGitResolvers,
+  defaultGitResolvers,
+  resolveGhDefaultRepoFromCwd,
+} from './git-command'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
 import { classifyGhToken, shouldMintAppToken } from './token-class'
@@ -351,9 +356,13 @@ export default definePlugin({
       event: { args: Record<string, unknown> }
       command: string
       agentDir: string
+      sessionId: string
     }): Promise<HookResult> => {
-      const { event, command, agentDir } = params
-      const decision = await analyzeGitCommand(command, { cwd: agentDir, resolvers: defaultGitResolvers })
+      const { event, command, agentDir, sessionId } = params
+      const decision = await analyzeGitCommand(command, {
+        cwd: agentDir,
+        resolvers: createSessionTmpGitResolvers(agentDir, sessionId),
+      })
       if (decision.kind === 'pass-through') return
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
 
@@ -410,7 +419,7 @@ export default definePlugin({
           }
 
           if (command.includes('git')) {
-            return await handleGitCommand({ event, command, agentDir: ctx.agentDir })
+            return await handleGitCommand({ event, command, agentDir: ctx.agentDir, sessionId: event.sessionId })
           }
           return
         },
