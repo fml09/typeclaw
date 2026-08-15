@@ -38,6 +38,20 @@ export type LiveSubagent = {
 export const MAX_EVENTS_PER_SUBAGENT = 100
 export const MESSAGE_PREVIEW_CHARS = 200
 
+// Newest — not oldest — so a long-running child that crossed a caller's backstop
+// cannot unpin a parent while a more recently spawned sibling is still inside its
+// window. Foreground children are excluded on purpose: they return inline, so a
+// parent is never left waiting on one.
+export function newestRunningBackgroundChildStartedAt(children: readonly LiveSubagent[]): number | null {
+  return children.reduce<number | null>(
+    (newest, child) =>
+      child.status === 'running' && child.background === true && (newest === null || child.startedAt > newest)
+        ? child.startedAt
+        : newest,
+    null,
+  )
+}
+
 type AgentSessionEvent =
   | { type: 'message_update'; assistantMessageEvent: { type: string; delta?: string } }
   | { type: 'message_end'; message: unknown }

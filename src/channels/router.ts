@@ -214,7 +214,12 @@ export function disengageReactionEmojiFor(adapter: AdapterId): string {
   return DISENGAGE_REACTION_EMOJI_OVERRIDES[adapter] ?? DISENGAGE_REACTION_EMOJI
 }
 
-type SilentAckReason = 'skip_response' | 'no_reply' | 'skip_response_text_leak' | 'github_review_output'
+type SilentAckReason =
+  | 'skip_response'
+  | 'no_reply'
+  | 'skip_response_text_leak'
+  | 'github_review_output'
+  | 'awaiting_background_child'
 
 // Wake nudge pushed into a resumed channel session at boot so drain() has a
 // non-empty batch and fires a turn. The substantive instruction the model acts
@@ -1004,6 +1009,13 @@ type LiveSession = {
   // counter is purely monotonic; the matching comparison is what protects
   // against stale state.
   turnSeq: number
+  // Clock time the current LOGICAL turn opened — stamped only on a real user
+  // batch, so the reminder-only iterations a retry queues stay inside the same
+  // logical turn. Unlike `turnSeq` (which increments per drain iteration) this
+  // gives background-child checks a boundary they can compare a child's
+  // `startedAt` against, to tell "this turn spawned it" from "it was already
+  // running when unrelated work arrived".
+  logicalTurnStartedAt: number
   // Snapshot of `successfulChannelSends` taken at turn start (same
   // moment `turnSeq` increments). Lets `markTurnSkipped` detect "a
   // channel send already landed in this turn" and reject the skip,
@@ -2050,6 +2062,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return false
   }
 
+  // Same question as the GC/rollover pin, asked for a different decision: while a
+  // background child is still working (and inside the stuck backstop), an empty
+  // completion from the parent is the subagent contract being honored, not the
+  // provider degeneration the turn-recovery ladder exists to repair.
+  //
+  // Turn-scoped, unlike the GC pin, which is deliberately session-scoped. Only
+  // the logical turn that spawned the child is waiting on it; a later inbound is
+  // unrelated work whose own recovery, todo continuation and staged fallback must
+  // still run. Session scope would let one long-running child silence every
+  // subsequent turn, and a wedged child would strand them with nothing to revisit
+  // them after the backstop expires.
+  const isAwaitingBackgroundChild = (live: LiveSession, label: string): boolean => {
+    const childStartedAt = newestRunningChildSubagentStartedAt(live.sessionId)
+    if (childStartedAt === null || childStartedAt < live.logicalTurnStartedAt) return false
+    return isPinnedByRunningChild(live.sessionId, live.keyId, label)
+  }
+
   const shouldRolloverLive = (live: LiveSession, idleMs: number): boolean => {
     // A session mid-prompt looks idle by lastInboundAt (only bumped on engaged
     // inbounds) while session.prompt() is still in flight; rolling it over aborts
@@ -2337,6 +2366,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         sendTimestamps: new Map(),
         successfulChannelSends: 0,
         turnSeq: 0,
+        logicalTurnStartedAt: now(),
         successfulSendsAtTurnStart: 0,
         inFlightToolSends: new Map(),
         policyDeniedToolSendsThisTurn: new Map(),
@@ -3258,6 +3288,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.toolLeakRetries = 0
           live.emptyStopAfterToolWorkArmed = false
           live.willingnessNudges = 0
+          live.logicalTurnStartedAt = now()
           // A fresh batch supersedes a still-pending staged fallback. That staged
           // turn produced no usable reply, so it must not leave the PRIOR turn's
           // committed lastQuestionSignal behind — otherwise the new question would
@@ -3487,10 +3518,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           logger.warn(`[channels] ${live.keyId}: skipping todo continuation after failed outcome write`)
         } else if (live.userStoppedTurnSeq === live.turnSeq) {
           logger.info(`[channels] ${live.keyId}: skipping todo continuation after user stop`)
+        } else if (isAwaitingBackgroundChild(live, 'todo-continuation')) {
+          // The outstanding todo is usually the very work the running child was
+          // spawned to do, so continuing here re-wakes a session that is
+          // deliberately waiting and asks the model to report progress it does
+          // not have yet. The child's completion reminder is the correct wake.
+          logger.info(`[channels] ${live.keyId}: skipping todo continuation while background child runs`)
         } else {
           await maybeContinueTodosChannel(live)
         }
-        await resolveStagedFallback(live)
+        if (!isAwaitingBackgroundChild(live, 'staged-fallback')) {
+          await resolveStagedFallback(live)
+        }
         live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
         if (live.currentTurnAuthorId !== null) {
           live.lastTurnAuthorId = live.currentTurnAuthorId
@@ -4915,6 +4954,32 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     ) {
       logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=github_review_output_this_turn`)
       armSilentTurnAck(live, 'github_review_output')
+      return
+    }
+
+    // A background child spawned by this session is still running, and the turn
+    // produced no user-facing output. That is `spawn_subagent`'s contract being
+    // honored ("you will receive a system-reminder when it completes"), not the
+    // empty-completion degeneration every branch below exists to repair — so the
+    // recovery ladder must not manufacture the status prose the model
+    // deliberately withheld. Each nudge re-enters with the child STILL running,
+    // so the budgets stack (MAX_EMPTY_TURN_RETRIES + MAX_WILLINGNESS_NUDGES) into
+    // several "still working…" messages for one request; on GitHub, where a
+    // channel reply IS a public PR comment, that shipped as duplicate review
+    // acknowledgements. The completion reminder re-wakes this session with the
+    // real result, so silence here is delivery deferred, not delivery dropped.
+    // Bounded by the same stuck-child backstop as GC/rollover: a wedged child
+    // stops pinning and the normal ladder resumes. A leaf carrying real text is
+    // deliberately NOT covered — recovering an answer the model already wrote is
+    // still correct while a child runs.
+    const awaitLeaf = recoverableAssistantText(live.session)
+    if (
+      live.currentTurnAuthorId !== null &&
+      (awaitLeaf === null || endsWithNoReplySignal(awaitLeaf.text)) &&
+      isAwaitingBackgroundChild(live, 'empty_turn_recovery')
+    ) {
+      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=awaiting_background_child`)
+      armSilentTurnAck(live, 'awaiting_background_child')
       return
     }
 

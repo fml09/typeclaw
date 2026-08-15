@@ -5,7 +5,7 @@ import { SessionManager } from '@mariozechner/pi-coding-agent'
 import { createSession, createSessionWithDispose } from '@/agent'
 import { createProviderAuthReloadable } from '@/agent/auth-reloadable'
 import { LiveSessionRegistry } from '@/agent/live-sessions'
-import { LiveSubagentRegistry } from '@/agent/live-subagents'
+import { LiveSubagentRegistry, newestRunningBackgroundChildStartedAt } from '@/agent/live-subagents'
 import { requestContainerRestart } from '@/agent/restart'
 import { consumeRestartHandoff } from '@/agent/restart-handoff'
 import { sessionMetaPayload } from '@/agent/session-meta'
@@ -475,13 +475,7 @@ async function startAgentRuntime(
     githubTokenBridge,
     stream,
     newestRunningChildSubagentStartedAt: (sessionId) =>
-      liveSubagentRegistry
-        .list({ parentSessionId: sessionId })
-        .reduce<number | null>(
-          (newest, child) =>
-            child.status === 'running' && (newest === null || child.startedAt > newest) ? child.startedAt : newest,
-          null,
-        ),
+      newestRunningBackgroundChildStartedAt(liveSubagentRegistry.list({ parentSessionId: sessionId })),
     listRunningBackgroundSubagentNames: (sessionId) =>
       liveSubagentRegistry
         .list({ parentSessionId: sessionId })
