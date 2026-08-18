@@ -210,13 +210,14 @@ describe('checkOutboundSecretGuard', () => {
     ).toBeUndefined()
   })
 
-  test('allows acknowledged outbound with secret', () => {
+  test('does not let a model-authored acknowledgement bypass an outbound secret', () => {
     const result = checkOutboundSecretGuard({
       tool: 'channel_send',
       args: { text: `rotated key was ${ghpFixture}`, acknowledgeGuards: { outboundSecret: true } },
       env: {},
     })
-    expect(result).toBeUndefined()
+    expect(result?.block).toBe(true)
+    expect(result?.reason).not.toContain('acknowledgeGuards')
   })
 
   test('does not apply to non-channel tools', () => {
@@ -266,7 +267,7 @@ TYPECLAW_HOSTD_BROKER_TOKEN=X TYPECLAW_CONTAINER_NAME=X`
     expect(result).toBeUndefined()
   })
 
-  test('allows acknowledged env-key recon', () => {
+  test('does not let a model-authored acknowledgement bypass env-key recon', () => {
     const result = checkOutboundSecretGuard({
       tool: 'channel_send',
       args: {
@@ -275,7 +276,8 @@ TYPECLAW_HOSTD_BROKER_TOKEN=X TYPECLAW_CONTAINER_NAME=X`
       },
       env: {},
     })
-    expect(result).toBeUndefined()
+    expect(result?.block).toBe(true)
+    expect(result?.reason).not.toContain('acknowledgeGuards')
   })
 
   test('exposes guard name constant', () => {

@@ -125,16 +125,16 @@ describe('checkSessionSearchSecretsGuard', () => {
     expect(checkSessionSearchSecretsGuard({ tool: 'grep', args: { query: 'password' } })).toBeUndefined()
   })
 
-  test('allows acknowledged secret query', () => {
-    expect(
-      checkSessionSearchSecretsGuard({
-        tool: 'session_search',
-        args: {
-          query: 'password OR token',
-          acknowledgeGuards: { sessionSearchSecrets: true },
-        },
-      }),
-    ).toBeUndefined()
+  test('does not let a model-authored acknowledgement bypass secret recon', () => {
+    const result = checkSessionSearchSecretsGuard({
+      tool: 'session_search',
+      args: {
+        query: 'password OR token',
+        acknowledgeGuards: { sessionSearchSecrets: true },
+      },
+    })
+    expect(result?.block).toBe(true)
+    expect(result?.reason).not.toContain('acknowledgeGuards')
   })
 
   test('handles missing query gracefully', () => {

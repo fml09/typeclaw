@@ -1,5 +1,5 @@
 import type { SecuritySeverity } from '../permissions'
-import { ACKNOWLEDGE_GUARDS, type SecurityBlock, isGuardAcknowledged } from '../policy'
+import type { SecurityBlock } from '../policy'
 
 export const GUARD_SYSTEM_PROMPT_LEAK = 'systemPromptLeak'
 // Classified `high` (audience-leak axis): bypass posts TypeClaw runtime
@@ -65,8 +65,6 @@ export function checkSystemPromptLeakGuard(options: {
 }): SecurityBlock | undefined {
   const { tool, args } = options
   if (tool !== 'channel_send' && tool !== 'channel_reply') return undefined
-  if (isGuardAcknowledged(args, GUARD_SYSTEM_PROMPT_LEAK)) return undefined
-
   const candidates: string[] = []
   for (const key of ['text', 'message', 'content', 'body']) {
     const v = args[key]
@@ -81,7 +79,7 @@ export function checkSystemPromptLeakGuard(options: {
       reason: [
         `Guard \`${GUARD_SYSTEM_PROMPT_LEAK}\` blocked ${tool}: outbound text contains TypeClaw system-prompt fingerprints (${summary}).`,
         'Posting the system prompt or identity files to a channel exposes the agent to prompt-injection replay attacks.',
-        `If this is genuinely intentional (e.g. you are debugging your own agent), retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_SYSTEM_PROMPT_LEAK}: true\` in the tool arguments.`,
+        'Intentional disclosure requires an operator-configured security bypass permission.',
       ].join(' '),
     }
   }
