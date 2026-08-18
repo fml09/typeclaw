@@ -294,6 +294,10 @@ export function buildEntrypointShim(): string {
 # Source: src/init/dockerfile.ts \`buildEntrypointShim()\`.
 set -eu
 
+# Host-generated images run TypeClaw from the Agent Folder. Managed images set
+# TYPECLAW_CLI_ENTRY to their immutable /node_modules copy instead.
+typeclaw_cli_entry="\${TYPECLAW_CLI_ENTRY:-${TYPECLAW_CLI_ENTRY}}"
+
 # start_xvfb launches Xvfb in the background under a stripped capability
 # bounding set so headed Chrome (agent-browser --headed, Playwright
 # headful) has a real X11 display to connect to. Headless containers
@@ -440,7 +444,9 @@ link_configured_symlinks() {
 # root-owned roots (e.g. /etc) can still be created. No-op when the value is
 # unset/blank or already resolves to the runtime HOME's .claude (avoids a
 # self-referential link). Re-linking is idempotent (an existing symlink is
-# replaced); failures are non-fatal so a bad custom path never blocks boot.
+# replaced). Host-mode bootstrap preserves the historical non-fatal behavior;
+# the already-non-root managed branch fails closed because continuing would put
+# a refresh token at a model-readable path.
 #
 # The from-path MUST match where the exporter actually writes. The exporter
 # (src/secrets/export-claude-credentials-file.ts resolveClaudeConfigDir) applies
@@ -448,13 +454,15 @@ link_configured_symlinks() {
 # in POSIX sed would diverge on Unicode whitespace (\u00A0, \u2003, …) that
 # .trim() strips but a byte-oriented sed class does not — a divergence is a
 # credential-isolation bypass (exporter writes the trimmed path, alias sits at
-# the padded path, token stays model-readable). So do the normalization in the
-# same \`bun -e\` runtime the exporter uses, guaranteeing byte-for-byte identical
-# trimming, and create the symlink there too.
+# the padded path, token stays model-readable). Bun also automatically loads the
+# working directory's .env. Do not pre-set CLAUDE_CONFIG_DIR to an empty shell
+# value here: that would suppress Bun's .env value for this helper while the
+# final TypeClaw process sees it. Running the helper under the same Bun semantics
+# guarantees byte-for-byte normalization and the same effective config path.
 link_custom_claude_credentials() {
-  CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-}" _CLAUDE_RUNTIME_HOME="$runtime_home" \\
+  _CLAUDE_RUNTIME_HOME="$runtime_home" \\
     _CLAUDE_CRED_FILE="${CLAUDE_CREDENTIALS_FILE_NAME}" _CLAUDE_CRED_REL="${CLAUDE_CREDENTIALS_RELATIVE_PATH}" bun -e '
-    import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+    import { lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
     import { dirname, join } from "node:path";
     const raw = process.env.CLAUDE_CONFIG_DIR;
     const trimmed = raw?.trim();
@@ -466,6 +474,10 @@ link_custom_claude_credentials() {
     try {
       mkdirSync(trimmed, { recursive: true });
       mkdirSync(dirname(to), { recursive: true });
+      try {
+        const existing = lstatSync(from);
+        if (existing.isSymbolicLink() && readlinkSync(from) === to) process.exit(0);
+      } catch { /* nothing to inspect */ }
       // Unconditionally (re)point the alias, matching the old ln -sfn: a
       // pre-existing real file at the custom path would otherwise keep the token
       // model-readable, which is exactly the exposure this aliasing closes.
@@ -473,8 +485,9 @@ link_custom_claude_credentials() {
       symlinkSync(to, from);
     } catch (e) {
       console.error("typeclaw-entrypoint: failed to alias custom Claude credentials:", String(e));
+      process.exitCode = 1;
     }
-  ' || true
+  '
 }
 
 # seed_runtime_home copies the image-baked Claude Code / Codex CLI settings from
@@ -567,15 +580,23 @@ start_xvfb() {
 }
 
 if [ "\${TYPECLAW_ENTRYPOINT_RUNTIME:-0}" = "1" ]; then
+  runtime_home="\${TYPECLAW_RUNTIME_HOME:-\${HOME:-/home/agent}}"
+  mkdir -p "$runtime_home"
+  if [ "\${TYPECLAW_DEPLOYMENT_PROFILE:-host}" = "managed" ]; then
+    link_custom_claude_credentials
+  else
+    link_custom_claude_credentials || true
+  fi
+  export HOME="$runtime_home"
   link_configured_symlinks
   start_xvfb
-  exec ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
+  exec ${RUNTIME_BUN} "$typeclaw_cli_entry" "$@"
 fi
 
 runtime_home="\${TYPECLAW_RUNTIME_HOME:-/home/agent}"
 mkdir -p "$runtime_home"
 seed_runtime_home "$HOME" "$runtime_home"
-link_custom_claude_credentials
+link_custom_claude_credentials || true
 if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
   chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$runtime_home"
 fi
@@ -603,7 +624,7 @@ if [ "\${TYPECLAW_NETWORK_BLOCK_INTERNAL:-0}" != "1" ]; then
   fi
   link_configured_symlinks
   start_xvfb
-  exec env HOME="$runtime_home" ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
+  exec env HOME="$runtime_home" ${RUNTIME_BUN} "$typeclaw_cli_entry" "$@"
 fi
 
 iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -657,7 +678,7 @@ if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
 fi
 link_configured_symlinks
 start_xvfb
-exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- ${RUNTIME_BUN} ${TYPECLAW_CLI_ENTRY} "$@"
+exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- ${RUNTIME_BUN} "$typeclaw_cli_entry" "$@"
 `
 }
 
@@ -1592,9 +1613,11 @@ const APT_CACHE_MOUNT =
   '--mount=type=cache,target=/var/cache/apt,sharing=locked \\\n' +
   '    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \\\n    '
 const BUN_CACHE_MOUNT = '--mount=type=cache,target=/root/.bun/install/cache,sharing=locked \\\n    '
+const BUN_GLOBAL_CACHE_MOUNT = '--mount=type=cache,target=/usr/local/install/cache,sharing=locked \\\n    '
 
 const aptCacheMount = (buildKit: boolean): string => (buildKit ? APT_CACHE_MOUNT : '')
 const bunCacheMount = (buildKit: boolean): string => (buildKit ? BUN_CACHE_MOUNT : '')
+const bunGlobalCacheMount = (buildKit: boolean): string => (buildKit ? BUN_GLOBAL_CACHE_MOUNT : '')
 
 const FROM_AND_WORKDIR = `FROM oven/bun:1-slim
 
@@ -1636,13 +1659,17 @@ const LAYER_3_AGENT_BROWSER_ARM64_CONFIG = `# Layer 3 (stable, arm64 only): poin
 # agent-browser version bumps.
 RUN if [ "$TARGETARCH" = "arm64" ]; then \\
       mkdir -p /root/.agent-browser \\
-   && printf '%s\\n' '{"executablePath":"/usr/bin/chromium"}' > /root/.agent-browser/config.json; \\
+   && printf '%s\\n' '{"executablePath":"/usr/bin/chromium"}' > /root/.agent-browser/config.json \\
+   && ln -sfn /usr/bin/chromium /usr/local/bin/typeclaw-chromium; \\
     fi`
 
 const renderAgentBrowserInstallLayer = (buildKit: boolean): string =>
   `# Layer 4 (volatile): install agent-browser globally so it survives the
 # runtime bind-mount over /agent/node_modules.
-RUN ${bunCacheMount(buildKit)}bun install -g agent-browser@^0.33.0`
+RUN ${bunGlobalCacheMount(buildKit)}BUN_INSTALL=/usr/local bun install -g agent-browser@^0.33.0 \\
+ && chmod 0755 \\
+      /usr/local/install/global/node_modules/agent-browser/bin/agent-browser.js \\
+      /usr/local/install/global/node_modules/agent-browser/bin/agent-browser-linux-*`
 
 // Layer 4.5: shim the agent-browser binary with a wrapper that calls
 // \`agent-browser close\` before \`open\`/\`goto\`/\`navigate\` when headed
@@ -1714,6 +1741,12 @@ done
 if [ -z "\${AGENT_BROWSER_USER_AGENT:-}" ] && [ "$has_user_agent" = "0" ]; then
   export AGENT_BROWSER_USER_AGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 fi
+# Managed and ordinary non-root runtimes cannot rely on the build-time /root
+# HOME. The image creates this stable /usr symlink for both architectures;
+# an explicit operator setting still wins.
+if [ -z "\${AGENT_BROWSER_EXECUTABLE_PATH:-}" ] && [ -x /usr/local/bin/typeclaw-chromium ]; then
+  export AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/typeclaw-chromium
+fi
 # Pre-close is only needed when the caller is requesting headed mode.
 # Match upstream's env_var_is_truthy contract (cli/src/flags.rs:183):
 # truthy = any non-empty value except case-insensitive "0", "false", "no".
@@ -1779,7 +1812,13 @@ TYPECLAW_AGENT_BROWSER_WRAPPER_EOF`
 const renderChromeForTestingLayer = (): string =>
   `# Layer 5 (heavy, amd64 only): Chrome for Testing download.
 RUN if [ "$TARGETARCH" != "arm64" ]; then \\
-      agent-browser install; \\
+      agent-browser install \\
+   && browser="$(find /root/.agent-browser/browsers -mindepth 2 -maxdepth 3 -type f -name chrome -print -quit)" \\
+   && test -n "$browser" \\
+   && relative="\${browser#/root/.agent-browser/browsers/}" \\
+   && mkdir -p /usr/local/lib/typeclaw \\
+   && mv /root/.agent-browser/browsers /usr/local/lib/typeclaw/agent-browser-browsers \\
+   && ln -sfn "/usr/local/lib/typeclaw/agent-browser-browsers/$relative" /usr/local/bin/typeclaw-chromium; \\
     fi`
 
 function defaultConfig(): DockerfileConfig {

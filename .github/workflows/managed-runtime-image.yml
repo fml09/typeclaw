@@ -1,0 +1,133 @@
+name: Managed runtime image (PR validation)
+
+on:
+  pull_request:
+    paths:
+      - 'package.json'
+      - 'src/**'
+      - 'bun.lock'
+      - 'scripts/emit-managed-runtime-dockerfile.ts'
+      - 'scripts/emit-base-dockerfile.ts'
+      - 'scripts/prepare-managed-runtime-models.ts'
+      - 'scripts/probe-managed-entrypoint-security.ts'
+      - 'scripts/smoke-managed-runtime-image.sh'
+      - '.github/workflows/managed-runtime-image.yml'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: managed-runtime-image-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Build managed runtime / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Prepare exact image inputs
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-input
+          version="$(bun -e "import pkg from './package.json'; console.log(pkg.version)")"
+          base_image_repository="typeclaw-base-pr-${{ matrix.arch }}"
+
+          typeclaw_tarball="$(npm pack --ignore-scripts --pack-destination runtime-input --json | jq -r '.[0].filename')"
+          mv "runtime-input/${typeclaw_tarball}" runtime-input/typeclaw.tgz
+
+          gws_version="$(bun -e "import { GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION } from './src/config'; console.log(GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION)")"
+          test -n "$gws_version"
+          gws_tarball="$(npm pack --ignore-scripts --pack-destination runtime-input --json "typeclaw-gws-multi-account@${gws_version}" | jq -r '.[0].filename')"
+          mv "runtime-input/${gws_tarball}" runtime-input/typeclaw-gws-multi-account.tgz
+
+          test "$(tar -xOf runtime-input/typeclaw.tgz package/package.json | jq -r '.name')" = "typeclaw"
+          test "$(tar -xOf runtime-input/typeclaw.tgz package/package.json | jq -r '.version')" = "$version"
+          test "$(tar -xOf runtime-input/typeclaw-gws-multi-account.tgz package/package.json | jq -r '.name')" = "typeclaw-gws-multi-account"
+          test "$(tar -xOf runtime-input/typeclaw-gws-multi-account.tgz package/package.json | jq -r '.version')" = "$gws_version"
+
+          bun run scripts/emit-managed-runtime-dockerfile.ts "$version" "$base_image_repository" > runtime-input/runtime.Dockerfile
+          cp package.json bun.lock runtime-input/
+          bun run scripts/emit-base-dockerfile.ts > base.Dockerfile
+          printf '%s\n' "$version" > runtime-input/version.txt
+          printf '%s\n' "$gws_version" > runtime-input/gws-version.txt
+          printf '%s:%s\n' "$base_image_repository" "$version" > runtime-input/base-image-ref.txt
+          (cd runtime-input && sha256sum typeclaw.tgz typeclaw-gws-multi-account.tgz package.json bun.lock > SHA256SUMS)
+
+      - name: Show and verify generated inputs
+        run: |
+          cd runtime-input
+          sha256sum --check SHA256SUMS
+          cat runtime.Dockerfile
+          cat ../base.Dockerfile
+
+      # The managed Dockerfile FROMs the matching versioned base image. Build
+      # the base from this checkout into the runner's Docker image store first,
+      # then build the runtime with the same daemon-backed builder. A remote
+      # released base would not contain entrypoint changes from this PR, while
+      # the default docker-container Buildx driver cannot resolve an image that
+      # a prior `load: true` exported only to the daemon.
+      - name: Build matching native base image
+        run: |
+          set -euo pipefail
+          BASE_IMAGE="$(cat runtime-input/base-image-ref.txt)"
+          docker build \
+            --platform "${{ matrix.platform }}" \
+            --file base.Dockerfile \
+            --tag "$BASE_IMAGE" \
+            .
+
+      - name: Build native image
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform "${{ matrix.platform }}" \
+            --file runtime-input/runtime.Dockerfile \
+            --tag "typeclaw-runtime:pr-${{ matrix.arch }}" \
+            runtime-input
+
+      - name: Smoke immutable image contract
+        env:
+          IMAGE: typeclaw-runtime:pr-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}')" = '["/usr/bin/tini","--","/usr/local/bin/typeclaw-entrypoint"]'
+          test "$(docker image inspect "$IMAGE" --format '{{json .Config.Cmd}}')" = '["run"]'
+          docker run --rm --entrypoint sh \
+            -e EXPECTED_VERSION="$(cat runtime-input/version.txt)" \
+            -e EXPECTED_GWS_VERSION="$(cat runtime-input/gws-version.txt)" \
+            "$IMAGE" -ec '
+              test "$(bun -e "import pkg from \"/node_modules/typeclaw/package.json\"; console.log(pkg.version)")" = "$EXPECTED_VERSION"
+              test "$(bun -e "import pkg from \"/node_modules/typeclaw-gws-multi-account/package.json\"; console.log(pkg.version)")" = "$EXPECTED_GWS_VERSION"
+              test -f /opt/typeclaw/models/.typeclaw-model.json
+            '
+          docker run --rm --entrypoint bun "$IMAGE" \
+            /node_modules/typeclaw/src/cli/index.ts --version
+          bash scripts/smoke-managed-runtime-image.sh "$IMAGE"

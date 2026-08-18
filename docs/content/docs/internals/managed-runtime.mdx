@@ -1,0 +1,185 @@
+---
+title: Managed runtime
+description: Immutable workload image, writable state, restart spool, health probes, and Kubernetes security contract
+icon: Container
+---
+
+The managed runtime is the platform-neutral workload half of TypeClaw. Releases publish `ghcr.io/typeclaw/typeclaw-runtime:<version>` alongside the matching `typeclaw-base` image and npm package. An external scheduler such as Kubernetes owns Pod replacement, networking, storage attachment, and rollout; the TypeClaw process stays a foreground `typeclaw run` process and never receives cluster API credentials.
+
+This is deliberately narrower than a Kubernetes operator API. The image and the contracts below are upstream TypeClaw behavior. A controller, sidecar, CSI driver, or init container implements the platform half.
+
+## Image and version contract
+
+The runtime image is paired with the TypeClaw release version. Its build consumes the exact npm tarball for the not-yet-published TypeClaw release, a source-controlled exact `typeclaw-gws-multi-account` version, and the release checkout's `package.json`/`bun.lock` production graph. It then layers those inputs over `typeclaw-base:<version>`. The release workflow builds native `linux/amd64` and `linux/arm64` images by digest and writes the version tag only after both manifests exist.
+
+The image contains:
+
+- TypeClaw and all production dependencies under `/node_modules`, outside the `/agent` state mount.
+- The default GWS multi-account plugin. When TypeClaw injects this default, it resolves from the immutable `/node_modules` graph even if a migrated Agent Folder contains stale `node_modules`. An explicit `typeclaw.json#plugins` entry remains Agent Folder-owned and may intentionally override it. Other arbitrary plugin packages are not installed dynamically by this image; a platform that allows them must hydrate them before boot or build a derived image.
+- The q8 embedding model and compatibility sentinel under `/opt/typeclaw/models`, so runtime embedding never needs a model download.
+- The default host-image command surface (`gh`, Python, `tmux`, and Xvfb) plus `tini` as PID 1.
+- A fixed non-root identity, UID/GID `65532`, and `CMD ["run"]`.
+
+`TYPECLAW_CLI_ENTRY=/node_modules/typeclaw/src/cli/index.ts` is what makes the same entrypoint shim independent of `/agent/node_modules`. Host-generated images leave that variable unset and retain their existing `/agent/node_modules/typeclaw/...` path.
+
+## Writable filesystem contract
+
+A read-only root filesystem is supported when the platform supplies these writable paths:
+
+| Path                      | Required lifetime                                | Purpose                                                                                         |
+| ------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `/agent`                  | Durable, single-writer                           | The complete Agent Folder: config, Git history, sessions, memory, workspace, and `secrets.json` |
+| `/home/typeclaw`          | Writable; durable for full credential continuity | Runtime home, local CLI credentials, and `~/.typeclaw/keys` used by encrypted channel state     |
+| `/tmp`                    | Pod lifetime                                     | Xvfb status/socket files and ordinary temporary files                                           |
+| `/dev/shm`                | Pod lifetime, memory-backed                      | Browser shared memory; size it for the browser workload                                         |
+| Managed control directory | Pod lifetime, shared with one relay              | Atomic restart request files; selected by `TYPECLAW_MANAGED_CONTROL_DIR`                        |
+
+`/home/typeclaw` may be an `emptyDir` only when losing local exported credentials and encryption keys on Pod replacement is acceptable. A full-fidelity deployment keeps it durable and outside `/agent`; moving `TYPECLAW_HOME` into the Agent Folder collapses the credential-separation boundary described in [Secrets](/docs/internals/secrets).
+
+Only one TypeClaw process may own an Agent Folder at a time. File locks and atomic renames prevent torn individual writes; they do not make sessions, Git state, SQLite memory, or credentials a multi-replica data model.
+
+## Writable secrets contract
+
+With `TYPECLAW_DEPLOYMENT_PROFILE=managed`, `createRuntimeCapabilities()` selects the existing file-backed secrets provider for `<agentDir>/secrets.json`. Reads, provider OAuth refresh, MCP OAuth, and channel credential write-back therefore share one locked, atomic file.
+
+A projected Kubernetes Secret mounted directly at `/agent/secrets.json` is not compatible: projected volumes are read-only, while refresh and channel flows legitimately rewrite the envelope. The platform must instead materialize an initial envelope onto the writable Agent Folder volume before TypeClaw starts, then hand it to UID/GID `65532:65532` with mode `0600`. The Agent Folder and every parent the runtime must traverse also need runtime-readable ownership and permissions. After handoff, the runtime owns that file. A reconciler must not continuously overwrite it with the original Secret and erase newer refresh tokens.
+
+The platform also owns any export policy from the writable file back to a cluster secret store. TypeClaw does not call the Kubernetes API and does not define conflict resolution between two external writers.
+
+## Restart request contract
+
+Managed self-restart is a file spool, not a Kubernetes API call. Set both:
+
+```text
+TYPECLAW_RUNTIME_ID=<stable platform identity>
+TYPECLAW_MANAGED_CONTROL_DIR=<shared writable directory>
+```
+
+On an accepted `restart` request, TypeClaw writes a mode-`0600` temporary file in the control directory and atomically renames it to `restart-<requestId>.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "restart",
+  "requestId": "018f47c2-8b1a-7000-8000-000000000001",
+  "runtimeId": "agent-a",
+  "requestedAt": "2026-08-18T12:34:56.000Z"
+}
+```
+
+Success means the local request is atomically published and visible to the relay. It does not mean the Kubernetes API accepted a deletion or rollout. TypeClaw therefore stays alive after publication. The sidecar or node-local relay must consume the file, request replacement through its platform credentials, and initiate SIGTERM only after that actuation is accepted. The runtime's SIGTERM handler then lowers readiness, writes continuation handoff state, and performs graceful teardown. This ownership prevents a `restartPolicy: Always` container restart in the old Pod from racing a later Pod deletion and consuming the handoff twice.
+
+The control directory is a strict platform prerequisite: it must be owned by the runtime UID and have mode `0700`; every request file is mode `0600`. Kubernetes `fsGroup` alone does not establish that contract for a normal `emptyDir` root, so an init container or CSI driver must `chown`/`chmod` it before runtime start. A same-Pod relay should run as UID `65532`; an operator outside the Pod cannot watch an arbitrary volume by itself.
+
+Relay processing is at-least-once across crashes. It must deduplicate the stable `requestId`, archive or remove a consumed file only after platform acceptance, and coalesce additional requests for the same `runtimeId` while a replacement is already pending. A retry or second user action can legitimately publish a new request ID; it must not cause two Pod replacements for the same pending transition.
+
+`build: true` is rejected in managed mode. Rebuilding and changing an immutable image reference is a platform rollout, not a capability of a running workload. Successful requests still use the common TypeClaw broadcast-then-handoff path, so TUI and channel session continuation behaves the same as hostd mode.
+
+## Health contract
+
+The runtime server exposes two unauthenticated JSON endpoints on the normal TypeClaw port. They intentionally bypass the TUI token so Kubernetes HTTP probes do not need a runtime credential.
+
+| Endpoint            | Status                                                                | Meaning                                                                                                                  |
+| ------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `GET /health/live`  | `200` while the HTTP server can answer                                | The process and event loop are alive. The body reports `starting`, `ready`, `degraded`, `replacing`, or `stopping`.      |
+| `GET /health/ready` | `503` during `starting`, `replacing`, and `stopping`; otherwise `200` | The server, channels, scheduler, plugins, and tunnel startup sequence has crossed the ready boundary and remains usable. |
+
+Degradation is sticky for the process lifetime and appears in `degradedComponents`. A degraded runtime remains ready: known component failures are isolated, and turning them into a Pod restart loop would defeat that isolation. An unknown fatal error instead moves to `replacing` and lowers readiness immediately, before the restart transport acknowledges, because the relay may be delayed or unavailable. Liveness remains green while the process can serve the endpoint. SIGTERM then moves to `stopping` before asynchronous handoff and teardown begin.
+
+The legacy `GET /` response remains `200 typeclaw agent`; it is not the readiness contract.
+
+## Kubernetes security mode
+
+The image supports non-root execution, a read-only root filesystem, no privilege escalation, and a fully dropped Linux capability set. A representative Pod/container split is:
+
+```yaml
+spec:
+  # fsGroup may help with other mounts, but it does not replace the explicit
+  # owner/mode initialization required by the managed control directory.
+  securityContext:
+    fsGroup: 65532
+  initContainers:
+    - name: prepare-runtime-volumes
+      image: ghcr.io/typeclaw/typeclaw-runtime:<version>
+      command: ['sh', '-ec']
+      args:
+        - |
+          # A restored PVC may contain root-owned nested state. Handoff applies
+          # to the complete durable trees, not only their mount roots.
+          chown -R 65532:65532 /init/agent /init/home /init/control
+          chmod 0700 /init/agent /init/home /init/control
+          if [ -e /init/agent/secrets.json ]; then
+            chown 65532:65532 /init/agent/secrets.json
+            chmod 0600 /init/agent/secrets.json
+          fi
+          chown 65532:65532 /init/tmp /init/shm
+          chmod 1777 /init/tmp /init/shm
+      securityContext:
+        runAsUser: 0
+        runAsNonRoot: false
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ['ALL']
+          # DAC_OVERRIDE permits traversal of restored trees whose prior owner
+          # left restrictive modes; FOWNER permits normalization after chown.
+          add: ['CHOWN', 'DAC_OVERRIDE', 'FOWNER']
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - { name: agent, mountPath: /init/agent }
+        - { name: runtime-home, mountPath: /init/home }
+        - { name: managed-control, mountPath: /init/control }
+        - { name: runtime-tmp, mountPath: /init/tmp }
+        - { name: browser-shm, mountPath: /init/shm }
+  containers:
+    - name: runtime
+      env:
+        - { name: TYPECLAW_RUNTIME_ID, value: '<stable-runtime-id>' }
+        - { name: TYPECLAW_MANAGED_CONTROL_DIR, value: /run/typeclaw-managed }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ['ALL']
+        seccompProfile:
+          type: Unconfined
+      volumeMounts:
+        - { name: agent, mountPath: /agent }
+        - { name: runtime-home, mountPath: /home/typeclaw }
+        - { name: managed-control, mountPath: /run/typeclaw-managed }
+        - { name: runtime-tmp, mountPath: /tmp }
+        - { name: browser-shm, mountPath: /dev/shm }
+  volumes:
+    - name: agent
+      persistentVolumeClaim: { claimName: '<agent-pvc>' }
+    - name: runtime-home
+      persistentVolumeClaim: { claimName: '<runtime-home-pvc>' }
+    - name: managed-control
+      emptyDir: {}
+    - name: runtime-tmp
+      emptyDir: { medium: Memory, sizeLimit: 256Mi }
+    - name: browser-shm
+      emptyDir: { medium: Memory, sizeLimit: 512Mi }
+```
+
+The `Unconfined` seccomp requirement is explicit, not a recommendation to weaken the rest of the Pod. TypeClaw's model-driven tools use bubblewrap user/mount namespaces. The default container-runtime seccomp profile blocks the required namespace creation even with an unprivileged UID; `allowPrivilegeEscalation: false` and `drop: ["ALL"]` do not. A node-local `Localhost` profile that admits the exact bubblewrap syscall set can replace `Unconfined` once a platform maintains and tests one.
+
+Consequences:
+
+- This mode does **not** satisfy Kubernetes Pod Security Standards Baseline or Restricted, both of which disallow an unconfined seccomp profile.
+- Do not grant `SYS_ADMIN`. Keep `sandbox.realProc: false`; that optional host-mode feature is incompatible with the managed security contract.
+- The image sets `TYPECLAW_NETWORK_BLOCK_INTERNAL=0` because it has no `NET_ADMIN`. A Kubernetes `NetworkPolicy` or equivalent platform policy owns Pod-level egress filtering. Application-level `web_fetch` and `look_at` SSRF checks remain active independently.
+- The runtime service and health endpoints are only as private as the platform network policy makes them. TypeClaw does not install an in-container firewall in managed mode.
+
+## Platform responsibilities
+
+The upstream boundary is easiest to audit as a short ownership list:
+
+- TypeClaw owns the immutable workload image, foreground process, Agent Folder format, writable secrets implementation, restart envelope, handoff ordering, and probe semantics.
+- The platform owns volume provisioning and initial materialization, the restart relay and its RBAC, Service/Ingress resources, NetworkPolicy, rollout, Pod disruption, backup of every durable mount, and any custom seccomp profile.
+- The current managed `Controller` remains fail-loud for host CLI lifecycle verbs. Running the image under a scheduler does not make `typeclaw start`, `stop`, `logs`, or `shell` into Kubernetes clients.
+
+Host mode is unchanged: no managed environment variables means the host deployment profile, hostd-backed write-back/restart, and the existing per-Agent Docker image path remain in effect.

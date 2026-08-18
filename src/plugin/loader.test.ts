@@ -135,6 +135,45 @@ export default definePlugin({
 })
 
 describe('loadPluginEntry — npm', () => {
+  test('prefers an immutable package root for a selected managed default', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-loader-npm-'))
+    try {
+      const agentPkgDir = join(dir, 'agent', 'node_modules', 'typeclaw-plugin-standup-log')
+      const imagePkgDir = join(dir, 'image', 'node_modules', 'typeclaw-plugin-standup-log')
+      await Promise.all([mkdir(agentPkgDir, { recursive: true }), mkdir(imagePkgDir, { recursive: true })])
+      for (const [pkgDir, version] of [
+        [agentPkgDir, '0.1.0'],
+        [imagePkgDir, '0.2.0'],
+      ] as const) {
+        await writeFile(
+          join(pkgDir, 'package.json'),
+          JSON.stringify({
+            name: 'typeclaw-plugin-standup-log',
+            version,
+            type: 'module',
+            main: 'index.js',
+          }),
+        )
+        await writeFile(
+          join(pkgDir, 'index.js'),
+          `import { definePlugin } from '${pluginIndexSpecifier}'
+export default definePlugin({
+  plugin: async () => ({}),
+})`,
+        )
+      }
+
+      const resolved = await loadPluginEntry('typeclaw-plugin-standup-log@^0.2.0', join(dir, 'agent'), {
+        preferredPackageSearchDir: join(dir, 'image'),
+        preferredPackages: new Set(['typeclaw-plugin-standup-log']),
+      })
+
+      expect(resolved.version).toBe('0.2.0')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('reads package.json for name + version when located in node_modules', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'typeclaw-loader-npm-'))
     try {

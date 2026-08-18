@@ -30,6 +30,8 @@ import {
   validateDockerfileAppendLine,
   validateMount,
   withDefaultPlugins,
+  GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION,
+  GWS_MULTI_ACCOUNT_PLUGIN_VERSION,
   type Models,
 } from './config'
 import { isModelRef, KNOWN_PROVIDERS, type ModelRef } from './providers'
@@ -2235,6 +2237,11 @@ describe('loadConfigSyncOrDefaults', () => {
 })
 
 describe('plugin config layout', () => {
+  test('derives the host default range from the exact managed-image pin', () => {
+    expect(GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION).toBe('0.3.4')
+    expect(GWS_MULTI_ACCOUNT_PLUGIN_VERSION).toBe(`^${GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION}`)
+  })
+
   test('plugins defaults to [] when omitted', () => {
     const parsed = configSchema.parse({ models: { default: VALID_MODEL } })
     expect(parsed.plugins).toEqual([])

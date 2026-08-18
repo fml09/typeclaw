@@ -9,6 +9,7 @@ import {
 } from '@/agent'
 import { applyTurnThinkingLevel } from '@/agent/attention-escalation'
 import { promptWithSameRefRetryOnly } from '@/agent/retry-same-ref'
+import type { RuntimeRestarter } from '@/capabilities'
 import type { ChannelRouter } from '@/channels/router'
 import type { McpManager } from '@/mcp'
 import type { PermissionService } from '@/permissions'
@@ -41,6 +42,7 @@ export type CommandRunnerOptions = {
   agentDir: string
   runtimeVersion: string | undefined
   containerName: string | undefined
+  restarter?: RuntimeRestarter
   outbound: CommandOutbound
   // Hands a persisted SessionManager to every prompt session spawned from a
   // plugin command's `ctx.prompt`. Required so the session writes its JSONL
@@ -194,6 +196,7 @@ export function createCommandRunner(opts: CommandRunnerOptions): CommandRunner {
               agentDir: opts.agentDir,
               runtimeVersion: opts.runtimeVersion,
               containerName: opts.containerName,
+              ...(opts.restarter !== undefined ? { restarter: opts.restarter } : {}),
               permissions: opts.permissions,
               signal: abortController.signal,
               sessionFactory: opts.sessionFactory,
@@ -417,6 +420,7 @@ export async function runPromptForCommand(args: {
   agentDir: string
   runtimeVersion: string | undefined
   containerName: string | undefined
+  restarter?: RuntimeRestarter
   permissions: PermissionService
   signal: AbortSignal
   // Persisted-session source. Each call gets a fresh SessionManager so the
@@ -457,6 +461,7 @@ export async function runPromptForCommand(args: {
     ...(args.mcpManager !== undefined ? { mcpManager: args.mcpManager } : {}),
     ...(args.runtimeVersion !== undefined ? { runtimeVersion: args.runtimeVersion } : {}),
     ...(args.containerName !== undefined ? { containerName: args.containerName } : {}),
+    ...(args.restarter !== undefined ? { restarter: args.restarter } : {}),
   })
   const detachAbort = bindSignalToSession(args.signal, session)
   // Mirror the other turn drivers (TUI/channel/cron/subagent): fire

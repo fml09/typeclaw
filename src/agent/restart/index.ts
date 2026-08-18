@@ -1,7 +1,7 @@
 import { basename } from 'node:path'
 
 import { acquireRestartHandoffLock, type RestartHandoffOrigin, writeRestartHandoff } from '@/agent/restart-handoff'
-import { sendHttp } from '@/hostd/client'
+import { createHostdRuntimeRestarter, type RuntimeRestarter } from '@/capabilities'
 import type { Stream } from '@/stream'
 
 const ACK_TIMEOUT_MS = 5_000
@@ -18,6 +18,9 @@ export type RequestContainerRestartOptions = {
   hostdUrl?: string
   hostdToken?: string
   ackTimeoutMs?: number
+  // Bound runtime replacement capability. Managed platforms inject this; when
+  // omitted, the legacy hostd env/options below remain the compatibility path.
+  restarter?: RuntimeRestarter | null
   // When present together with originatingSessionId, the post-ACK
   // container-restarting broadcast is published here so every live session's
   // subscribeRestartNotice fans out the restart notice (originator gets
@@ -50,6 +53,7 @@ export async function requestContainerRestart({
   hostdUrl,
   hostdToken,
   ackTimeoutMs,
+  restarter,
   stream,
   agentDir,
   originatingSessionId,
@@ -58,7 +62,6 @@ export async function requestContainerRestart({
   triggeringAuthorId,
   restartedAt,
 }: RequestContainerRestartOptions): Promise<RequestContainerRestartResult> {
-  const request = { kind: 'restart' as const, containerName, build: build === true }
   const httpUrl = hostdUrl ?? process.env.TYPECLAW_HOSTD_URL
   const httpToken = hostdToken ?? process.env.TYPECLAW_HOSTD_TOKEN
   const ackBudget = ackTimeoutMs ?? ACK_TIMEOUT_MS
@@ -69,7 +72,18 @@ export async function requestContainerRestart({
   // `/run/typeclaw-host/hostd.sock` dial always silently failed — and on native
   // Windows the host transport is a named pipe, not a socket. Fail loud here
   // when the control env is absent (hostd unregistered/disabled).
-  if (!httpUrl || !httpToken) {
+  const runtimeRestarter =
+    restarter !== undefined
+      ? restarter
+      : httpUrl && httpToken
+        ? createHostdRuntimeRestarter({
+            hostdUrl: httpUrl,
+            restartToken: httpToken,
+            containerName,
+            ackTimeoutMs: ackBudget,
+          })
+        : null
+  if (runtimeRestarter === null) {
     return {
       ok: false,
       containerName,
@@ -77,9 +91,7 @@ export async function requestContainerRestart({
         'host daemon control endpoint unavailable (TYPECLAW_HOSTD_URL/TYPECLAW_HOSTD_TOKEN not set); cannot request restart',
     }
   }
-  const url = httpUrl
-  const token = httpToken
-
+  const boundRestarter = runtimeRestarter
   const handoffTarget =
     agentDir !== undefined &&
     originatingSessionId !== undefined &&
@@ -102,7 +114,7 @@ export async function requestContainerRestart({
   }
 
   async function performRestart(): Promise<RequestContainerRestartResult> {
-    const reply = await sendHttp(request, { timeoutMs: ackBudget, url, token })
+    const reply = await boundRestarter.requestRestart({ build: build === true })
 
     if (!reply.ok) return { ok: false, containerName, reason: reply.reason }
 

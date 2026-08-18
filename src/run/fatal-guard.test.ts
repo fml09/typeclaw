@@ -79,7 +79,9 @@ describe('installFatalGuard', () => {
 
   test('an uncaughtException requests a restart', async () => {
     const reasons: string[] = []
+    let replacementPending = 0
     const { guard } = install({
+      onReplacementPending: () => replacementPending++,
       requestRestart: async (reason) => {
         reasons.push(reason)
         return { ok: true }
@@ -90,6 +92,26 @@ describe('installFatalGuard', () => {
     await Promise.resolve()
 
     expect(reasons).toEqual(['uncaught exception'])
+    expect(replacementPending).toBe(1)
+  })
+
+  test('marks replacement pending before waiting for managed control acknowledgement', async () => {
+    const events: string[] = []
+    let acknowledge: ((result: { ok: boolean }) => void) | undefined
+    const { guard } = install({
+      onReplacementPending: () => events.push('not-ready'),
+      requestRestart: () =>
+        new Promise((resolve) => {
+          events.push('request-started')
+          acknowledge = resolve
+        }),
+    })
+
+    guard.handle('uncaughtException', new Error('corrupt'))
+    expect(events).toEqual(['not-ready', 'request-started'])
+
+    acknowledge?.({ ok: true })
+    await Promise.resolve()
   })
 
   test('restart requests are rate-limited within the min interval', () => {
@@ -114,9 +136,27 @@ describe('installFatalGuard', () => {
     expect(restartCalls).toBe(2)
   })
 
-  test('missing requestRestart continues degraded instead of throwing', () => {
-    const { guard } = install({})
+  test('missing requestRestart marks the whole runtime degraded instead of throwing', () => {
+    const degraded: Array<{ scope: string; reason: string }> = []
+    const { guard } = install({ onDegrade: (scope, reason) => degraded.push({ scope, reason }) })
     expect(() => guard.handle('uncaughtException', new Error('no host daemon'))).not.toThrow()
+    expect(degraded).toEqual([{ scope: 'runtime', reason: 'uncaught exception; replacement control is unavailable' }])
+  })
+
+  test('a rejected restart marks the whole runtime degraded', async () => {
+    const degraded: Array<{ scope: string; reason: string }> = []
+    const { guard } = install({
+      onDegrade: (scope, reason) => degraded.push({ scope, reason }),
+      requestRestart: async () => ({ ok: false, reason: 'relay unavailable' }),
+    })
+
+    guard.handle('uncaughtException', new Error('corrupt'))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(degraded).toEqual([
+      { scope: 'runtime', reason: 'uncaught exception; replacement unavailable: relay unavailable' },
+    ])
   })
 
   test('a throwing onDegrade is contained', () => {
@@ -130,8 +170,10 @@ describe('installFatalGuard', () => {
     ).not.toThrow()
   })
 
-  test('a rejecting requestRestart does not surface an unhandled rejection', async () => {
+  test('a rejecting requestRestart is contained and marks runtime degraded', async () => {
+    const degraded: Array<{ scope: string; reason: string }> = []
     const { guard } = install({
+      onDegrade: (scope, reason) => degraded.push({ scope, reason }),
       requestRestart: async () => {
         throw new Error('hostd unreachable')
       },
@@ -139,6 +181,9 @@ describe('installFatalGuard', () => {
     guard.handle('uncaughtException', new Error('boom'))
     await Promise.resolve()
     await Promise.resolve()
+    expect(degraded).toEqual([
+      { scope: 'runtime', reason: 'uncaught exception; replacement request threw: Error: hostd unreachable' },
+    ])
   })
 
   test('installed handlers fire on real process events and never exit', () => {

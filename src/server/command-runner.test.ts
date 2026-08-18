@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import { z } from 'zod'
 
+import type { RuntimeRestarter } from '@/capabilities'
 import { noopPermissionService } from '@/permissions'
 import { createHookBus } from '@/plugin'
 import type { PluginCommand, PluginRegistry } from '@/plugin'
@@ -744,6 +745,41 @@ describe('CommandRunner — review follow-ups', () => {
 })
 
 describe('runPromptForCommand', () => {
+  test('forwards the bound runtime restarter to the prompt session', async () => {
+    const { sessionFactory, agentDir } = makeSessionFactoryForTest()
+    const runtime = makeRuntime([])
+    const restarter: RuntimeRestarter = { requestRestart: async () => ({ ok: true }) }
+    let captured: { restarter?: RuntimeRestarter } | undefined
+    const fakeCreate = async (options: unknown): Promise<{ session: object; dispose: () => Promise<void> }> => {
+      captured = options as typeof captured
+      return {
+        session: {
+          prompt: async () => {},
+          getLastAssistantText: () => 'ok',
+          dispose: () => {},
+          abort: async () => {},
+        } as object,
+        dispose: async () => {},
+      }
+    }
+
+    await runPromptForCommand({
+      text: 'restart if needed',
+      origin: { kind: 'cron', jobId: 'test', jobKind: 'handler', scheduledByOrigin: { kind: 'config-file' } },
+      runtime,
+      agentDir,
+      permissions: noopPermissionService,
+      signal: new AbortController().signal,
+      runtimeVersion: '0.0.0-test',
+      containerName: 'managed-agent',
+      restarter,
+      sessionFactory,
+      _createSession: fakeCreate as Parameters<typeof runPromptForCommand>[0]['_createSession'],
+    })
+
+    expect(captured?.restarter).toBe(restarter)
+  })
+
   // Regression guard: ctx.prompt sessions used to fall through to
   // SessionManager.inMemory() (no sessionManager passed to
   // createSessionWithDispose), which silently dropped every plugin

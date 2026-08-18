@@ -189,6 +189,56 @@ describe('createTunnelManager (external provider)', () => {
 })
 
 describe('createTunnelManager (cloudflare-quick provider)', () => {
+  test.skipIf(onWindows)('reports a permanently failed configured tunnel as degraded', async () => {
+    const degraded: Array<{ component: string; reason: string }> = []
+    const manager = createTunnelManager({
+      tunnels: [cloudflareQuickConfig({ for: { kind: 'manual' }, upstreamPort: 8973 })],
+      stream: createStream(),
+      logger: silentLogger,
+      cloudflareQuickBinary: '/definitely/missing/typeclaw-cloudflared',
+      onDegrade: (component, reason) => degraded.push({ component, reason }),
+    })
+
+    await manager.start()
+
+    expect(manager.snapshot()[0]?.status).toBe('permanently-failed')
+    expect(degraded).toEqual([{ component: 'tunnel:github-webhook', reason: expect.stringContaining('cloudflared') }])
+  })
+
+  // Spawns cloudflared; absent on the Windows runner. #899
+  test.skipIf(onWindows)('reports an asynchronous provider failure as degraded', async () => {
+    const scratchDir = createScratchDir()
+    const binary = installFakeCloudflared(
+      scratchDir,
+      `
+sleep 0.05
+exit 7
+`,
+    )
+    const degraded: Array<{ component: string; reason: string }> = []
+    const manager = createTunnelManager({
+      tunnels: [cloudflareQuickConfig({ for: { kind: 'manual' }, upstreamPort: 8973 })],
+      stream: createStream(),
+      logger: silentLogger,
+      cloudflareQuickBinary: binary,
+      onDegrade: (component, reason) => degraded.push({ component, reason }),
+    })
+
+    try {
+      await manager.start()
+      expect(degraded).toEqual([])
+
+      await waitFor(() => degraded.length === 1, { description: 'asynchronous tunnel degradation' })
+
+      expect(degraded).toEqual([
+        { component: 'tunnel:github-webhook', reason: expect.stringContaining('cloudflared exited 7') },
+      ])
+    } finally {
+      await manager.stop()
+      rmSync(scratchDir, { recursive: true, force: true })
+    }
+  })
+
   // Spawns cloudflared; absent on the Windows runner. #899
   test.skipIf(onWindows)('resolves channel-owned upstream ports before constructing the provider', async () => {
     const scratchDir = createScratchDir()

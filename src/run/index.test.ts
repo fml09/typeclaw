@@ -10,11 +10,19 @@ import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { CronFile, CronJob, LoadCronResult, Scheduler } from '@/cron'
 import { SecretsBackend } from '@/secrets'
 import type { SessionFactory } from '@/sessions'
+import { createStream } from '@/stream'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 import type { TuiOptions } from '@/tui'
 import type { TunnelManager, TunnelManagerOptions } from '@/tunnels'
 
-import { type LoadCronFn, type SchedulerFactory, startAgent, type TuiFactory } from './index'
+import {
+  type LoadCronFn,
+  prepareRuntimeShutdownHandoff,
+  type SchedulerFactory,
+  startAgent,
+  startScheduler,
+  type TuiFactory,
+} from './index'
 
 const noCron: LoadCronFn = async () => ({ ok: true, file: null }) as LoadCronResult
 
@@ -69,6 +77,79 @@ describe('startAgent', () => {
     const res = await fetch(`http://localhost:${running.server.port}`)
     expect(res.status).toBe(200)
     expect(await res.text()).toBe('typeclaw agent')
+  })
+
+  test('installs the runtime SIGTERM owner before a channel can start accepting work', async () => {
+    const before = process.listenerCount('SIGTERM')
+    let listenersAtChannelStart = -1
+    const createChannelManagerFor = (): ChannelManager => ({
+      router: createChannelRouter({ agentDir: testCwd, configForAdapter: () => undefined }),
+      start: async () => {
+        listenersAtChannelStart = process.listenerCount('SIGTERM')
+      },
+      stop: async () => {},
+      reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
+      restartAdapter: async () => {},
+    })
+
+    running = await startAgent({
+      port: 0,
+      attachTui: false,
+      cwd: testCwd,
+      loadCron: noCron,
+      createChannelManager: createChannelManagerFor,
+    })
+
+    expect(listenersAtChannelStart).toBe(before + 1)
+  })
+
+  test('prepares channel handoff without requiring a self-restart identity', async () => {
+    const router = createChannelRouter({ agentDir: testCwd, configForAdapter: () => undefined })
+    let channelHandoffWrites = 0
+    router.writeInterruptedSubagentHandoff = async () => {
+      channelHandoffWrites += 1
+      return true
+    }
+
+    await prepareRuntimeShutdownHandoff(testCwd, { router })
+
+    expect(channelHandoffWrites).toBe(1)
+  })
+
+  test('keeps readiness true while surfacing isolated channel and tunnel startup failures', async () => {
+    const createChannelManagerFor = (opts: ChannelManagerOptions): ChannelManager => ({
+      router: createChannelRouter({ agentDir: testCwd, configForAdapter: () => undefined }),
+      start: async () => opts.onDegrade?.('channel:discord-bot', 'token rejected'),
+      stop: async () => {},
+      reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
+      restartAdapter: async () => {},
+    })
+    const createTunnelManagerFor = (opts: TunnelManagerOptions): TunnelManager => ({
+      start: async () => opts.onDegrade?.('tunnel:github-webhook', 'cloudflared missing'),
+      stop: async () => {},
+      snapshot: () => [],
+      urlFor: () => null,
+      tail: () => [],
+      subscribeToLogs: () => () => {},
+    })
+
+    running = await startAgent({
+      port: 0,
+      attachTui: false,
+      cwd: testCwd,
+      loadCron: noCron,
+      createChannelManager: createChannelManagerFor,
+      createTunnelManager: createTunnelManagerFor,
+    })
+
+    const response = await fetch(`http://localhost:${running.server.port}/health/ready`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      status: 'degraded',
+      ready: true,
+      degraded: true,
+      degradedComponents: expect.arrayContaining(['channel:discord-bot', 'tunnel:github-webhook']),
+    })
   })
 
   test('awaits provider-OAuth refresh before any session consumer starts, so a lock-holding refresh cannot ELOCKED a boot auth read', async () => {
@@ -395,6 +476,31 @@ describe('startAgent', () => {
     expect(factoryCalls[0]?.file.jobs).toEqual([])
     expect(running.scheduler).not.toBeNull()
     expect(running.server.port).toBeGreaterThan(0)
+    const response = await fetch(`http://localhost:${running.server.port}/health/ready`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      status: 'degraded',
+      ready: true,
+      degradedComponents: expect.arrayContaining(['scheduler']),
+    })
+  })
+
+  test('reports skipped invalid cron jobs as a scheduler degradation', async () => {
+    const loadCron: LoadCronFn = async () => ({
+      ok: true,
+      file: { jobs: [] },
+      warnings: [{ index: 0, reason: 'job schedule is invalid' }],
+    })
+
+    running = await startAgent({ port: 0, attachTui: false, cwd: testCwd, loadCron })
+
+    const response = await fetch(`http://localhost:${running.server.port}/health/ready`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      status: 'degraded',
+      ready: true,
+      degradedComponents: expect.arrayContaining(['scheduler']),
+    })
   })
 
   test('passes onFire to the scheduler factory; firing publishes a kind:cron message to the stream', async () => {
@@ -606,6 +712,25 @@ describe('startAgent', () => {
       __resetConfigForTesting()
       await rmTempDir(agentDir)
     }
+  })
+})
+
+describe('startScheduler', () => {
+  test('reports a file-level failure even when no internal jobs keep a scheduler alive', async () => {
+    const degraded: string[] = []
+
+    const scheduler = await startScheduler({
+      cwd: '/agent',
+      loadCron: async () => ({ ok: false, reason: 'malformed cron.json' }),
+      createSchedulerFor: () => stubScheduler(),
+      registerBootCleanup: () => {},
+      stream: createStream(),
+      hasInternalJobs: false,
+      onDegrade: (reason) => degraded.push(reason),
+    })
+
+    expect(scheduler).toBeNull()
+    expect(degraded).toEqual(['malformed cron.json'])
   })
 })
 

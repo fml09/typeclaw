@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { restartHandoffPath } from '@/agent/restart-handoff'
+import type { RuntimeRestarter } from '@/capabilities'
 import { createStream, type StreamMessage } from '@/stream'
 
 import { createRestartTool } from './restart'
@@ -54,21 +55,6 @@ async function startOkServer(): Promise<ReturnType<typeof Bun.serve>> {
   })
 }
 
-// Polls until `predicate()` returns truthy, bounded by `timeoutMs`. Used to
-// observe restart.ts's internal `setTimeout(EXIT_DELAY_MS)` firing without
-// a fixed-sleep race. The prior pattern (`await sleep(600)` after a 500ms
-// EXIT_DELAY_MS) left only 100ms of slack — under 18-worker libuv
-// contention, setTimeout callbacks can be deferred well past their
-// scheduled fire time, so the 100ms margin occasionally collapses and the
-// `exitCode` assertion fails because the timer hasn't run yet.
-async function waitForCondition(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-  const deadline = performance.now() + timeoutMs
-  while (performance.now() < deadline) {
-    if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-}
-
 // Production callers run against a real hostd on the same host where 5s is
 // generous. These tests run against an in-process `Bun.serve` under the
 // same 18-worker parallel-test contention as the rest of the suite, where
@@ -79,6 +65,32 @@ async function waitForCondition(predicate: () => boolean, timeoutMs = 5_000): Pr
 const TEST_ACK_TIMEOUT_MS = 30_000
 
 describe('createRestartTool', () => {
+  test('publishes through an injected runtime restarter without taking termination ownership', async () => {
+    const requests: Array<{ build: boolean }> = []
+    const restarter: RuntimeRestarter = {
+      requestRestart: async (request) => {
+        requests.push(request)
+        return { ok: true }
+      },
+    }
+    let exitCode: number | undefined
+    const tool = createRestartTool({
+      containerName: 'managed-agent',
+      restarter,
+      originatingSessionId: 'ses-managed',
+      exit: (code) => {
+        exitCode = code
+      },
+    })
+
+    const result = await tool.execute('id', { build: true }, undefined, undefined, fakeCtx)
+
+    expect(requests).toEqual([{ build: true }])
+    expect(result.details).toEqual({ ok: true, containerName: 'managed-agent' })
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    expect(exitCode).toBeUndefined()
+  })
+
   test('uses HTTP hostd transport when URL and token are configured', async () => {
     const requests: Array<{ auth: string | null; body: unknown }> = []
     server = await serveReady({
@@ -109,8 +121,8 @@ describe('createRestartTool', () => {
         body: { kind: 'restart', containerName: 'coder', build: false },
       },
     ])
-    await waitForCondition(() => exitCode !== undefined)
-    expect(exitCode).toBe(0)
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    expect(exitCode).toBeUndefined()
   })
 
   test('forwards build:true in the RPC body when invoked with { build: true }', async () => {
@@ -324,8 +336,8 @@ describe('createRestartTool', () => {
 
     // then
     expect(result.details).toEqual({ ok: true, containerName: 'coder' })
-    await waitForCondition(() => exitCode !== undefined)
-    expect(exitCode).toBe(0)
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    expect(exitCode).toBeUndefined()
   })
 })
 
@@ -542,7 +554,8 @@ describe('createRestartTool restart-pending handoff', () => {
     await tool.execute('id', {}, undefined, undefined, fakeCtx)
 
     // then
-    const broadcastTs = (received[0]?.payload as { restartedAt: string }).restartedAt
+    expect(received).toHaveLength(1)
+    const broadcastTs = (received[0]!.payload as { restartedAt: string }).restartedAt
     const handoff = JSON.parse(await readFile(restartHandoffPath(agentDir), 'utf8'))
     expect(handoff.restartedAt).toBe(broadcastTs)
   })

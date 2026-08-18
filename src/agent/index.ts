@@ -10,6 +10,7 @@ import {
 } from '@mariozechner/pi-coding-agent'
 import type { AgentSession, ToolDefinition } from '@mariozechner/pi-coding-agent'
 
+import type { RuntimeRestarter } from '@/capabilities'
 import type { ChannelRouter } from '@/channels/router'
 import type { ReactionRef } from '@/channels/types'
 import {
@@ -158,6 +159,9 @@ export type CreateSessionOptions = {
   // Enables the `restart` tool. Set when the agent is running inside a
   // typeclaw-managed container. Read from TYPECLAW_CONTAINER_NAME at the call site.
   containerName?: string
+  // Bound self-restart capability selected by the deployment profile. Kept
+  // separate from containerName so sessions never discover platform transport.
+  restarter?: RuntimeRestarter
   // The typeclaw runtime version (`package.json#version` of the executing
   // CLI) to surface in the system prompt under `## Runtime`. Threaded from
   // `startAgent` via `CLI_VERSION` so every session — TUI, channel, cron,
@@ -430,6 +434,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
               ? [
                   createRestartTool({
                     containerName: options.containerName,
+                    ...(options.restarter !== undefined ? { restarter: options.restarter } : {}),
                     originatingSessionId: sessionManager.getSessionId(),
                     ...(options.stream ? { stream: options.stream } : {}),
                     ...buildRestartHandoffWiring(options, sessionManager),

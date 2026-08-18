@@ -13,6 +13,18 @@ export type ResolvedPlugin = {
 
 export type LoadPluginEntryFn = (entry: string, agentDir: string) => Promise<ResolvedPlugin>
 
+export type LoadPluginEntryOptions = {
+  // Managed images can bind image-owned defaults to the immutable root package
+  // graph while leaving explicitly configured packages agent-local. The value
+  // is a project directory containing node_modules, not node_modules itself.
+  preferredPackageSearchDir?: string
+  preferredPackages?: ReadonlySet<string>
+  // Stops a preferred package lookup after inspecting this directory. Managed
+  // explicit plugins use the Agent Folder as a hard boundary so walking to
+  // `/node_modules` cannot silently satisfy a missing hydrated override.
+  preferredPackageSearchBoundaryDir?: string
+}
+
 // Thrown only when a plugin entry cannot be resolved at all (uninstalled
 // package, missing local file, unresolvable export subpath). The manager
 // treats this as non-fatal and skips the entry.
@@ -39,11 +51,15 @@ export class PluginSecurityError extends Error {
   }
 }
 
-export async function loadPluginEntry(entry: string, agentDir: string): Promise<ResolvedPlugin> {
+export async function loadPluginEntry(
+  entry: string,
+  agentDir: string,
+  options: LoadPluginEntryOptions = {},
+): Promise<ResolvedPlugin> {
   if (isLocalPath(entry)) {
     return loadLocal(entry, agentDir)
   }
-  return loadNpm(entry, agentDir)
+  return loadNpm(entry, agentDir, options)
 }
 
 function isLocalPath(entry: string): boolean {
@@ -67,14 +83,24 @@ async function loadLocal(entry: string, agentDir: string): Promise<ResolvedPlugi
   return { name, version: undefined, source: entry, defined }
 }
 
-async function loadNpm(entry: string, agentDir: string): Promise<ResolvedPlugin> {
+async function loadNpm(entry: string, agentDir: string, options: LoadPluginEntryOptions): Promise<ResolvedPlugin> {
   // The version suffix (`name@1.2.3`, `@scope/name@1.2.3`) is consumed by the
   // host reconcile step when materializing the entry into package.json. By load
   // time the package is installed at `node_modules/<name>/` under its bare name,
   // so passing the raw `name@version` here would miss the dir and fail the
   // bare-import fallback too.
   const { name: packageName } = splitPluginEntrySpec(entry)
-  const pkgJsonPath = findPackageJson(packageName, agentDir)
+  const packageSearchDir = options.preferredPackages?.has(packageName) ? options.preferredPackageSearchDir : undefined
+  const resolutionDir = packageSearchDir ?? agentDir
+  const packageSearchBoundaryDir =
+    packageSearchDir !== undefined ? options.preferredPackageSearchBoundaryDir : undefined
+  const pkgJsonPath = findPackageJson(packageName, resolutionDir, packageSearchBoundaryDir)
+  if (pkgJsonPath === null && packageSearchBoundaryDir !== undefined) {
+    throw new PluginNotFoundError(
+      entry,
+      `cannot resolve plugin "${entry}" inside package boundary ${packageSearchBoundaryDir}`,
+    )
+  }
   let pkgName = packageName
   let version: string | undefined
   let entryPath: string | null = null
@@ -110,7 +136,7 @@ async function loadNpm(entry: string, agentDir: string): Promise<ResolvedPlugin>
     importTarget = toModuleSpecifier(entryPath)
   } else {
     try {
-      importTarget = toModuleSpecifier(Bun.resolveSync(packageName, agentDir))
+      importTarget = toModuleSpecifier(Bun.resolveSync(packageName, resolutionDir))
     } catch (err) {
       throw new PluginNotFoundError(entry, `cannot resolve plugin "${entry}": ${describeError(err)}`, { cause: err })
     }
@@ -154,12 +180,18 @@ function toModuleSpecifier(target: string): string {
   return isAbsolute(target) ? pathToFileURL(target).href : target
 }
 
-function findPackageJson(entry: string, agentDir: string): string | null {
+function findPackageJson(entry: string, agentDir: string, boundaryDir?: string): string | null {
   const PACKAGE_JSON = 'package.json'
-  let cur = agentDir
+  let cur = resolve(agentDir)
+  const boundary = boundaryDir === undefined ? null : resolve(boundaryDir)
+  if (boundary !== null) {
+    const fromBoundary = relative(boundary, cur)
+    if (fromBoundary.startsWith('..') || isAbsolute(fromBoundary)) return null
+  }
   while (true) {
     const p = join(cur, 'node_modules', entry, PACKAGE_JSON)
     if (existsSync(p)) return p
+    if (boundary !== null && cur === boundary) return null
     const parent = dirname(cur)
     if (parent === cur) return null
     cur = parent

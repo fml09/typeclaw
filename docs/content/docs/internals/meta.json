@@ -10,6 +10,7 @@
     "secrets",
     "permissions",
     "capabilities",
+    "managed-runtime",
     "hostd",
     "tunnels",
     "message-stream",

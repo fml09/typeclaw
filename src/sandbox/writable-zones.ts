@@ -370,6 +370,11 @@ function gitConfigEnv(agentDir: string, gitDir: string): NodeJS.ProcessEnv {
   return {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
     HOME: agentDir,
+    // execLocalGitConfig recognizes Git's stable C-locale diagnostic before
+    // falling back from --local to --file for deliberately minimal synthetic
+    // repositories. Do not let the host OS localize that control-flow signal.
+    LC_ALL: 'C',
+    LANG: 'C',
     GIT_DIR: gitDir,
     GIT_WORK_TREE: agentDir,
     GIT_CONFIG_GLOBAL: '/dev/null',

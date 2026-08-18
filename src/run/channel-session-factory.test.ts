@@ -7,6 +7,7 @@ import { SessionManager } from '@mariozechner/pi-coding-agent'
 import type { AgentSession } from '@mariozechner/pi-coding-agent'
 
 import type { CreateSessionOptions } from '@/agent'
+import type { RuntimeRestarter } from '@/capabilities'
 import type { ChannelRouter } from '@/channels'
 import type { ReloadRegistry } from '@/reload'
 import type { SessionFactory } from '@/sessions'
@@ -120,6 +121,38 @@ describe('buildChannelSessionFactory — production wiring contract', () => {
 
     expect(captured!.stream).toBe(stream)
     expect(captured!.reloadRegistry).toBe(reloadRegistry)
+  })
+
+  test('threads the bound runtime restarter into channel sessions', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'channel-session-factory-'))
+    const restarter: RuntimeRestarter = { requestRestart: async () => ({ ok: true }) }
+    let captured: Captured = undefined
+
+    const factory = buildChannelSessionFactory({
+      cwd: tmp,
+      sessionFactory: makeFakeSessionFactory(join(tmp, 'sessions')),
+      stream: makeFakeStream(),
+      reloadRegistry: makeFakeReloadRegistry(),
+      pluginRuntime: makeEmptyRuntime(),
+      getChannelRouter: makeFakeRouter,
+      containerName: 'managed-agent',
+      restarter,
+      createSession: async (options) => {
+        captured = options
+        return STUB_SESSION
+      },
+      rehydrateCapOptions: null,
+    })
+
+    await factory({
+      key: { adapter: 'discord-bot', workspace: '@dm', chat: 'c1', thread: null },
+      participants: [],
+      origin: { kind: 'channel', adapter: 'discord-bot', workspace: '@dm', chat: 'c1', thread: null, participants: [] },
+      originRef: { current: undefined },
+    })
+
+    expect(captured).toBeDefined()
+    expect(captured!.restarter).toBe(restarter)
   })
 
   test('omits plugin wiring when the runtime has no plugin content (avoids cost of plugin tool injection)', async () => {

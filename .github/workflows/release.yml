@@ -7,13 +7,13 @@ on:
         description: 'Version (x.y.z)'
         required: true
 
-# Serialize releases by version so two dispatches of the same version can't
-# race each other into a half-published state. `cancel-in-progress: false`:
+# Serialize every release so two versions cannot race mutable npm/GHCR tags or
+# reserve competing package.json bumps on main. `cancel-in-progress: false`:
 # a release in flight must NEVER be cancelled mid-publish — the GHCR-first/
 # npm-second ordering and the irreversible `npm publish` depend on the job
 # running to completion once started. A duplicate dispatch waits instead.
 concurrency:
-  group: release-${{ github.event.inputs.version }}
+  group: release
   cancel-in-progress: false
 
 # Base image repo, reused across the build/merge jobs. Single source so a
@@ -21,6 +21,7 @@ concurrency:
 # src/init/cli-version.ts (the value the per-agent Dockerfile FROMs).
 env:
   REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/typeclaw-base
+  RUNTIME_REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/typeclaw-runtime
 
 # Job-default permissions are read-only; each job widens only what it needs
 # (packages: write for the GHCR push/merge jobs, contents: write + id-token:
@@ -39,11 +40,25 @@ jobs:
   checks:
     name: Validate and test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+      npm_exists: ${{ steps.preflight.outputs.npm_exists }}
+      base_exists: ${{ steps.preflight.outputs.base_exists }}
+      runtime_exists: ${{ steps.preflight.outputs.runtime_exists }}
+      tag_exists: ${{ steps.preflight.outputs.tag_exists }}
+      promote_latest: ${{ steps.preflight.outputs.promote_latest }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full first-parent history is needed to recover a partial release
+          # after any number of later PRs have merged above its reserved
+          # package.json-only version bump.
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -77,7 +92,129 @@ jobs:
             echo "::error::Invalid version: '$VERSION' (expected strict x.y.z)"
             exit 1
           fi
+          source_sha="$(bash scripts/resolve-release-source.sh "$VERSION" "$GITHUB_SHA")"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          # All tests, tarballs, and Dockerfiles below must come from the
+          # canonical source, not arbitrary code merged after its reservation.
+          git checkout --detach "$source_sha"
+          test "$(git rev-parse HEAD)" = "$source_sha"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR for release preflight
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate existing release identity
+        id: preflight
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_SHA: ${{ steps.version.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          trap 'rm -rf -- "$scratch"' EXIT
+
+          npm_exists=false
+          if npm_metadata="$(npm view "typeclaw@${VERSION}" --json 2>"${scratch}/npm.err")"; then
+            npm_exists=true
+            npm_git_head="$(jq -r '.gitHead // empty' <<<"$npm_metadata")"
+            if [ "$npm_git_head" != "$SOURCE_SHA" ]; then
+              echo "::error::published npm source does not match workflow source: ${npm_git_head:-<missing>} != ${SOURCE_SHA}"
+              exit 1
+            fi
+          elif grep -q 'E404' "${scratch}/npm.err"; then
+            npm_exists=false
+          else
+            echo "::error::could not determine whether typeclaw@${VERSION} exists"
+            cat "${scratch}/npm.err" >&2
+            exit 1
+          fi
+          echo "npm_exists=$npm_exists" >> "$GITHUB_OUTPUT"
+
+          if ! latest_version="$(npm view typeclaw@latest version 2>"${scratch}/npm-latest.err")"; then
+            echo "::error::could not resolve the current npm latest version"
+            cat "${scratch}/npm-latest.err" >&2
+            exit 1
+          fi
+          if ! [[ "$latest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::npm latest is not a strict release version: ${latest_version:-<missing>}"
+            exit 1
+          fi
+          promote_latest="$(node - "$VERSION" "$latest_version" <<'NODE'
+          const [candidate, current] = process.argv.slice(2).map((version) => version.split('.').map(Number))
+          const comparison = candidate[0] - current[0] || candidate[1] - current[1] || candidate[2] - current[2]
+          process.stdout.write(comparison >= 0 ? 'true' : 'false')
+          NODE
+          )"
+          echo "promote_latest=$promote_latest" >> "$GITHUB_OUTPUT"
+
+          inspect_release_image() {
+            local ref="$1"
+            local output_name="$2"
+            local raw="${scratch}/${output_name}.json"
+            local err="${scratch}/${output_name}.err"
+            if docker buildx imagetools inspect --raw "$ref" >"$raw" 2>"$err"; then
+              if ! bash scripts/validate-release-image-index.sh "$raw" "$SOURCE_SHA"; then
+                echo "::error::${ref} is not the expected paired multi-arch release index"
+                exit 1
+              fi
+              echo "${output_name}=true" >> "$GITHUB_OUTPUT"
+              return
+            fi
+            if grep -Eqi 'manifest unknown|name unknown|not found|404' "$err"; then
+              echo "${output_name}=false" >> "$GITHUB_OUTPUT"
+              return
+            fi
+            echo "::error::could not determine whether ${ref} exists"
+            cat "$err" >&2
+            exit 1
+          }
+
+          inspect_release_image "${REGISTRY_IMAGE}:${VERSION}" base_exists
+          inspect_release_image "${RUNTIME_REGISTRY_IMAGE}:${VERSION}" runtime_exists
+          base_exists="$(grep '^base_exists=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
+          runtime_exists="$(grep '^runtime_exists=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
+
+          tag_exists=false
+          if git ls-remote --exit-code --refs origin "refs/tags/${VERSION}" >"${scratch}/tag.out" 2>"${scratch}/tag.err"; then
+            tag_exists=true
+            git fetch --no-tags origin "+refs/tags/${VERSION}:refs/tags/${VERSION}"
+            tag_commit="$(git rev-parse "${VERSION}^{commit}")"
+            if [ "$tag_commit" != "$SOURCE_SHA" ] && ! bash scripts/is-release-version-bump.sh "$SOURCE_SHA" "$tag_commit" "$VERSION"; then
+              echo "::error::release tag source does not match workflow source: ${tag_commit} is not an exact version-only bump over ${SOURCE_SHA}"
+              exit 1
+            fi
+          elif grep -Eq '(^|[[:space:]])2($|[[:space:]])|not found' "${scratch}/tag.err"; then
+            tag_exists=false
+          else
+            # `git ls-remote --exit-code` uses status 2 with empty stderr when
+            # no matching ref exists. Any diagnostic means transport failure.
+            if [ -s "${scratch}/tag.err" ]; then
+              echo "::error::could not determine whether release tag ${VERSION} exists"
+              cat "${scratch}/tag.err" >&2
+              exit 1
+            fi
+            tag_exists=false
+          fi
+          echo "tag_exists=$tag_exists" >> "$GITHUB_OUTPUT"
+
+          if [ "$runtime_exists" = true ] && [ "$base_exists" != true ]; then
+            echo "::error::managed runtime version tag exists without its paired base image"
+            exit 1
+          fi
+          if [ "$npm_exists" = true ] && { [ "$base_exists" != true ] || [ "$runtime_exists" != true ]; }; then
+            echo "::error::published npm version is missing a paired immutable image"
+            exit 1
+          fi
+          if [ "$tag_exists" = true ] && { [ "$npm_exists" != true ] || [ "$base_exists" != true ] || [ "$runtime_exists" != true ]; }; then
+            echo "::error::release tag exists without the complete npm and image release set"
+            exit 1
+          fi
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -108,6 +245,37 @@ jobs:
         # the slower GitHub Actions runners.
         run: bun test --parallel --timeout 30000
 
+      - name: Prepare exact managed runtime inputs
+        # The TypeClaw release does not exist on npm yet, so the workload image
+        # must consume this checkout's publishable tarball. The managed GWS
+        # version is an exact source-controlled pin, and package.json/bun.lock
+        # freeze the complete TypeClaw production graph across architectures and
+        # same-version reruns.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null
+          mkdir -p runtime-input
+
+          typeclaw_tarball="$(npm pack --ignore-scripts --pack-destination runtime-input --json | jq -r '.[0].filename')"
+          mv "runtime-input/${typeclaw_tarball}" runtime-input/typeclaw.tgz
+
+          gws_version="$(bun -e "import { GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION } from './src/config'; console.log(GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION)")"
+          test -n "$gws_version"
+          gws_tarball="$(npm pack --ignore-scripts --pack-destination runtime-input --json "typeclaw-gws-multi-account@${gws_version}" | jq -r '.[0].filename')"
+          mv "runtime-input/${gws_tarball}" runtime-input/typeclaw-gws-multi-account.tgz
+
+          test "$(tar -xOf runtime-input/typeclaw.tgz package/package.json | jq -r '.name')" = "typeclaw"
+          test "$(tar -xOf runtime-input/typeclaw.tgz package/package.json | jq -r '.version')" = "$VERSION"
+          test "$(tar -xOf runtime-input/typeclaw-gws-multi-account.tgz package/package.json | jq -r '.name')" = "typeclaw-gws-multi-account"
+          test "$(tar -xOf runtime-input/typeclaw-gws-multi-account.tgz package/package.json | jq -r '.version')" = "$gws_version"
+
+          bun run scripts/emit-managed-runtime-dockerfile.ts "$VERSION" > runtime-input/runtime.Dockerfile
+          cp package.json bun.lock runtime-input/
+          printf '%s\n' "$gws_version" > runtime-input/gws-version.txt
+          (cd runtime-input && sha256sum typeclaw.tgz typeclaw-gws-multi-account.tgz package.json bun.lock > SHA256SUMS)
+
       - name: Generate base Dockerfile
         # Same source as base-image.yml (PR validation) — the published base
         # image is a function of src/init/dockerfile.ts at this commit,
@@ -126,6 +294,81 @@ jobs:
           path: base.Dockerfile
           if-no-files-found: error
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: managed-runtime-input
+          path: runtime-input/
+          if-no-files-found: error
+
+  # Reserve the version on main before any image or npm publication. If main
+  # moved since checks started, the push fails before an irreversible artifact
+  # exists. A partial run leaves one recognizable package.json-only bump commit
+  # that a rerun can reuse even after later PRs merge on top of it.
+  reserve-version:
+    name: Reserve release version on main
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      bump_sha: ${{ steps.reserve.outputs.bump_sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.checks.outputs.source_sha }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Create or recover the version bump commit
+        id: reserve
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+          SOURCE_SHA: ${{ needs.checks.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+
+          is_release_bump() {
+            local commit="$1"
+            bash scripts/is-release-version-bump.sh "$SOURCE_SHA" "$commit" "$VERSION"
+          }
+
+          bump_sha=''
+          remote_main="$(git rev-parse origin/main)"
+          if is_release_bump "$remote_main"; then
+            bump_sha="$remote_main"
+          elif [ "$remote_main" = "$SOURCE_SHA" ]; then
+            npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null
+            if git diff --quiet -- package.json; then
+              bump_sha="$SOURCE_SHA"
+            else
+              git config user.name "Typeey"
+              git config user.email "typeeybird@gmail.com"
+              git add package.json
+              git commit -m "$VERSION"
+              bump_sha="$(git rev-parse HEAD)"
+              git push origin HEAD:main
+            fi
+          elif git merge-base --is-ancestor "$SOURCE_SHA" origin/main; then
+            while IFS= read -r candidate; do
+              if is_release_bump "$candidate"; then
+                bump_sha="$candidate"
+                break
+              fi
+            done < <(git rev-list --ancestry-path "${SOURCE_SHA}..origin/main")
+          fi
+
+          if [ -z "$bump_sha" ]; then
+            echo "::error::main moved before version ${VERSION} was reserved from source ${SOURCE_SHA}"
+            exit 1
+          fi
+          echo "bump_sha=$bump_sha" >> "$GITHUB_OUTPUT"
+
   # ─────────────────────────── build-base ───────────────────────────
   # One leg per target architecture, each on a NATIVE runner — amd64 on
   # `ubuntu-latest`, arm64 on `ubuntu-24.04-arm` — instead of emulating
@@ -136,15 +379,12 @@ jobs:
   # already uses for PR validation.
   #
   # Each leg pushes its single-platform image BY DIGEST (push-by-digest=true),
-  # NOT to a tag. The version-named tags (`:X.Y.Z`, `:latest`) are written
-  # exactly once, by the merge-base job below, via `imagetools create` — so
-  # there is never a window where `:X.Y.Z` resolves to a single-arch image.
-  # This preserves the "single writer for version-named tags" invariant
-  # across the split: the build legs write only content-addressed digests,
-  # the merge job writes the human/CLI-facing tags atomically.
+  # NOT to a tag. The immutable `:X.Y.Z` tag is written exactly once by the
+  # merge-base job below, so it never resolves to a single-arch image. Mutable
+  # `:latest` promotion is deliberately later, after npm publication.
   build-base:
     name: Build base image / ${{ matrix.arch }}
-    needs: checks
+    needs: [checks, reserve-version]
     permissions:
       contents: read
       packages: write
@@ -166,6 +406,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: base-dockerfile
@@ -230,9 +472,9 @@ jobs:
           retention-days: 1
 
   # ─────────────────────────── merge-base ───────────────────────────
-  # Assembles the two single-arch digests into multi-arch manifest LISTS at
-  # `:X.Y.Z` and `:latest`, then verifies both are anonymously pullable on
-  # both platforms. This is the SINGLE WRITER of the version-named tags. It
+  # Assembles the two single-arch digests into a multi-arch manifest list at
+  # `:X.Y.Z`, then verifies it is anonymously pullable on both platforms. This
+  # is the SINGLE WRITER of the version-named tag. It
   # `needs:` the whole build matrix, so it only runs once both arches pushed
   # their digests. The verify step is the publish gate: the release job
   # `needs: merge-base`, so npm publish cannot run unless a real multi-arch
@@ -241,11 +483,15 @@ jobs:
     name: Merge and verify base image
     needs: [checks, build-base]
     runs-on: ubuntu-latest
+    outputs:
+      version_digest: ${{ steps.verify.outputs.digest }}
     permissions:
       contents: read
       packages: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: actions/download-artifact@v4
@@ -262,17 +508,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create multi-arch manifest lists
-        # `imagetools create` is idempotent: re-running overwrites the tag to
-        # point at the same manifest list (GHCR has no immutability policy as
-        # of 2026), so a partial-failure re-run re-assembles cleanly. Both
-        # `:X.Y.Z` and `:latest` are created in one invocation so they always
-        # become manifest lists together — `:latest` can never lag at a
-        # single-arch or stale version. The guard refuses to proceed unless
+        if: needs.checks.outputs.base_exists != 'true'
+        # The immutable version tag is created only when preflight proved it
+        # absent. Mutable `:latest` is promoted in the final release job after
+        # npm publication and only for a non-older release. The guard refuses
+        # to proceed unless
         # exactly two digests arrived, so a half-built matrix (one arch
         # failed under fail-fast:false) cannot produce a single-arch
         # `:X.Y.Z`.
         env:
           VERSION: ${{ needs.checks.outputs.version }}
+          SOURCE_SHA: ${{ needs.checks.outputs.source_sha }}
         run: |
           set -euo pipefail
           refs=()
@@ -285,43 +531,208 @@ jobs:
             exit 1
           fi
           docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.revision=${SOURCE_SHA}" \
             -t "${REGISTRY_IMAGE}:${VERSION}" \
-            -t "${REGISTRY_IMAGE}:latest" \
             "${refs[@]}"
 
       - name: Verify base image is anonymously pullable on both platforms
+        id: verify
         # The end-user contract is "an unauthenticated `docker pull` from a
         # fresh machine resolves both linux/amd64 and linux/arm64 manifests."
         # The login from the steps above must be cleared first — otherwise a
         # private package could pass verification on a credentialed runner
         # and then fail on every user's first `typeclaw start`.
         #
-        # Four checks, each closing a distinct failure mode:
+        # Three checks, each closing a distinct failure mode:
         #   (a) `imagetools inspect` on :X.Y.Z confirms the manifest list and
         #       both per-platform manifests exist as a single atomic record.
         #   (b) `docker pull --platform linux/amd64` proves the amd64 layer
         #       blobs are actually pullable, not just referenced.
         #   (c) `docker pull --platform linux/arm64` does the same for arm64.
-        #   (d) `imagetools inspect` on :latest confirms the human-facing tag
-        #       is ALSO a multi-arch list, not left behind by the merge.
-        #
         # No retries: `imagetools create` is immediately consistent, and the
         # pulls run from a fresh connection. If any step fails the image is
         # not safe to release — and because the release job `needs:` this
         # one, a failure here blocks the irreversible npm publish.
         env:
           VERSION: ${{ needs.checks.outputs.version }}
+          SOURCE_SHA: ${{ needs.checks.outputs.source_sha }}
         run: |
           set -euo pipefail
           IMAGE="${REGISTRY_IMAGE}:${VERSION}"
           docker logout ghcr.io
-          docker buildx imagetools inspect "$IMAGE"
+          raw="$(mktemp)"
+          trap 'rm -f -- "$raw"' EXIT
+          docker buildx imagetools inspect --raw "$IMAGE" >"$raw"
+          bash scripts/validate-release-image-index.sh "$raw" "$SOURCE_SHA"
+          echo "digest=sha256:$(sha256sum "$raw" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           docker pull --platform linux/amd64 "$IMAGE"
           docker pull --platform linux/arm64 "$IMAGE"
-          docker buildx imagetools inspect "${REGISTRY_IMAGE}:latest"
+
+  # ─────────────────────────── build-runtime ───────────────────────────
+  # The immutable workload image is layered over the just-published matching
+  # base manifest. Like build-base, native runners push only content-addressed
+  # single-platform manifests; merge-runtime is the sole version-tag writer.
+  build-runtime:
+    name: Build managed runtime / ${{ matrix.arch }}
+    needs: [checks, merge-base]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: managed-runtime-input
+          path: runtime-input
+
+      - name: Verify immutable build inputs
+        run: |
+          cd runtime-input
+          sha256sum --check SHA256SUMS
+          cat runtime.Dockerfile
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: runtime-input
+          file: runtime-input/runtime.Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.RUNTIME_REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.RUNTIME_REGISTRY_IMAGE }}:cache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.RUNTIME_REGISTRY_IMAGE }}:cache-${{ matrix.arch }},mode=max
+
+      - name: Smoke single-platform runtime by digest
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${RUNTIME_REGISTRY_IMAGE}@${DIGEST}"
+          GWS_VERSION="$(cat runtime-input/gws-version.txt)"
+          docker pull --platform "${{ matrix.platform }}" "$IMAGE_REF"
+          test "$(docker image inspect "$IMAGE_REF" --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect "$IMAGE_REF" --format '{{json .Config.Entrypoint}}')" = '["/usr/bin/tini","--","/usr/local/bin/typeclaw-entrypoint"]'
+          test "$(docker image inspect "$IMAGE_REF" --format '{{json .Config.Cmd}}')" = '["run"]'
+          docker run --rm --entrypoint sh \
+            -e EXPECTED_VERSION="$VERSION" \
+            -e EXPECTED_GWS_VERSION="$GWS_VERSION" \
+            "$IMAGE_REF" -ec '
+              test "$(bun -e "import pkg from \"/node_modules/typeclaw/package.json\"; console.log(pkg.version)")" = "$EXPECTED_VERSION"
+              test "$(bun -e "import pkg from \"/node_modules/typeclaw-gws-multi-account/package.json\"; console.log(pkg.version)")" = "$EXPECTED_GWS_VERSION"
+              test -f /opt/typeclaw/models/.typeclaw-model.json
+            '
+          bash scripts/smoke-managed-runtime-image.sh "$IMAGE_REF"
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/runtime-digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/runtime-digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/runtime-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─────────────────────────── merge-runtime ───────────────────────────
+  merge-runtime:
+    name: Merge and verify managed runtime image
+    needs: [checks, build-runtime]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-digests-*
+          path: ${{ runner.temp }}/runtime-digests
+          merge-multiple: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest lists
+        if: needs.checks.outputs.runtime_exists != 'true'
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+          SOURCE_SHA: ${{ needs.checks.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          refs=()
+          for digest_file in "${{ runner.temp }}"/runtime-digests/*; do
+            refs+=("${RUNTIME_REGISTRY_IMAGE}@sha256:$(basename "$digest_file")")
+          done
+          if [ "${#refs[@]}" -ne 2 ]; then
+            echo "::error::Expected exactly 2 managed runtime platform digests, got ${#refs[@]}"
+            printf '%s\n' "${refs[@]}"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.revision=${SOURCE_SHA}" \
+            -t "${RUNTIME_REGISTRY_IMAGE}:${VERSION}" \
+            "${refs[@]}"
+
+      - name: Verify managed runtime is anonymously pullable on both platforms
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+          SOURCE_SHA: ${{ needs.checks.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="${RUNTIME_REGISTRY_IMAGE}:${VERSION}"
+          docker logout ghcr.io
+          raw="$(mktemp)"
+          trap 'rm -f -- "$raw"' EXIT
+          docker buildx imagetools inspect --raw "$IMAGE" >"$raw"
+          bash scripts/validate-release-image-index.sh "$raw" "$SOURCE_SHA"
+          docker pull --platform linux/amd64 "$IMAGE"
+          docker pull --platform linux/arm64 "$IMAGE"
+
+          # The second pull leaves the local tag pointing at arm64. Restore the
+          # runner-native manifest before executing the CLI smoke test.
+          docker pull --platform linux/amd64 "$IMAGE"
+          test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = "65532:65532"
+          docker run --rm --entrypoint bun "$IMAGE" \
+            /node_modules/typeclaw/src/cli/index.ts --version
 
   # ─────────────────────────── release ───────────────────────────
-  # The irreversible publish path, gated on a verified multi-arch base image.
+  # The irreversible publish path, gated on verified multi-arch base and
+  # managed runtime images.
   #
   # GHCR base image FIRST (built+merged+verified by the jobs above), npm
   # SECOND. Order matters: a user who `npm install`s typeclaw@X.Y.Z and runs
@@ -329,19 +740,21 @@ jobs:
   # `FROM ghcr.io/typeclaw/typeclaw-base:X.Y.Z` (see src/init/dockerfile.ts).
   # If `npm publish` ran before the GHCR image existed, there is a window
   # where users can install a CLI version whose base image does not yet
-  # exist. `needs: merge-base` (which verified the image is pullable) closes
-  # that race. The npm publish below remains the cardinal irreversible step;
-  # everything before it is already in place by the time this job starts.
+  # exist. `needs: [merge-base, merge-runtime]` (which verified both images are
+  # pullable) closes that race. The npm publish below remains the cardinal
+  # irreversible step; everything before it is already in place by the time
+  # this job starts.
   release:
     name: Publish npm, tag, and release
-    needs: [checks, merge-base]
+    needs: [checks, reserve-version, merge-base, merge-runtime]
     runs-on: ubuntu-latest
     # id-token: write is required for `npm publish --provenance` (OIDC
     # trusted publishing) — and ONLY this job needs it. contents: write is
-    # for the git push of the version bump + tag (over the deploy key).
+    # for the release tag (over the deploy key) and GitHub Release.
     permissions:
       contents: write
       id-token: write
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -360,6 +773,10 @@ jobs:
         # required — turning it off strips the auth and the push falls back
         # to anonymous HTTPS.
         with:
+          # Publish from the canonical source commit so npm gitHead and both
+          # OCI revision annotations share one identity. The separate bump
+          # commit reserved main before builds and is only the tag target.
+          ref: ${{ needs.checks.outputs.source_sha }}
           ssh-key: ${{ secrets.DEPLOY_KEY }}
 
       - uses: oven-sh/setup-bun@v2
@@ -392,56 +809,90 @@ jobs:
         # TypeClaw publishes raw TS sources (no build step), and has no
         # .claude-plugin/plugin.json or skill `version:` frontmatter to sync —
         # package.json is the only place a version lives. `--allow-same-version`
-        # makes this idempotent across re-runs. Mutates package.json in the
-        # runner only; the bumped value is pushed by `Commit and tag` after
-        # every downstream publish succeeds. Re-done here (not carried from
-        # the checks job) because this job is a fresh checkout/runner.
+        # makes this idempotent across re-runs. Mutates package.json in this
+        # canonical-source checkout only; reserve-version already committed
+        # the same one-file bump on main before any artifact build began.
         run: npm version ${{ needs.checks.outputs.version }} --no-git-tag-version --allow-same-version
 
       - name: Publish to npm
         # Cardinal irreversible step. npm enforces version immutability —
         # once typeclaw@X.Y.Z is on the registry, that name is burned
         # forever. By the time this step runs, the GHCR image at the same
-        # version tag has been pushed AND verified pullable (merge-base job),
+        # version tags have been pushed AND verified pullable (merge-base and
+        # merge-runtime jobs),
         # so any user who installs typeclaw@X.Y.Z within seconds of this step
         # completing will succeed at `typeclaw start`.
         #
-        # Idempotency guard: if a previous run already published this
-        # version, treat the conflict as success so the rest of the
-        # workflow can repair whatever halted it (git tag, GitHub Release).
-        # `npm view` returns the version string on success and exits
-        # non-zero when the package@version is missing — so a non-empty
-        # stdout means "already published, skip."
+        # The checks job queried this exact version fail-closed and verified
+        # an existing package's gitHead against the immutable source SHA.
+        # Reuse that result here instead of swallowing registry/network errors.
+        env:
+          NPM_EXISTS: ${{ needs.checks.outputs.npm_exists }}
+          PROMOTE_LATEST: ${{ needs.checks.outputs.promote_latest }}
+          VERSION: ${{ needs.checks.outputs.version }}
         run: |
-          if [ -n "$(npm view typeclaw@${{ needs.checks.outputs.version }} version 2>/dev/null || true)" ]; then
-            echo "typeclaw@${{ needs.checks.outputs.version }} already published, skipping npm publish"
+          if [ "$NPM_EXISTS" = true ]; then
+            echo "typeclaw@${VERSION} already published, skipping npm publish"
+          elif [ "$PROMOTE_LATEST" = true ]; then
+            npm publish --provenance --access public --tag latest
           else
-            npm publish --provenance --access public
+            # A delayed repair of an older version must not move npm latest
+            # backward. The immutable version remains directly installable.
+            npm publish --provenance --access public --tag "release-${VERSION//./-}"
           fi
 
-      - name: Commit and tag
+      - uses: docker/setup-buildx-action@v3
+        if: needs.checks.outputs.promote_latest == 'true'
+
+      - name: Login to GHCR for latest promotion
+        if: needs.checks.outputs.promote_latest == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote matching base image to latest
+        if: needs.checks.outputs.promote_latest == 'true'
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${REGISTRY_IMAGE}:latest" \
+            "${REGISTRY_IMAGE}@${{ needs.merge-base.outputs.version_digest }}"
+          version_raw="$(mktemp)"
+          latest_raw="$(mktemp)"
+          trap 'rm -f -- "$version_raw" "$latest_raw"' EXIT
+          docker logout ghcr.io
+          docker buildx imagetools inspect --raw "${REGISTRY_IMAGE}:${VERSION}" >"$version_raw"
+          docker buildx imagetools inspect --raw "${REGISTRY_IMAGE}:latest" >"$latest_raw"
+          if ! cmp -s "$version_raw" "$latest_raw"; then
+            echo "::error::base image latest does not match ${VERSION}"
+            exit 1
+          fi
+
+      - name: Create release tag
+        if: needs.checks.outputs.tag_exists != 'true'
         # Runs after BOTH the GHCR image push and the npm publish so a
         # transient failure in either does not leave a published git tag
-        # pointing at a half-released state. Idempotency guards on both
-        # tag creation and push handle re-runs after a tag-step blip:
-        # `git tag -f` overwrites a local tag of the same name (harmless
-        # on fresh runners where no local tag exists), and `git push
-        # --force` on the tag is scoped to the specific tag ref so it
-        # cannot rewrite branches or other refs.
+        # pointing at a half-released state. `reserve-version` already pushed
+        # (or recovered) the package.json-only bump before builds; tag that
+        # exact commit without moving main here. Existing tags are validated
+        # during preflight and never force-moved.
         #
         # Pushes here use the SSH deploy key configured by `actions/checkout`
         # above. That key — and only that key — is allowed to bypass the
         # `main` branch ruleset, so this step would fail with GH013
         # ("repository rule violations") if anything below tried to push
         # via the default GITHUB_TOKEN.
+        env:
+          BUMP_SHA: ${{ needs.reserve-version.outputs.bump_sha }}
         run: |
-          git config user.name "Typeey"
-          git config user.email "typeeybird@gmail.com"
-          git add package.json
-          git diff --staged --quiet || git commit -m "${{ needs.checks.outputs.version }}"
-          git push origin HEAD
-          git tag -f "${{ needs.checks.outputs.version }}"
-          git push --force origin "refs/tags/${{ needs.checks.outputs.version }}"
+          git fetch origin main
+          git cat-file -e "${BUMP_SHA}^{commit}"
+          git tag "${{ needs.checks.outputs.version }}" "$BUMP_SHA"
+          git push origin "refs/tags/${{ needs.checks.outputs.version }}"
 
       - name: Create GitHub Release
         # Idempotency guard: skip if the release for this tag already exists

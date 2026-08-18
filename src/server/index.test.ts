@@ -11,7 +11,9 @@ import type { CreateSessionForSubagent, SubagentRegistry } from '@/agent/subagen
 import { renderShard } from '@/bundled-plugins/memory/frontmatter'
 import { topicShardPath, topicsDir } from '@/bundled-plugins/memory/paths'
 import { createMemorySearchTool } from '@/bundled-plugins/memory/search-tool'
+import type { RuntimeRestarter } from '@/capabilities'
 import type { CronJob } from '@/cron'
+import { createRuntimeHealth, type RuntimeHealth } from '@/health'
 import { createPermissionService, type PermissionService } from '@/permissions'
 import { createHookBus, type HookBus, type PluginRegistry } from '@/plugin'
 import { emptyRegistry } from '@/plugin/registry'
@@ -134,6 +136,8 @@ async function startWithSession(
     tunnelManager?: TunnelManager
     runtimeVersion?: string
     containerName?: string
+    restarter?: RuntimeRestarter
+    health?: RuntimeHealth
   } = {},
 ): Promise<{ url: string }> {
   const pluginRuntime =
@@ -152,6 +156,8 @@ async function startWithSession(
     ...(extra.tunnelManager ? { tunnelManager: extra.tunnelManager } : {}),
     ...(extra.runtimeVersion !== undefined ? { runtimeVersion: extra.runtimeVersion } : {}),
     ...(extra.containerName !== undefined ? { containerName: extra.containerName } : {}),
+    ...(extra.restarter !== undefined ? { restarter: extra.restarter } : {}),
+    ...(extra.health !== undefined ? { health: extra.health } : {}),
   }).start()
   server = built
   return { url: `ws://localhost:${built.port}` }
@@ -413,6 +419,75 @@ describe('createServer tool event forwarding', () => {
   })
 })
 
+describe('createServer managed health contract', () => {
+  test('serves unauthenticated liveness while starting and stopping', async () => {
+    const health = createRuntimeHealth()
+    const built = createServer({
+      port: 0,
+      createSession: async () => createFakeSession(),
+      tuiToken: 'secret',
+      health,
+    }).start()
+    server = built
+
+    const liveUrl = `http://127.0.0.1:${built.port}/health/live`
+    await expect(fetch(liveUrl)).resolves.toMatchObject({ status: 200 })
+    expect(await (await fetch(liveUrl)).json()).toMatchObject({ status: 'starting', ready: false })
+
+    health.markStopping()
+    expect(await (await fetch(liveUrl)).json()).toMatchObject({ status: 'stopping', ready: false })
+  })
+
+  test('reports readiness only after boot and keeps degraded runtimes ready', async () => {
+    const health = createRuntimeHealth()
+    const built = createServer({ port: 0, createSession: async () => createFakeSession(), health }).start()
+    server = built
+    const readyUrl = `http://127.0.0.1:${built.port}/health/ready`
+
+    expect((await fetch(readyUrl)).status).toBe(503)
+
+    health.markReady()
+    let response = await fetch(readyUrl)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ status: 'ready', ready: true, degraded: false })
+
+    health.markDegraded('plugins')
+    response = await fetch(readyUrl)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      status: 'degraded',
+      ready: true,
+      degraded: true,
+      degradedComponents: ['plugins'],
+    })
+
+    health.markReplacementPending()
+    response = await fetch(readyUrl)
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({ status: 'replacing', ready: false })
+
+    response = await fetch(`http://127.0.0.1:${built.port}/health/live`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ status: 'replacing', ready: false })
+
+    health.markStopping()
+    expect((await fetch(readyUrl)).status).toBe(503)
+  })
+
+  test('preserves the legacy root response', async () => {
+    const built = createServer({
+      port: 0,
+      createSession: async () => createFakeSession(),
+      health: createRuntimeHealth(),
+    }).start()
+    server = built
+
+    const response = await fetch(`http://127.0.0.1:${built.port}/`)
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('typeclaw agent')
+  })
+})
+
 describe('createServer todo continuation (drain re-entrancy)', () => {
   test('consumes an idle continuation in the same drain pass instead of stalling', async () => {
     const agentDir = await mkdtemp(join(tmpdir(), 'server-todo-cont-'))
@@ -635,6 +710,32 @@ describe('createServer restart handling', () => {
       if (oldToken === undefined) delete process.env.TYPECLAW_HOSTD_TOKEN
       else process.env.TYPECLAW_HOSTD_TOKEN = oldToken
       hostd.stop(true)
+    }
+  })
+
+  test('uses the injected runtime restarter instead of hostd environment discovery', async () => {
+    const requests: Array<{ build: boolean }> = []
+    const restarter: RuntimeRestarter = {
+      requestRestart: async (request) => {
+        requests.push(request)
+        return { ok: true }
+      },
+    }
+    const session = createFakeSession()
+    const { url } = await startWithSession(session, { containerName: 'managed-agent', restarter })
+    const { ws, waitFor } = await connect(url)
+    try {
+      await waitFor((message) => message.type === 'connected')
+
+      ws.send(JSON.stringify({ type: 'restart' }))
+
+      await expect(waitFor((message) => message.type === 'restart_result')).resolves.toMatchObject({
+        type: 'restart_result',
+        status: 'accepted',
+      })
+      expect(requests).toEqual([{ build: false }])
+    } finally {
+      ws.close()
     }
   })
 

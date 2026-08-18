@@ -1215,7 +1215,9 @@ describe('base ↔ per-agent Dockerfile drift guard', () => {
 
   test('base Dockerfile installs the agent-browser CLI to the same global location the per-agent Dockerfile expects', () => {
     const base = buildBaseDockerfile()
-    expect(base).toContain('bun install -g agent-browser@^0.33.0')
+    expect(base).toContain('BUN_INSTALL=/usr/local bun install -g agent-browser@^0.33.0')
+    expect(base).toContain('/usr/local/install/global/node_modules/agent-browser')
+    expect(base).toContain('chmod 0755')
   })
 
   test('base Dockerfile downloads Chrome for Testing on amd64 — without it the per-agent image would FROM a base that lacks the browser binary and `agent-browser install` would have to redo it', () => {
@@ -1232,6 +1234,14 @@ describe('base ↔ per-agent Dockerfile drift guard', () => {
     const base = buildBaseDockerfile()
     expect(base).toContain('/root/.agent-browser/config.json')
     expect(base).toContain('/usr/bin/chromium')
+    expect(base).toContain('ln -sfn /usr/bin/chromium /usr/local/bin/typeclaw-chromium')
+  })
+
+  test('base Dockerfile relocates amd64 Chrome beneath /usr and gives the wrapper a stable non-root path', () => {
+    const base = buildBaseDockerfile()
+    expect(base).toContain('mv /root/.agent-browser/browsers /usr/local/lib/typeclaw/agent-browser-browsers')
+    expect(base).toContain('/usr/local/bin/typeclaw-chromium')
+    expect(base).toContain('export AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/typeclaw-chromium')
   })
 
   test('base Dockerfile omits gh keyring bootstrap — toggle-driven layers live in the per-agent Dockerfile so typeclaw.json toggles do not force a base-image rebuild', () => {
@@ -1423,6 +1433,12 @@ describe('versioned per-agent Dockerfile (base-image-pinning)', () => {
 })
 
 describe('network egress entrypoint shim', () => {
+  test('allows a managed image to override the CLI entry while preserving the host default', () => {
+    const shim = buildEntrypointShim()
+    expect(shim).toContain(`typeclaw_cli_entry="\${TYPECLAW_CLI_ENTRY:-${TYPECLAW_CLI_ENTRY}}"`)
+    expect(shim.match(/bun --smol run "\$typeclaw_cli_entry" "\$@"/g)).toHaveLength(3)
+  })
+
   test('re-execs the runtime under the host UID/GID after root-only bootstrap on both network paths', () => {
     // given
     const shim = buildEntrypointShim()
@@ -1504,11 +1520,23 @@ describe('network egress entrypoint shim', () => {
     expect(shim).toContain('rmSync(from);')
     // Must run in the root phase, after runtime_home is set and BEFORE the
     // privilege-drop re-exec, so custom dirs under root-owned roots still work.
-    const callIdx = shim.indexOf('link_custom_claude_credentials\n')
     const runtimeHomeIdx = shim.indexOf('runtime_home="${TYPECLAW_RUNTIME_HOME:-/home/agent}"')
+    const callIdx = shim.indexOf('link_custom_claude_credentials || true', runtimeHomeIdx)
     const firstDropIdx = shim.indexOf('exec setpriv --reuid')
     expect(callIdx).toBeGreaterThan(runtimeHomeIdx)
     expect(callIdx).toBeLessThan(firstDropIdx)
+  })
+
+  test('fails closed on custom Claude credentials in the already-non-root managed branch', () => {
+    const shim = buildEntrypointShim()
+    const runtimeBranchStart = shim.indexOf('if [ "${TYPECLAW_ENTRYPOINT_RUNTIME:-0}" = "1" ]; then')
+    const runtimeBranchEnd = shim.indexOf('\nfi\n', runtimeBranchStart)
+    const runtimeBranch = shim.slice(runtimeBranchStart, runtimeBranchEnd)
+
+    expect(runtimeBranch).toContain('runtime_home="${TYPECLAW_RUNTIME_HOME:-${HOME:-/home/agent}}"')
+    expect(runtimeBranch).toContain('if [ "${TYPECLAW_DEPLOYMENT_PROFILE:-host}" = "managed" ]; then')
+    expect(runtimeBranch).toContain('    link_custom_claude_credentials\n')
+    expect(runtimeBranch).toContain('    link_custom_claude_credentials || true\n')
   })
 
   test('runs configured symlinks, Xvfb, and bun in the non-root runtime phase without legacy persistence links', () => {
@@ -1525,7 +1553,7 @@ describe('network egress entrypoint shim', () => {
     expect(shim).not.toContain('link_persistent_home_files')
     expect(runtimeBranch).toContain('link_configured_symlinks')
     expect(runtimeBranch).toContain('start_xvfb')
-    expect(runtimeBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(runtimeBranch).toContain('exec bun --smol run "$typeclaw_cli_entry" "$@"')
   })
 
   test('off-switch path (network.blockInternal=false) installs no iptables rules and reaches the runtime phase before bun starts', () => {
@@ -1540,7 +1568,7 @@ describe('network egress entrypoint shim', () => {
     // then
     expect(offBranch).not.toContain('iptables -A OUTPUT')
     expect(offBranch).toContain('TYPECLAW_ENTRYPOINT_RUNTIME=1')
-    expect(offBranch).toContain(`exec env HOME="$runtime_home" bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(offBranch).toContain('exec env HOME="$runtime_home" bun --smol run "$typeclaw_cli_entry" "$@"')
   })
 
   test('shim self-heals on Xvfb presence: spawns Xvfb directly (not xvfb-run, which hangs as PID 1) and exports DISPLAY', () => {
@@ -1630,7 +1658,7 @@ describe('network egress entrypoint shim', () => {
   test('drops NET_ADMIN from bounding+inheritable+ambient sets before exec-ing (matches setpriv(1) warning)', () => {
     const shim = buildEntrypointShim()
     expect(shim).toContain(
-      `exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`,
+      'exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun --smol run "$typeclaw_cli_entry" "$@"',
     )
   })
 
@@ -1646,7 +1674,7 @@ describe('network egress entrypoint shim', () => {
 
     // then
     expect(runtimeBranch.indexOf('start_xvfb\n')).toBeLessThan(
-      runtimeBranch.indexOf(`exec bun --smol run ${TYPECLAW_CLI_ENTRY}`),
+      runtimeBranch.indexOf('exec bun --smol run "$typeclaw_cli_entry"'),
     )
     expect(networkOnTail.indexOf('start_xvfb\n')).toBeLessThan(
       networkOnTail.indexOf(`exec env HOME="$runtime_home" setpriv --bounding-set`),
@@ -1697,7 +1725,7 @@ describe('network egress entrypoint shim', () => {
     expect(offBranchEnd).toBeGreaterThan(-1)
     const offBranch = shim.slice(offBranchStart, offBranchEnd)
     expect(offBranch).not.toContain('iptables -A OUTPUT')
-    expect(offBranch).toContain(`exec env HOME="$runtime_home" bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(offBranch).toContain('exec env HOME="$runtime_home" bun --smol run "$typeclaw_cli_entry" "$@"')
     expect(offBranch).not.toMatch(/exec setpriv [^\n]*-- bun --smol run/)
   })
 
@@ -1818,10 +1846,10 @@ describe('network egress entrypoint shim', () => {
     const networkOffBranch = shim.slice(networkOffStart, networkOffEnd)
     const networkOnTail = shim.slice(shim.lastIndexOf('if [ -n "${TYPECLAW_HOST_UID:-}" ]'))
 
-    expect(runtimeBranch).toContain(`exec bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
-    expect(networkOffBranch).toContain(`exec env HOME="$runtime_home" bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`)
+    expect(runtimeBranch).toContain('exec bun --smol run "$typeclaw_cli_entry" "$@"')
+    expect(networkOffBranch).toContain('exec env HOME="$runtime_home" bun --smol run "$typeclaw_cli_entry" "$@"')
     expect(networkOnTail).toContain(
-      `exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun --smol run ${TYPECLAW_CLI_ENTRY} "$@"`,
+      'exec env HOME="$runtime_home" setpriv --bounding-set -net_admin --inh-caps -net_admin --ambient-caps -net_admin -- bun --smol run "$typeclaw_cli_entry" "$@"',
     )
   })
 })
@@ -2068,6 +2096,50 @@ exit 0
     expect(await proc.exited).toBe(0)
 
     // then: the real file is GONE — replaced by a symlink into the runtime HOME
+    const customCred = join(customConfigDir, '.credentials.json')
+    expect(lstatSync(customCred).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(customCred)).toBe(join(runtimeHome, '.claude', '.credentials.json'))
+    rmSync(workdir, { recursive: true, force: true })
+  })
+
+  test('managed runtime aliases CLAUDE_CONFIG_DIR loaded only from the Agent Folder .env', async () => {
+    const realBun = Bun.which('bun')
+    if (!realBun) throw new Error('bun not on host PATH')
+
+    const workdir = mkdtempSync(join(tmpdir(), 'typeclaw-shim-managed-dotenv-'))
+    const agentDir = join(workdir, 'agent')
+    const bin = join(workdir, 'bin')
+    await mkdir(agentDir, { recursive: true })
+    await mkdir(bin, { recursive: true })
+    await symlinkHostBinaries(bin, ['mkdir', 'ln', 'readlink', 'env', 'sh', 'rm', 'dirname'])
+    // Execute the alias helper with real Bun so its automatic .env loading is
+    // identical to the final TypeClaw process. The final CLI invocation is a
+    // no-op, keeping the test focused on entrypoint security.
+    await writeShellScript(
+      join(bin, 'bun'),
+      `#!/bin/sh\nfor a in "$@"; do [ "$a" = "-e" ] && exec ${realBun} "$@"; done\nexit 0\n`,
+    )
+
+    const shimPath = join(workdir, 'shim.sh')
+    await writeShellScript(shimPath, buildEntrypointShim())
+    const runtimeHome = join(workdir, 'runtime-home')
+    const customConfigDir = join(agentDir, 'workspace', 'claude')
+    await writeFile(join(agentDir, '.env'), `CLAUDE_CONFIG_DIR=${customConfigDir}\n`)
+
+    const proc = Bun.spawn(['/bin/sh', shimPath, 'run'], {
+      cwd: agentDir,
+      env: {
+        PATH: bin,
+        HOME: runtimeHome,
+        TYPECLAW_RUNTIME_HOME: runtimeHome,
+        TYPECLAW_ENTRYPOINT_RUNTIME: '1',
+        TYPECLAW_DEPLOYMENT_PROFILE: 'managed',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(await proc.exited).toBe(0)
+
     const customCred = join(customConfigDir, '.credentials.json')
     expect(lstatSync(customCred).isSymbolicLink()).toBe(true)
     expect(readlinkSync(customCred)).toBe(join(runtimeHome, '.claude', '.credentials.json'))
@@ -2739,8 +2811,8 @@ describe('buildKit: false (legacy-builder Dockerfile for hosts without buildx)',
   test('the agent-browser install RUN is well-formed in both modes', () => {
     const bk = buildDockerfile(allTogglesOn, { baseImageVersion: null })
     const lg = buildDockerfile(allTogglesOn, { baseImageVersion: null, buildKit: false })
-    expect(bk).toContain('RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \\')
-    expect(lg).toContain('RUN bun install -g agent-browser')
+    expect(bk).toContain('RUN --mount=type=cache,target=/usr/local/install/cache,sharing=locked \\')
+    expect(lg).toContain('RUN BUN_INSTALL=/usr/local bun install -g agent-browser')
   })
 
   test('legacy mode strips structurally-unsafe append lines (heredoc `<<`) but still emits ENTRYPOINT/CMD', () => {

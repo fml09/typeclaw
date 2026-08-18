@@ -1391,12 +1391,12 @@ describe('writeDockerAssets', () => {
     await writeDockerAssets(root)
 
     const dockerfile = await readFile(join(root, 'Dockerfile'), 'utf8')
-    // The bun install -g RUN must mount /root/.bun/install/cache. This is
-    // the path bun uses for its global tarball cache (see bun docs); a
-    // miss without the mount means re-downloading every dependency of
-    // agent-browser on every CLI version bump.
+    // The bun install -g RUN uses the non-root-readable /usr/local global
+    // prefix, so its tarball cache must be mounted at the matching install
+    // cache. A miss means re-downloading every agent-browser dependency on
+    // every CLI version bump.
     expect(dockerfile).toMatch(
-      /--mount=type=cache,target=\/root\/\.bun\/install\/cache[\s\S]+?bun install -g agent-browser/,
+      /--mount=type=cache,target=\/usr\/local\/install\/cache[\s\S]+?BUN_INSTALL=\/usr\/local bun install -g agent-browser/,
     )
   })
 

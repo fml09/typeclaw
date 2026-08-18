@@ -41,7 +41,15 @@ import {
   type SubagentCompletionBridge,
 } from '@/channels'
 import { createTunnelBridge, type TunnelBridge } from '@/channels/tunnel-bridge'
-import { createConfigReloadable, getConfig, loadConfigBundleSync, reloadConfig, withDefaultPlugins } from '@/config'
+import {
+  createConfigReloadable,
+  getConfig,
+  GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE,
+  loadConfigBundleSync,
+  reloadConfig,
+  withDefaultPlugins,
+} from '@/config'
+import type { DeploymentProfile } from '@/container/controller'
 import {
   type CountStore,
   type CronConsumer,
@@ -57,10 +65,20 @@ import {
   type Scheduler,
 } from '@/cron'
 import { logDependencyBinProblems, registerDependencyBinDoctorCheck, validateDependencyBins } from '@/dependencies'
+import { createRuntimeHealth } from '@/health'
 import { CLI_VERSION } from '@/init/cli-version'
-import { createMcpManager, resolveContainerMcpOAuthStore, TypeClawMcpOAuthProvider } from '@/mcp'
+import { createMcpManager, TypeClawMcpOAuthProvider } from '@/mcp'
 import { runStartupMigrations } from '@/migrations'
-import { loadPlugins, type LoadPluginsResult, pluginCronJobs, type PluginRegistry, summarizeLoaded } from '@/plugin'
+import {
+  loadPluginEntry,
+  type LoadPluginEntryFn,
+  loadPlugins,
+  type LoadPluginsResult,
+  pluginCronJobs,
+  type PluginRegistry,
+  splitPluginEntrySpec,
+  summarizeLoaded,
+} from '@/plugin'
 import { createPluginLogger } from '@/plugin/context'
 import type { CronHandlerContext } from '@/plugin/types'
 import { createContainerBroker, publishForwardResult, subscribeForwardRequest } from '@/portbroker'
@@ -91,6 +109,7 @@ import { installFatalGuard } from './fatal-guard'
 import { installLlmFetchObserver } from './llm-fetch-observer'
 import { createPluginRuntime, type PluginRuntime, type PluginSubagentEntry } from './plugin-runtime'
 import { logResourceReport } from './resource-report'
+import { createRuntimeShutdownHandler } from './shutdown'
 import { acquireSubagentCoalesceLease } from './subagent-coalescing'
 
 type BunServer = ReturnType<Server['start']>
@@ -109,6 +128,30 @@ export type SchedulerFactory = (options: {
 }) => Scheduler | Promise<Scheduler>
 export type ChannelManagerFactory = typeof createChannelManager
 export type TunnelManagerFactory = (options: TunnelManagerOptions) => TunnelManager
+
+// Managed images own the injected GWS default at /node_modules. An explicit
+// typeclaw.json entry remains user-owned and resolves from the Agent Folder as
+// before, so derived images and hydrated plugins can intentionally override it.
+export function createManagedDefaultPluginLoader(
+  profile: DeploymentProfile,
+  configuredEntries: readonly string[],
+  preferredPackageSearchDir = '/',
+): LoadPluginEntryFn | undefined {
+  if (profile !== 'managed') return undefined
+  const configuredPackages = new Set(configuredEntries.map((entry) => splitPluginEntrySpec(entry).name))
+  const preferredPackages = new Set([GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE])
+  const explicitGws = configuredPackages.has(GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE)
+  return (entry, agentDir) => {
+    if (splitPluginEntrySpec(entry).name !== GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE) {
+      return loadPluginEntry(entry, agentDir)
+    }
+    return loadPluginEntry(entry, agentDir, {
+      preferredPackageSearchDir: explicitGws ? agentDir : preferredPackageSearchDir,
+      preferredPackageSearchBoundaryDir: explicitGws ? agentDir : preferredPackageSearchDir,
+      preferredPackages,
+    })
+  }
+}
 
 export type StartAgentOptions = {
   port: number
@@ -162,20 +205,37 @@ export type StartAgentResult = {
 // try. Cleanups are idempotent, so the success path's `stop()` never double-fires.
 export async function startAgent(options: StartAgentOptions): Promise<StartAgentResult> {
   const bootCleanups: Array<() => void | Promise<void>> = []
-  try {
-    return await startAgentRuntime(options, (cleanup) => {
-      bootCleanups.push(cleanup)
-    })
-  } catch (err) {
-    for (const cleanup of bootCleanups.reverse()) {
-      try {
-        await cleanup()
-      } catch (cleanupErr) {
-        console.warn(
-          `[run] boot-failure cleanup error: ${cleanupErr instanceof Error ? cleanupErr.message : cleanupErr}`,
-        )
-      }
+  let cleanupComplete = false
+  let cleanupPromise: Promise<void> | null = null
+  const runCleanup = async (cleanup: () => void | Promise<void>): Promise<void> => {
+    try {
+      await cleanup()
+    } catch (cleanupErr) {
+      console.warn(`[run] boot cleanup error: ${cleanupErr instanceof Error ? cleanupErr.message : cleanupErr}`)
     }
+  }
+  const registerBootCleanup = (cleanup: () => void | Promise<void>): void => {
+    if (cleanupComplete) {
+      void runCleanup(cleanup)
+      return
+    }
+    bootCleanups.push(cleanup)
+  }
+  const drainBootCleanups = (): Promise<void> => {
+    if (cleanupPromise !== null) return cleanupPromise
+    cleanupPromise = (async () => {
+      while (bootCleanups.length > 0) {
+        const cleanup = bootCleanups.pop()
+        if (cleanup !== undefined) await runCleanup(cleanup)
+      }
+      cleanupComplete = true
+    })()
+    return cleanupPromise
+  }
+  try {
+    return await startAgentRuntime(options, registerBootCleanup, drainBootCleanups)
+  } catch (err) {
+    await drainBootCleanups()
     throw err
   }
 }
@@ -199,8 +259,10 @@ async function startAgentRuntime(
     refreshProviderOAuth = refreshProviderOAuthForAgent,
   }: StartAgentOptions,
   registerBootCleanup: (cleanup: () => void | Promise<void>) => void,
+  drainBootCleanups: () => Promise<void>,
 ): Promise<StartAgentResult> {
   const reloadRegistry = new ReloadRegistry()
+  const health = createRuntimeHealth()
 
   // Wrap globalThis.fetch BEFORE any plugin/session/manager construction so
   // every LLM provider stream from anywhere in the container is guarded. Logs
@@ -213,15 +275,23 @@ async function startAgentRuntime(
   // TYPECLAW_LLM_FETCH_OBSERVER=off.
   const uninstallLlmFetchObserver = installLlmFetchObserver()
 
-  // The host CLI sets TYPECLAW_CONTAINER_NAME when it `docker run`s us. When
-  // running outside a typeclaw container (tests, ad-hoc `bun run typeclaw run`
-  // outside docker), the env var is absent and the `restart` tool is omitted —
-  // which is what we want, since there is no host daemon to honor it anyway.
-  const containerName = process.env.TYPECLAW_CONTAINER_NAME
+  // Host mode identifies the runtime with TYPECLAW_CONTAINER_NAME. Managed
+  // platforms bind the same self-restart capability to TYPECLAW_RUNTIME_ID so
+  // TypeClaw does not need a Kubernetes object name or API credentials.
+  const containerName =
+    caps.deploymentProfile === 'managed' ? process.env.TYPECLAW_RUNTIME_ID : process.env.TYPECLAW_CONTAINER_NAME
   const containerNameOpt = containerName !== undefined ? { containerName } : {}
+  const restarter = caps.restarter ?? undefined
+  const restarterOpt = restarter !== undefined ? { restarter } : {}
   const runtimeVersionOpt = { runtimeVersion: CLI_VERSION }
   const tuiToken = process.env.TYPECLAW_TUI_TOKEN
   const tuiTokenOpt = tuiToken !== undefined && tuiToken !== '' ? { tuiToken } : {}
+  let channelManagerForShutdown: ChannelManager | null = null
+  let stopForShutdown: (() => void | Promise<void>) | null = null
+  let terminationRequested = false
+  const assertBootActive = (): void => {
+    if (terminationRequested) throw new Error('runtime startup interrupted by SIGTERM')
+  }
 
   // Install the crash guard FIRST, before any plugin/channel/session
   // construction, so an `unhandledRejection` escaping a channel SDK during boot
@@ -234,13 +304,39 @@ async function startAgentRuntime(
       ? {
           requestRestart: async (reason: string) => {
             console.warn(`[fatal-guard] requesting container restart: ${reason}`)
-            const result = await requestContainerRestart({ containerName })
+            const result = await requestContainerRestart({ containerName, ...restarterOpt })
             return result.ok ? { ok: true } : { ok: false, reason: result.reason }
           },
         }
       : {}),
-    onDegrade: (scope, reason) => console.warn(`[fatal-guard] ${scope} degraded: ${reason}`),
+    onDegrade: (scope, reason) => {
+      health.markDegraded(scope)
+      console.warn(`[fatal-guard] ${scope} degraded: ${reason}`)
+    },
+    onReplacementPending: () => health.markReplacementPending(),
   })
+
+  // Install the supervised-runtime SIGTERM owner before any plugin, consumer,
+  // channel, or server can accept work. During boot it drains every cleanup
+  // registered so far; after boot it delegates to the full ordered stop().
+  // Either way readiness falls synchronously and continuation handoff precedes
+  // teardown. A second CLI-level SIGTERM owner would race this sequence.
+  let sigtermHandler: (() => void) | null = null
+  sigtermHandler = createRuntimeShutdownHandler({
+    markStopping: () => {
+      terminationRequested = true
+      health.markStopping()
+    },
+    prepareHandoff: async () => {
+      await prepareRuntimeShutdownHandoff(cwd, channelManagerForShutdown)
+    },
+    stop: async () => {
+      const stop = stopForShutdown
+      if (stop === null) await drainBootCleanups()
+      else await stop()
+    },
+  })
+  process.on('SIGTERM', sigtermHandler)
 
   // Both process-global disposers are surrendered to the wrapper as one unit the
   // instant they exist, so a throw anywhere below detaches them; `stop()` calls
@@ -251,16 +347,15 @@ async function startAgentRuntime(
     processGlobalsDisposed = true
     uninstallLlmFetchObserver()
     fatalGuard.dispose()
-    // onSigterm is defined later in this scope but only ever invoked after init;
-    // removing it here keeps a restarted startAgent() from stacking listeners.
+    // Removing the early owner keeps a restarted startAgent() from stacking
+    // listeners in embeddings and tests.
     if (sigtermHandler !== null) process.removeListener('SIGTERM', sigtermHandler)
   }
-  let sigtermHandler: (() => void) | null = null
   registerBootCleanup(disposeProcessGlobals)
 
   const { config: cwdConfig, pluginConfigs: pluginConfigsByName } = loadConfigBundleSync(cwd)
   const githubTokenBridge = createGithubTokenBridge()
-  const mcpOAuthStore = resolveContainerMcpOAuthStore(process.env, join(cwd, 'secrets.json'))
+  const mcpOAuthStore = caps.mcpOAuthStore
   const mcpManager =
     cwdConfig.mcpServers.length > 0
       ? createMcpManager(cwdConfig.mcpServers, {
@@ -285,7 +380,10 @@ async function startAgentRuntime(
   if (mcpManager !== null) {
     void mcpManager.connectAll().then((results) => {
       for (const result of results) {
-        if (!result.ok) console.warn(`[mcp] ${result.name} failed to connect: ${result.error.message}`)
+        if (!result.ok) {
+          health.markDegraded(`mcp:${result.name}`)
+          console.warn(`[mcp] ${result.name} failed to connect: ${result.error.message}`)
+        }
       }
     })
   }
@@ -296,10 +394,12 @@ async function startAgentRuntime(
   // MCP warm-up so its servers can't leak — startAgent returns no stop() handler
   // on this path, so this is the only cleanup chance. closeAll() also closes any
   // connection the warm-up establishes after shutdown begins.
+  const managedDefaultPluginLoader = createManagedDefaultPluginLoader(caps.deploymentProfile, cwdConfig.plugins)
   const pluginsLoadedPromise = loadPlugins({
     entries: withDefaultPlugins(cwdConfig.plugins),
     agentDir: cwd,
     configsByName: pluginConfigsByName,
+    ...(managedDefaultPluginLoader !== undefined ? { loadEntry: managedDefaultPluginLoader } : {}),
     bundled: BUNDLED_PLUGINS,
     resolveGithubTokenForRepo: githubTokenBridge.resolveTokenForRepo,
     hasGithubAppTokenResolver: githubTokenBridge.hasAppTokenResolver,
@@ -315,6 +415,7 @@ async function startAgentRuntime(
   try {
     const [loaded] = await Promise.all([pluginsLoadedPromise, vectorStartupPromise])
     pluginsLoaded = loaded
+    assertBootActive()
   } catch (err) {
     if (mcpManager !== null) await mcpManager.closeAll()
     throw err
@@ -396,6 +497,7 @@ async function startAgentRuntime(
     agentDir: cwd,
     log: (message) => console.warn(message),
   })
+  assertBootActive()
 
   // When the user has `docker.file.codexCli: true` AND a typeclaw-managed
   // openai-codex OAuth credential in secrets.json, write ~/.codex/auth.json
@@ -434,6 +536,10 @@ async function startAgentRuntime(
   const tunnelManager: TunnelManager = createTunnelManagerFor({
     tunnels: getConfig().tunnels,
     stream,
+    onDegrade: (component, reason) => {
+      health.markDegraded(component)
+      console.warn(`[health] ${component} degraded: ${reason}`)
+    },
     resolveChannelUpstreamPort: (name) => {
       if (name === 'github') return getConfig().channels.github?.webhookPort ?? null
       return null
@@ -449,6 +555,10 @@ async function startAgentRuntime(
     secretsProvider: caps.secrets,
     channelsConfigRef: () => getConfig().channels,
     aliasesRef: () => getConfig().alias,
+    onDegrade: (component, reason) => {
+      health.markDegraded(component)
+      console.warn(`[health] ${component} degraded: ${reason}`)
+    },
     tunnelUrlForChannel: (name) => resolveTunnelUrlForChannel(name, tunnelManager),
     tunnelConfiguredForChannel: (name) => isTunnelConfiguredForChannel(name),
     createSessionForChannel: buildChannelSessionFactory({
@@ -467,6 +577,7 @@ async function startAgentRuntime(
       subagentRegistry: pluginRuntime.get().subagents,
       getCreateSessionForSubagent: () => createSessionForSubagent,
       ...containerNameOpt,
+      ...restarterOpt,
       ...runtimeVersionOpt,
       ...mcpManagerOpt,
     }),
@@ -487,8 +598,8 @@ async function startAgentRuntime(
     },
     // Always registered so /restart's presence in /help, the Slack manifest,
     // and the Discord declarations is environment-independent. When there is no
-    // container to bounce (TYPECLAW_CONTAINER_NAME unset — tests, ad-hoc
-    // `typeclaw run` outside Docker), the handler reports that instead of the
+    // runtime to replace (TYPECLAW_RUNTIME_ID / TYPECLAW_CONTAINER_NAME unset —
+    // tests, ad-hoc `typeclaw run` outside a platform), the handler reports that instead of the
     // command resolving as unknown, which would make the advertised contract
     // depend on the runtime environment.
     onRestart: async (ctx): Promise<string> => {
@@ -504,6 +615,7 @@ async function startAgentRuntime(
       // container just bounces — the next inbound resumes pending todos.
       const result = await requestContainerRestart({
         containerName,
+        ...restarterOpt,
         ...(ctx !== undefined
           ? {
               stream,
@@ -520,6 +632,7 @@ async function startAgentRuntime(
       return result.ok ? 'Restart scheduled; the container will bounce shortly.' : `Restart denied: ${result.reason}`
     },
   })
+  channelManagerForShutdown = channelManager
 
   const createSessionForSubagent: import('@/agent/subagents').CreateSessionForSubagent = async (
     subagent,
@@ -651,6 +764,7 @@ async function startAgentRuntime(
     },
   })
   registerBootCleanup(() => subagentConsumer.stop())
+  assertBootActive()
   subagentConsumer.start()
 
   // Populated by startScheduler's factory (onCountStore). The consumer
@@ -701,6 +815,7 @@ async function startAgentRuntime(
             signal: abortController.signal,
             runtimeVersion: runtimeVersionOpt.runtimeVersion,
             containerName: containerNameOpt.containerName,
+            ...restarterOpt,
             sessionFactory,
             channelRouter: channelManager.router,
             ...mcpManagerOpt,
@@ -759,6 +874,7 @@ async function startAgentRuntime(
         subagentRegistry: pluginRuntime.get().subagents,
         createSessionForSubagent,
         ...containerNameOpt,
+        ...restarterOpt,
         ...runtimeVersionOpt,
         ...mcpManagerOpt,
       })
@@ -791,6 +907,7 @@ async function startAgentRuntime(
   // the subscription exists would be lost. Subscribing to an empty stream is
   // harmless when there are no jobs.
   registerBootCleanup(() => cronConsumer.stop())
+  assertBootActive()
   cronConsumer.start()
   const scheduler = await startScheduler({
     cwd,
@@ -803,7 +920,12 @@ async function startAgentRuntime(
     onCountStore: (store) => {
       cronCountStore = store
     },
+    onDegrade: (reason) => {
+      health.markDegraded('scheduler')
+      console.warn(`[health] scheduler degraded: ${reason}`)
+    },
   })
+  assertBootActive()
 
   if (scheduler) {
     reloadRegistry.register(
@@ -886,7 +1008,9 @@ async function startAgentRuntime(
   }
 
   registerBootCleanup(() => channelManager.stop())
+  assertBootActive()
   await channelManager.start()
+  assertBootActive()
 
   if (restartReservation !== null) {
     try {
@@ -970,6 +1094,7 @@ async function startAgentRuntime(
   }
 
   for (const f of pluginsLoaded.failedPlugins) {
+    health.markDegraded('plugins')
     console.warn(`[plugin] DEGRADED: "${f.entry}" disabled (${f.phase}): ${f.error}`)
   }
 
@@ -1005,6 +1130,7 @@ async function startAgentRuntime(
       agentDir: cwd,
       runtimeVersion: CLI_VERSION,
       containerName,
+      ...restarterOpt,
       outbound,
       sessionFactory,
       channelRouter: channelManager.router,
@@ -1026,17 +1152,20 @@ async function startAgentRuntime(
     claimController,
     commandRunnerFactory,
     tunnelManager,
+    health,
     liveSubagentRegistry,
     subagentCoalescer,
     createSessionForSubagent,
     liveSessionRegistry,
     ...containerNameOpt,
+    ...restarterOpt,
     ...runtimeVersionOpt,
     ...tuiTokenOpt,
     ...containerBrokerOpt,
   })
   let server: BunServer | null = null
   registerBootCleanup(() => server?.stop(true))
+  assertBootActive()
   server = serverFactory.start()
 
   // Tunnel manager starts AFTER the WS server is up so a slow/hanging
@@ -1045,12 +1174,16 @@ async function startAgentRuntime(
   // synchronously; future managed providers will resolve asynchronously
   // and broadcast URL events when ready.
   registerBootCleanup(() => tunnelManager.stop())
+  assertBootActive()
   await tunnelManager.start()
+  assertBootActive()
+  health.markReady()
 
   let stopped = false
   const stop = async () => {
     if (stopped) return
     stopped = true
+    health.markStopping()
     // The final disposers run in `finally` so an earlier async teardown
     // rejection cannot strand process-global listeners or plugin-owned handles
     // into the next `startAgent`.
@@ -1072,38 +1205,7 @@ async function startAgentRuntime(
       disposeProcessGlobals()
     }
   }
-
-  // Graceful shutdown on host-initiated restart (`typeclaw restart` → docker
-  // stop → SIGTERM, ~10s before SIGKILL). Mark every live session's todo scope
-  // so the turn this restart aborts does not arm the durable user-abort block —
-  // each scope's incomplete todos then auto-continue after the new container
-  // boots. Then run best-effort teardown. A hard deadline force-exits well
-  // inside Docker's grace window so a hung turn can't get the process SIGKILL'd
-  // mid-flush. Only meaningful inside a container; outside Docker SIGTERM is an
-  // ordinary stop with nothing to resume.
-  const SHUTDOWN_DEADLINE_MS = 8_000
-  let shuttingDown = false
-  const onSigterm = (): void => {
-    if (shuttingDown) return
-    shuttingDown = true
-    const forceExit = setTimeout(() => process.exit(0), SHUTDOWN_DEADLINE_MS)
-    forceExit.unref()
-    void (async () => {
-      if (containerName !== undefined) {
-        // Persist the interrupted-subagent handoff BEFORE markRestartAbortForAllLive
-        // aborts the sessions and stop() tears them down — both read the same live
-        // set this write depends on.
-        await channelManager.router.writeInterruptedSubagentHandoff().catch(() => undefined)
-        await markRestartAbortPendingForOrigin(cwd, { kind: 'tui', sessionId: 'tui' }).catch(() => undefined)
-        await channelManager.router.markRestartAbortForAllLive().catch(() => undefined)
-      }
-      await stop().catch(() => undefined)
-      clearTimeout(forceExit)
-      process.exit(0)
-    })()
-  }
-  sigtermHandler = onSigterm
-  process.on('SIGTERM', onSigterm)
+  stopForShutdown = stop
 
   if (!attachTui) {
     return {
@@ -1139,6 +1241,20 @@ async function startAgentRuntime(
     channelManager,
     stop,
   }
+}
+
+// SIGTERM is a supervised-runtime lifecycle event, not a self-restart event.
+// Rollouts and evictions need the same continuation state even when no restart
+// relay (and therefore no TYPECLAW_RUNTIME_ID) is configured.
+export async function prepareRuntimeShutdownHandoff(
+  cwd: string,
+  channelManager: Pick<ChannelManager, 'router'> | null,
+): Promise<void> {
+  if (channelManager !== null) {
+    await channelManager.router.writeInterruptedSubagentHandoff().catch(() => undefined)
+  }
+  await markRestartAbortPendingForOrigin(cwd, { kind: 'tui', sessionId: 'tui' }).catch(() => undefined)
+  if (channelManager !== null) await channelManager.router.markRestartAbortForAllLive().catch(() => undefined)
 }
 
 async function runVectorStartup(cwd: string): Promise<void> {
@@ -1205,6 +1321,7 @@ export async function startScheduler({
   hasInternalJobs,
   getSubagents,
   onCountStore,
+  onDegrade,
 }: {
   cwd: string
   loadCron: LoadCronFn
@@ -1214,6 +1331,7 @@ export async function startScheduler({
   hasInternalJobs: boolean
   getSubagents?: () => SubagentRegistry
   onCountStore?: (store: CountStore) => void
+  onDegrade?: (reason: string) => void
 }): Promise<Scheduler | null> {
   let result: LoadCronResult
   const subagents = getSubagents?.()
@@ -1230,11 +1348,14 @@ export async function startScheduler({
   // give up only when there is nothing to schedule at all.
   if (!result.ok) {
     console.error(`[cron] failed to load cron.json: ${result.reason}`)
+    onDegrade?.(result.reason)
     if (!hasInternalJobs) return null
   } else {
-    for (const warning of result.warnings ?? []) {
+    const warnings = result.warnings ?? []
+    for (const warning of warnings) {
       console.error(`[cron] skipped invalid job at boot: ${warning.reason}`)
     }
+    if (warnings.length > 0) onDegrade?.(warnings.map((warning) => warning.reason).join('; '))
   }
 
   const file: CronFile = result.ok ? (result.file ?? { jobs: [] }) : { jobs: [] }

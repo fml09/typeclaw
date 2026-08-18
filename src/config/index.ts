@@ -14,6 +14,7 @@ export {
   gitSchema,
   gitignoreSchema,
   GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE,
+  GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION,
   GWS_MULTI_ACCOUNT_PLUGIN_VERSION,
   thinkingLevelSchema,
   loadConfigBundleSync,

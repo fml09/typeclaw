@@ -29,6 +29,49 @@ describe('requestContainerRestart', () => {
     await rm(agentDir, { recursive: true, force: true })
   })
 
+  test('uses an injected runtime restarter before consulting hostd environment', async () => {
+    const requests: Array<{ build: boolean }> = []
+    const result = await requestContainerRestart({
+      containerName: 'managed-agent',
+      restarter: {
+        async requestRestart(request) {
+          requests.push(request)
+          return { ok: true }
+        },
+      },
+      build: false,
+      restartedAt: '2026-08-18T12:34:56.000Z',
+    })
+
+    expect(requests).toEqual([{ build: false }])
+    expect(result).toEqual({
+      ok: true,
+      containerName: 'managed-agent',
+      restartedAt: '2026-08-18T12:34:56.000Z',
+    })
+  })
+
+  test('treats an explicit null restarter as authoritative instead of falling back to hostd', async () => {
+    let requests = 0
+    server = Bun.serve({
+      port: 0,
+      fetch() {
+        requests++
+        return Response.json({ ok: true, result: { containerName: 'wrong', scheduled: true } })
+      },
+    })
+
+    const result = await requestContainerRestart({
+      containerName: 'managed-agent',
+      restarter: null,
+      hostdUrl: `http://127.0.0.1:${server.port}`,
+      hostdToken: 'stale-token',
+    })
+
+    expect(result.ok).toBe(false)
+    expect(requests).toBe(0)
+  })
+
   test('uses HTTP transport and returns the accepted restart timestamp', async () => {
     // given
     const requests: Array<{ auth: string | null; body: unknown }> = []

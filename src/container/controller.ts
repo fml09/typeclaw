@@ -79,17 +79,20 @@ function unsupported(verb: string, cwd: string): string {
 }
 
 // Which side owns the container control loop. `host` = typeclaw orchestrates
-// via local Docker (the only reachable value today). `managed` = an external
+// via local Docker. `managed` = an external
 // platform (ECS/K8s/…) owns it. The distinction is a deployer concern, not an
 // agent-runtime one; see docs/internals for the host/controller split.
 export type DeploymentProfile = 'host' | 'managed'
 
-// Single source of truth for the deployment profile. There is no `managed`
-// runtime yet, so this always resolves to `host`. When a managed platform
-// lands, the trigger (a platform-injected env var, or a config field) is wired
-// HERE — one place, not per call site.
-export function resolveDeploymentProfile(): DeploymentProfile {
-  return 'host'
+// Single source of truth for the deployment profile. Platforms select the
+// managed runtime at process start; agent-authored config cannot move the
+// lifecycle boundary underneath a running process. Env is injectable so the
+// composition roots and tests never need to mutate process.env.
+export function resolveDeploymentProfile(env: NodeJS.ProcessEnv = process.env): DeploymentProfile {
+  const value = env.TYPECLAW_DEPLOYMENT_PROFILE
+  if (value === undefined || value === '' || value === 'host') return 'host'
+  if (value === 'managed') return 'managed'
+  throw new Error(`Invalid TYPECLAW_DEPLOYMENT_PROFILE=${JSON.stringify(value)}; expected "host" or "managed"`)
 }
 
 // The controller-axis resolver: maps the deployment profile to its actuator.

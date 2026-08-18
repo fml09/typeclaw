@@ -22,6 +22,8 @@ export type TunnelManagerOptions = {
   // poking global env and so the manager stays a pure function of its inputs.
   resolveEnv?: (name: string) => string | undefined
   logger?: TunnelManagerLogger
+  // Reports isolated startup failures without turning them into boot failure.
+  onDegrade?: (component: string, reason: string) => void
 }
 
 export type TunnelManager = {
@@ -42,7 +44,15 @@ const consoleLogger: TunnelManagerLogger = {
 export function createTunnelManager(options: TunnelManagerOptions): TunnelManager {
   const logger = options.logger ?? consoleLogger
   const handles = new Map<string, TunnelProviderHandle>()
+  const degradedTunnels = new Set<string>()
   const resolveEnv = options.resolveEnv ?? ((name: string) => process.env[name])
+
+  const reportDegraded = (state: TunnelState): void => {
+    if (state.status !== 'unhealthy' && state.status !== 'permanently-failed') return
+    if (degradedTunnels.has(state.name)) return
+    degradedTunnels.add(state.name)
+    options.onDegrade?.(`tunnel:${state.name}`, state.detail)
+  }
 
   for (const config of options.tunnels) {
     const handle = buildProvider(
@@ -53,6 +63,7 @@ export function createTunnelManager(options: TunnelManagerOptions): TunnelManage
       options.cloudflareNamedBinary,
       resolveEnv,
     )
+    handle.subscribeToState(reportDegraded)
     handles.set(config.name, handle)
   }
 
@@ -63,9 +74,13 @@ export function createTunnelManager(options: TunnelManagerOptions): TunnelManage
           try {
             await h.start()
           } catch (err) {
-            logger.error(
-              `[tunnels] ${h.snapshot().name}: start failed: ${err instanceof Error ? err.message : String(err)}`,
-            )
+            const reason = err instanceof Error ? err.message : String(err)
+            const name = h.snapshot().name
+            logger.error(`[tunnels] ${name}: start failed: ${reason}`)
+            if (!degradedTunnels.has(name)) {
+              degradedTunnels.add(name)
+              options.onDegrade?.(`tunnel:${name}`, reason)
+            }
           }
         }),
       )

@@ -2,7 +2,7 @@ import type { Unsubscribe } from '@/stream'
 
 import { createLogRing, type LogLineSubscriber, type LogRing } from '../log-ring'
 import { extractQuickTunnelUrl } from '../quick-url-parser'
-import type { TunnelConfig, TunnelProviderHandle, TunnelState } from '../types'
+import type { TunnelConfig, TunnelProviderHandle, TunnelState, TunnelStateSubscriber } from '../types'
 import { isUpstreamReachable, type UpstreamProbe } from '../upstream-probe'
 import { isBinaryNotFound, MISSING_BINARY_DETAIL } from './cloudflared-binary'
 
@@ -54,6 +54,7 @@ export function createCloudflareQuickProvider(options: CloudflareQuickProviderOp
     lastUrlAt: null,
     detail: '',
   }
+  const stateSubscribers = new Set<TunnelStateSubscriber>()
 
   let started = false
   let stopping = false
@@ -69,6 +70,13 @@ export function createCloudflareQuickProvider(options: CloudflareQuickProviderOp
   // while a probe is in flight, the resolved probe sees a stale generation and
   // bails — so it can never mark a dead process's tunnel healthy.
   let launchGeneration = 0
+
+  function setStatus(status: TunnelState['status'], detail: string): void {
+    state.status = status
+    state.detail = detail
+    const snapshot = { ...state }
+    for (const subscriber of stateSubscribers) subscriber(snapshot)
+  }
 
   function clearRecheckTimer(): void {
     if (recheckTimer !== null) {
@@ -100,13 +108,14 @@ export function createCloudflareQuickProvider(options: CloudflareQuickProviderOp
     const reachable = await probeUpstream(upstreamPort)
     if (generation !== launchGeneration || !started || stopping || state.url === null) return
     if (reachable) {
-      state.status = 'healthy'
-      state.detail = 'quick tunnel URL emitted; upstream reachable'
+      setStatus('healthy', 'quick tunnel URL emitted; upstream reachable')
       clearRecheckTimer()
       return
     }
-    state.status = 'unhealthy'
-    state.detail = `quick tunnel URL emitted but upstream 127.0.0.1:${upstreamPort} is not reachable (requests will 502)`
+    setStatus(
+      'unhealthy',
+      `quick tunnel URL emitted but upstream 127.0.0.1:${upstreamPort} is not reachable (requests will 502)`,
+    )
     clearRecheckTimer()
     recheckTimer = setTimeout(() => {
       recheckTimer = null
@@ -119,8 +128,7 @@ export function createCloudflareQuickProvider(options: CloudflareQuickProviderOp
 
     const generation = ++launchGeneration
     attemptEmittedUrl = false
-    state.status = 'starting'
-    state.detail = 'starting cloudflared'
+    setStatus('starting', 'starting cloudflared')
     let spawned: Bun.Subprocess<'ignore', 'ignore', 'pipe'>
     try {
       spawned = Bun.spawn(
@@ -129,8 +137,7 @@ export function createCloudflareQuickProvider(options: CloudflareQuickProviderOp
       )
     } catch (err) {
       if (isBinaryNotFound(err)) {
-        state.status = 'permanently-failed'
-        state.detail = MISSING_BINARY_DETAIL
+        setStatus('permanently-failed', MISSING_BINARY_DETAIL)
         return
       }
       throw err
@@ -156,13 +163,11 @@ export function createCloudflareQuickProvider(options: CloudflareQuickProviderOp
     clearRecheckTimer()
     if (!attemptEmittedUrl) restartFailuresWithoutUrl += 1
     if (restartFailuresWithoutUrl >= maxConsecutiveFailuresWithoutUrl) {
-      state.status = 'permanently-failed'
-      state.detail = `cloudflared exited ${code}; retry cap reached before URL emission`
+      setStatus('permanently-failed', `cloudflared exited ${code}; retry cap reached before URL emission`)
       return
     }
 
-    state.status = 'unhealthy'
-    state.detail = `cloudflared exited ${code}; restarting`
+    setStatus('unhealthy', `cloudflared exited ${code}; restarting`)
     const delay = restartBackoffMs[Math.min(restartFailuresWithoutUrl - 1, restartBackoffMs.length - 1)] ?? 30_000
     retryTimer = setTimeout(() => {
       retryTimer = null
@@ -204,14 +209,19 @@ export function createCloudflareQuickProvider(options: CloudflareQuickProviderOp
       }
 
       stopping = false
-      state.status = 'stopped'
-      state.detail = ''
+      setStatus('stopped', '')
     },
     snapshot(): TunnelState {
       return { ...state }
     },
     tail(): string[] {
       return logs.snapshot()
+    },
+    subscribeToState(cb: TunnelStateSubscriber): Unsubscribe {
+      stateSubscribers.add(cb)
+      return () => {
+        stateSubscribers.delete(cb)
+      }
     },
     subscribeToLogs(cb: LogLineSubscriber): Unsubscribe {
       return logs.subscribe(cb)

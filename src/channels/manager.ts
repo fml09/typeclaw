@@ -69,6 +69,9 @@ export type ChannelManagerOptions = {
   // end-to-end engagement assertion that guards this wiring.
   aliasesRef?: () => readonly string[]
   logger?: ChannelManagerLogger
+  // Reports isolated configured-adapter failures to process health while the
+  // manager continues supervising and retrying them.
+  onDegrade?: (component: string, reason: string) => void
   env?: NodeJS.ProcessEnv
   // The container-stage secrets provider for personal-account adapters
   // (line/kakaotalk/slack/discord/webex/instagram write-back + read). Resolved
@@ -621,6 +624,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
 
     failed.set(name, entry)
     failedInputSignatures.set(entry, failure.inputSignature)
+    if (!continuing) options.onDegrade?.(`channel:${name}`, failure.detail)
     return entry
   }
 
@@ -644,6 +648,8 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     }
     if (result.status === 'failed') {
       recordFailure(name, cfg, result, previousFailure)
+    } else if (result.status === 'blocked') {
+      options.onDegrade?.(`channel:${name}`, 'configured adapter could not be constructed')
     } else if (previousFailure !== undefined && failed.get(name) === previousFailure) {
       failed.delete(name)
     }

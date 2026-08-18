@@ -29,7 +29,12 @@ const knownModelRefs = listKnownModelRefs() as [KnownModelRef, ...KnownModelRef[
 const DEFAULT_PORT = 8973
 
 export const GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE = 'typeclaw-gws-multi-account'
-export const GWS_MULTI_ACCOUNT_PLUGIN_VERSION = '^0.3.4'
+// Host-created Agent Folders keep a compatible range so an ordinary install can
+// pick up patch releases. The managed workload image needs a source-controlled
+// exact pin: resolving a range at release time would make a same-version image
+// rebuild depend on mutable registry state.
+export const GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION = '0.3.4'
+export const GWS_MULTI_ACCOUNT_PLUGIN_VERSION = `^${GWS_MULTI_ACCOUNT_PLUGIN_EXACT_VERSION}` as const
 export const DEFAULT_PLUGINS = [`${GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE}@${GWS_MULTI_ACCOUNT_PLUGIN_VERSION}`] as const
 
 export function withDefaultPlugins(plugins: readonly string[]): string[] {

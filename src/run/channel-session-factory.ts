@@ -9,6 +9,7 @@ import { sessionMetaPayload } from '@/agent/session-meta'
 import type { CreateSessionForSubagent, SubagentCoalescer, SubagentRegistry } from '@/agent/subagents'
 import { capJsonlFileInPlace } from '@/bundled-plugins/tool-result-cap/cap-jsonl'
 import type { CapOptions } from '@/bundled-plugins/tool-result-cap/cap-result'
+import type { RuntimeRestarter } from '@/capabilities'
 import type { CreateSessionForChannel, ChannelRouter } from '@/channels'
 import type { McpManager } from '@/mcp'
 import type { PermissionService, RolesConfig } from '@/permissions'
@@ -41,6 +42,7 @@ export type BuildChannelSessionFactoryDeps = {
   getChannelRouter: () => ChannelRouter
   mcpManager?: McpManager
   containerName?: string
+  restarter?: RuntimeRestarter
   runtimeVersion?: string
   // When set, rehydrating a session JSONL caps oversized tool results in the
   // file before pi-coding-agent reads it. `null` disables the load-time pass
@@ -133,6 +135,7 @@ export function buildChannelSessionFactory(deps: BuildChannelSessionFactoryDeps)
           }
         : {}),
       ...(deps.containerName !== undefined ? { containerName: deps.containerName } : {}),
+      ...(deps.restarter !== undefined ? { restarter: deps.restarter } : {}),
       ...(deps.runtimeVersion !== undefined ? { runtimeVersion: deps.runtimeVersion } : {}),
       ...(deps.permissions !== undefined ? { permissions: deps.permissions } : {}),
       ...(deps.reloadRoles !== undefined ? { reloadRoles: deps.reloadRoles } : {}),

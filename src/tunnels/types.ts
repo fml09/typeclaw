@@ -45,8 +45,11 @@ export type TunnelProviderHandle = {
   stop: () => Promise<void>
   snapshot: () => TunnelState
   tail: () => string[]
+  subscribeToState: (cb: TunnelStateSubscriber) => Unsubscribe
   subscribeToLogs: (cb: TunnelLogSubscriber) => Unsubscribe
 }
+
+export type TunnelStateSubscriber = (state: TunnelState) => void
 
 export type TunnelLogSubscriber = (line: string) => void
 

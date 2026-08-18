@@ -1,7 +1,7 @@
 import type { Unsubscribe } from '@/stream'
 
 import { createLogRing, type LogLineSubscriber, type LogRing } from '../log-ring'
-import type { TunnelConfig, TunnelProviderHandle, TunnelState } from '../types'
+import type { TunnelConfig, TunnelProviderHandle, TunnelState, TunnelStateSubscriber } from '../types'
 import { isBinaryNotFound, MISSING_BINARY_DETAIL } from './cloudflared-binary'
 
 const DEFAULT_BINARY = 'cloudflared'
@@ -56,12 +56,20 @@ export function createCloudflareNamedProvider(options: CloudflareNamedProviderOp
     lastUrlAt: null,
     detail: '',
   }
+  const stateSubscribers = new Set<TunnelStateSubscriber>()
 
   let started = false
   let stopping = false
   let proc: ReturnType<typeof Bun.spawn> | null = null
   let retryTimer: ReturnType<typeof setTimeout> | null = null
   let consecutiveCrashes = 0
+
+  function setStatus(status: TunnelState['status'], detail: string): void {
+    state.status = status
+    state.detail = detail
+    const snapshot = { ...state }
+    for (const subscriber of stateSubscribers) subscriber(snapshot)
+  }
 
   async function launch(): Promise<void> {
     if (!started || stopping) return
@@ -73,13 +81,11 @@ export function createCloudflareNamedProvider(options: CloudflareNamedProviderOp
       // permanently-failed so `tunnel status` makes the cause obvious and we
       // don't waste retries spawning a cloudflared we know will reject the
       // missing token.
-      state.status = 'permanently-failed'
-      state.detail = `env var ${tokenEnv} is unset or empty; set it in .env and restart`
+      setStatus('permanently-failed', `env var ${tokenEnv} is unset or empty; set it in .env and restart`)
       return
     }
 
-    state.status = 'starting'
-    state.detail = 'starting cloudflared'
+    setStatus('starting', 'starting cloudflared')
     let spawned: Bun.Subprocess<'ignore', 'ignore', 'pipe'>
     try {
       spawned = Bun.spawn([binary, 'tunnel', '--no-autoupdate', 'run', '--token', token], {
@@ -88,8 +94,7 @@ export function createCloudflareNamedProvider(options: CloudflareNamedProviderOp
       })
     } catch (err) {
       if (isBinaryNotFound(err)) {
-        state.status = 'permanently-failed'
-        state.detail = MISSING_BINARY_DETAIL
+        setStatus('permanently-failed', MISSING_BINARY_DETAIL)
         return
       }
       throw err
@@ -112,8 +117,7 @@ export function createCloudflareNamedProvider(options: CloudflareNamedProviderOp
     void pumpStderr(spawned.stderr, logs, () => {
       if (sawFirstLine) return
       sawFirstLine = true
-      state.status = 'healthy'
-      state.detail = 'cloudflared started'
+      setStatus('healthy', 'cloudflared started')
     })
 
     void spawned.exited.then((code) => {
@@ -127,13 +131,14 @@ export function createCloudflareNamedProvider(options: CloudflareNamedProviderOp
   function handleExit(code: number): void {
     consecutiveCrashes += 1
     if (consecutiveCrashes >= maxConsecutiveCrashes) {
-      state.status = 'permanently-failed'
-      state.detail = `cloudflared exited ${code}; retry cap reached after ${consecutiveCrashes} consecutive crashes`
+      setStatus(
+        'permanently-failed',
+        `cloudflared exited ${code}; retry cap reached after ${consecutiveCrashes} consecutive crashes`,
+      )
       return
     }
 
-    state.status = 'unhealthy'
-    state.detail = `cloudflared exited ${code}; restarting`
+    setStatus('unhealthy', `cloudflared exited ${code}; restarting`)
     const delay = restartBackoffMs[Math.min(consecutiveCrashes - 1, restartBackoffMs.length - 1)] ?? 30_000
     retryTimer = setTimeout(() => {
       retryTimer = null
@@ -181,14 +186,19 @@ export function createCloudflareNamedProvider(options: CloudflareNamedProviderOp
       }
 
       stopping = false
-      state.status = 'stopped'
-      state.detail = ''
+      setStatus('stopped', '')
     },
     snapshot(): TunnelState {
       return { ...state }
     },
     tail(): string[] {
       return logs.snapshot()
+    },
+    subscribeToState(cb: TunnelStateSubscriber): Unsubscribe {
+      stateSubscribers.add(cb)
+      return () => {
+        stateSubscribers.delete(cb)
+      }
     },
     subscribeToLogs(cb: LogLineSubscriber): Unsubscribe {
       return logs.subscribe(cb)

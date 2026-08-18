@@ -56,7 +56,6 @@ export const run = defineCommand({
       void shutdown({ stop, exit })
     }
     process.once('SIGINT', onSignal)
-    process.once('SIGTERM', onSignal)
 
     if (tuiPromise) {
       await tuiPromise
@@ -67,10 +66,9 @@ export const run = defineCommand({
 
 // Awaits `stop()` BEFORE exiting so async teardown side-effects (channel
 // adapter teardown, in particular GitHub webhook deregistration) actually
-// complete. The previous code called `stop()` without awaiting and then
-// `process.exit(0)` synchronously, so the in-process DELETE /repos/.../hooks/
-// requests never went out and webhooks survived `typeclaw stop` (which
-// `docker stop`s the container → SIGTERM).
+// complete. SIGTERM is deliberately owned by startAgent: its handoff-first
+// sequence must finish before teardown and process exit during a supervised
+// container replacement. The CLI owns only interactive SIGINT here.
 export async function shutdown(deps: {
   stop: () => void | Promise<void>
   exit: (code: number) => void

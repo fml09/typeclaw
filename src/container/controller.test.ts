@@ -159,7 +159,17 @@ describe('resolveController', () => {
 })
 
 describe('resolveDeploymentProfile', () => {
-  test('resolves to host (the only reachable profile today)', () => {
-    expect(resolveDeploymentProfile()).toBe('host')
+  test('defaults to host when the deployment profile is absent', () => {
+    expect(resolveDeploymentProfile({})).toBe('host')
+  })
+
+  test('resolves the managed profile from the platform-injected environment', () => {
+    expect(resolveDeploymentProfile({ TYPECLAW_DEPLOYMENT_PROFILE: 'managed' })).toBe('managed')
+  })
+
+  test('fails loud on an unknown deployment profile', () => {
+    expect(() => resolveDeploymentProfile({ TYPECLAW_DEPLOYMENT_PROFILE: 'kubernetees' })).toThrow(
+      'TYPECLAW_DEPLOYMENT_PROFILE',
+    )
   })
 })

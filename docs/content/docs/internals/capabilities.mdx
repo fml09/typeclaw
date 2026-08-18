@@ -1,6 +1,6 @@
 ---
 title: Capabilities
-description: The Controller / RuntimeSecretsProvider seams, per-stage capability bags, functional-factory DI, and the host vs managed deployment profile
+description: The Controller, RuntimeSecretsProvider, and RuntimeRestarter seams, per-stage capability bags, functional-factory DI, and the host vs managed deployment profile
 icon: Blocks
 ---
 
@@ -17,7 +17,7 @@ The fix is to name each responsibility as its own interface, give it per-environ
 Two orthogonal roles, each an independent axis:
 
 - **controller** — the external actuator that acts _on_ a container: `start` / `stop` / `status` / `logs` / `shell`. `src/container/controller.ts`. The container never holds one; the host stage does.
-- **host substrate** — what the container reaches _into_ for durable state. Today that's secrets read + write-back (`RuntimeSecretsProvider`, `src/secrets/secrets-provider.ts`).
+- **runtime substrate** — capabilities the container reaches _into_: secrets read/write-back (`RuntimeSecretsProvider`) and bound self-replacement (`RuntimeRestarter`).
 
 These are stage-disjoint on purpose (see [Architecture](/docs/concepts/architecture)): controller lives host-stage, substrate lives container-stage.
 
@@ -31,13 +31,14 @@ ControlPlaneCapabilities   (host-stage; src/capabilities/control-plane.ts)
 
 RuntimeCapabilities        (container-stage; src/capabilities/runtime.ts)
   secrets: RuntimeSecretsProvider | null
+  restarter?: RuntimeRestarter | null
 ```
 
 Each is built by a factory that composes implementations for a `DeploymentProfile`:
 
 ```ts
 createControlPlaneCapabilities(profile) => { controller: resolveController(profile) }
-createRuntimeCapabilities(env, secretsPath) => { secrets: resolveRuntimeSecretsProvider(env, secretsPath) }
+createRuntimeCapabilities(env, secretsPath) => { secrets, restarter }
 ```
 
 The bag is built at the composition root and **specific capabilities are handed down** to the modules that need them. It is not a service locator — modules receive `caps.controller`, not the whole bag.
@@ -46,7 +47,7 @@ The bag is built at the composition root and **specific capabilities are handed 
 
 Secrets, restart, and port-forwarding are inherently cross-stage: a container-side **client** talks to a host-side **server** over a transport. They are modeled as _two_ contracts, never one object spanning both stages. The client contract names what the runtime needs, transport- and backend-agnostic.
 
-`RuntimeSecretsProvider` is the worked example (`src/secrets/secrets-provider.ts`):
+`RuntimeSecretsProvider` is the writable-state example (`src/secrets/secrets-provider.ts`):
 
 - `readChannels()` — reads the mounted `secrets.json` (file-based; `null` when absent so callers degrade rather than crash).
 - `writeBackChannelBlock(block)` — persists one adapter's block. Under hostd this crosses the `secrets-patch` RPC (the container can't write the host-owned file directly); under a volume it's a direct file write.
@@ -54,15 +55,21 @@ Secrets, restart, and port-forwarding are inherently cross-stage: a container-si
 Two implementations ship today:
 
 - `createHostdSecretsProvider` — reads the mounted file, writes via hostd's `secrets-patch` RPC.
-- `createFileSecretsProvider` — both halves hit the file on disk (for a future volume-backed managed profile, or host-stage).
+- `createFileSecretsProvider` — both halves hit the file on disk (used by the volume-backed managed profile and host-stage utilities).
 
-The six channel credential stores (`src/secrets/*-store.ts`) read _and_ write through this one seam in container mode; host mode still reads `SecretsBackend` directly.
+The channel credential stores (`src/secrets/*-store.ts`) read _and_ write through this one seam in container mode; host mode still reads `SecretsBackend` directly.
+
+`RuntimeRestarter` is the replacement example (`src/capabilities/runtime-restarter.ts`):
+
+- `createHostdRuntimeRestarter` sends the existing authenticated restart RPC.
+- `createManagedFileRestarter` atomically publishes a versioned request to a shared control directory. A platform relay owns the server half and cluster credentials.
+- `requestContainerRestart()` owns success-only broadcast and handoff ordering after either adapter accepts the request. Callers never branch on transport.
 
 ## The deployment profile
 
-`DeploymentProfile` is `'host' | 'managed'` (`src/container/controller.ts`). `resolveDeploymentProfile()` is the single source of truth. There is no managed runtime yet, so it always returns `'host'`; the seam exists so that when a managed platform lands, the trigger (a platform-injected env var or config field) is wired in _one_ place.
+`DeploymentProfile` is `'host' | 'managed'` (`src/container/controller.ts`). `resolveDeploymentProfile()` is the single source of truth. `TYPECLAW_DEPLOYMENT_PROFILE=managed` selects the managed runtime; unset, empty, or `host` selects host mode, and unknown values fail boot. This is a platform-injected boot boundary, never agent-authored config.
 
-Today only the **controller axis** consumes the profile: `createControlPlaneCapabilities()` resolves it and passes it to `resolveController(profile)`. The **runtime secrets axis** does _not_ take a profile yet — `createRuntimeCapabilities(env, secretsPath)` keys off the hostd env triple via `resolveRuntimeSecretsProvider`, and the deployment profile enters there only when a managed secrets implementation lands.
+Both composition roots consume the profile. `createControlPlaneCapabilities()` selects the controller. `createRuntimeCapabilities(env, secretsPath)` selects hostd-backed secrets/restart in host mode and writable-file secrets plus the managed restart spool in managed mode.
 
 `resolveController(profile)` maps it to an actuator: `host` → `createLocalDockerController` (shells out to Docker), `managed` → `createNoopController` (every verb fail-loud, since the platform owns the loop).
 
@@ -87,7 +94,8 @@ Every capability is an exported factory (`create*` / `resolve*`) returning an ob
 `src/capabilities/`:
 
 - `control-plane.ts` — `ControlPlaneCapabilities` + `createControlPlaneCapabilities`.
-- `runtime.ts` — `RuntimeCapabilities` + `createRuntimeCapabilities`.
+- `runtime.ts` — `RuntimeCapabilities` + profile-aware `createRuntimeCapabilities`.
+- `runtime-restarter.ts` — `RuntimeRestarter`, hostd/file adapters, and their environment resolvers.
 
 ## Rules of thumb
 
@@ -97,38 +105,39 @@ Every capability is an exported factory (`create*` / `resolve*`) returning an ob
 - **Build the bag at the root; hand specific capabilities down.** Not a service locator. A module that needs the controller takes a `Controller`, not the whole `ControlPlaneCapabilities`.
 - **Extract a capability into an interface on-trigger, not speculatively.** The trigger is: a second implementation exists, the capability crosses a stage boundary, or the composition root needs to hide platform selection. Extracting against a single caller bakes hostd-isms into a supposedly neutral interface.
 - **`managed` stays a single value until behavior diverges.** Split to `'ecs' | 'k8s'` only when an implementation actually differs by platform.
-- **The runtime call sites are the invariant.** Across every profile composition, `caps.secrets?.writeBackChannelBlock(...)` / `caps.controller.stop(...)` never change — only the injected implementations swap. That property is what "run the container without a host" reduces to.
+- **The runtime call sites are the invariant.** Across every profile composition, secrets writers call the bound provider and restart callers call `requestContainerRestart(..., restarter)`; only the injected implementations swap.
 
 ## Status and roadmap
 
-The interfaces are **prepared, file-based, ahead of any concrete platform work**. `resolveDeploymentProfile()` returns `'host'` unconditionally — there is no managed runtime yet, so the `managed` branches (`createNoopController`, a future volume/secret-store provider) exist but never execute in production.
+The runtime half now has a concrete managed composition. The published workload image boots `typeclaw run` with writable-file secrets, a platform-neutral restart spool, and named health probes. The host-stage managed `Controller` intentionally remains fail-loud; lifecycle CLI commands do not become Kubernetes clients.
 
 ### Shipped
 
 - **`Controller`** — extracted with two implementations (`createLocalDockerController`, `createNoopController`) and `resolveController(profile)`.
 - **`RuntimeSecretsProvider`** — extracted with read + write-back, file-based, with `createHostdSecretsProvider` and `createFileSecretsProvider`.
-- **`RuntimeCapabilities` is threaded through the container root.** `startAgentRuntime` (`src/run/index.ts`) assembles it once and hands `caps.secrets` to the channel manager — the six per-adapter provider resolutions collapsed to one. The manager no longer reads the hostd env triple itself.
+- **`RuntimeRestarter`** — extracted with hostd and managed-file implementations. TUI, channel, cron, command, and fatal-guard paths receive the same bound adapter.
+- **`RuntimeCapabilities` is threaded through the container root.** `startAgentRuntime` (`src/run/index.ts`) assembles it once and hands each capability to its consumers. Call sites no longer discover a platform transport.
+- **Managed health** — startup, degradation, readiness, and shutdown state is exposed through `/health/live` and `/health/ready`.
 
 ### Deliberately deferred — the on-trigger ledger
 
 A capability is extracted into an interface only when its trigger fires (see Rules of thumb: a second implementation exists, it crosses a stage boundary, or the root must hide platform selection). Extracting earlier — against a single caller — bakes hostd-isms into a "neutral" interface. Current triggers:
 
-| Capability                                  | State                                              | Trigger to extract                                                   |
-| ------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------- |
-| `Restarter` (self-recycle)                  | hostd-owned (supervisor + restart tool)            | when a managed restart impl (e.g. ECS `StopTask`+`RunTask`) is built |
-| `PortForwarder` (portbroker)                | hostd-owned                                        | when a managed ingress replacement is built                          |
-| `CredentialRenewer` (KakaoTalk/Webex crons) | hostd-owned                                        | host-only today; extract only if a managed renewal home appears      |
-| `Ingress` (tunnels)                         | container-side (cloudflared) + host-side Tailscale | when a platform ingress replaces it                                  |
+| Capability                                  | State                                              | Trigger to extract                                              |
+| ------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------------- |
+| `PortForwarder` (portbroker)                | hostd-owned                                        | when a managed ingress replacement is built                     |
+| `CredentialRenewer` (KakaoTalk/Webex crons) | hostd-owned                                        | host-only today; extract only if a managed renewal home appears |
+| `Ingress` (tunnels)                         | container-side (cloudflared) + host-side Tailscale | when a platform ingress replaces it                             |
 
 `ControlPlaneCapabilities` is **not** threaded through a single host-stage root, and that is intentional: each CLI command (`typeclaw start`/`stop`/…) is its own process-level composition root, so a per-command `resolveController()` already _is_ the root. Collapsing the ~14 call sites into a shared bag would be ceremony, not consolidation — revisit only when multiple commands need shared profile/config resolution beyond a one-line factory.
 
-### What a managed platform would fire, all at once
+### Remaining platform work
 
-Committing to a concrete target (ECS or K8s) is the trigger that unblocks the rest, because it supplies the _second implementation_ every deferred interface is waiting for:
+A concrete target such as ECS or Kubernetes supplies the server-side implementations and orchestration policy that intentionally remain outside the workload image:
 
 1. A managed `Controller` (`createEcsController` / a K8s operator) — makes `resolveController('managed')` reach something real instead of the fail-loud noop.
-2. A managed `RuntimeSecretsProvider` — the `createFileSecretsProvider` shape already fits a **writable** mounted volume (EFS, a K8s PVC/CSI volume, a Cloud Run volume), since it writes back through the file. Read-only mounts (a projected K8s Secret/configMap) satisfy the read half but would fail write-back with `EROFS` — those need a live-API provider implementation instead.
-3. `Restarter` / `PortForwarder` interface extraction, each with its managed server half.
-4. Closing the three controller **escape hatches** that make `Controller` non-load-bearing today — `resolveDockerBinary()` in `src/compose/logs.ts`, `inspectContainer()` in `src/compose/status.ts`, and the raw `start`/`stop` imports in `src/init/index.ts` — plus the `preflightDocker()`-before-`resolveController()` ordering in the lifecycle CLI commands, which would exit on a host-only Docker check before a managed controller is reached. These only matter once a managed profile is executable; until then they are correct as-is.
+2. A platform server half for the shipped managed clients: materialize and back up the writable secrets file, then consume restart request files through a sidecar or node-local relay.
+3. A managed `PortForwarder` or explicit Service/Ingress replacement if dynamic ports are required.
+4. Closing the three controller **escape hatches** that make `Controller` non-load-bearing today — `resolveDockerBinary()` in `src/compose/logs.ts`, `inspectContainer()` in `src/compose/status.ts`, and the raw `start`/`stop` imports in `src/init/index.ts` — plus the `preflightDocker()`-before-`resolveController()` ordering in the lifecycle CLI commands. These matter when a managed host-stage CLI is implemented; they do not affect the scheduler-owned workload image.
 
-The invariant that makes all of this tractable: **runtime call sites never change** across profiles (`caps.secrets?.writeBackChannelBlock(...)`, `caps.controller.stop(...)`). A managed platform swaps the injected implementations behind the bags, not the callers.
+The invariant that makes all of this tractable: **runtime call sites never change** across profiles. A managed platform swaps the injected implementations behind the bags, not the callers. See [Managed runtime](/docs/internals/managed-runtime) for the concrete volume, restart, probe, and security contracts.

@@ -32,6 +32,10 @@ export type FatalGuardOptions = {
   // can be visibly marked degraded (e.g. log/status) instead of silently
   // swallowing the error.
   onDegrade?: (scope: string, reason: string) => void
+  // Called synchronously for an undefined-state failure, before replacement
+  // control is contacted. Readiness must drop immediately: a managed file ACK
+  // only proves the request was published, not that a controller acted on it.
+  onReplacementPending?: () => void
   now?: () => number
   // Minimum spacing between restart requests. A fault re-firing on every event
   // loop tick must not spam the host daemon. Default 60s.
@@ -70,6 +74,14 @@ export function installFatalGuard(options: FatalGuardOptions = {}): { guard: Fat
   const restartMinIntervalMs = options.restartMinIntervalMs ?? DEFAULT_RESTART_MIN_INTERVAL_MS
   let lastRestartRequestAt: number | null = null
 
+  const markDegraded = (scope: string, reason: string): void => {
+    try {
+      options.onDegrade?.(scope, reason)
+    } catch (degradeErr) {
+      logger.warn(`[fatal-guard] onDegrade(${scope}) threw: ${describeError(degradeErr)}`)
+    }
+  }
+
   const handle = (kind: FatalGuardKind, error: unknown): void => {
     // The guard body must never throw — a throwing handler re-enters the very
     // failure mode it exists to contain. Everything is wrapped, with a bare
@@ -83,15 +95,16 @@ export function installFatalGuard(options: FatalGuardOptions = {}): { guard: Fat
 
       if (decision.action === 'continue') {
         if (decision.scope !== undefined) {
-          try {
-            options.onDegrade?.(decision.scope, decision.reason)
-          } catch (degradeErr) {
-            logger.warn(`[fatal-guard] onDegrade(${decision.scope}) threw: ${describeError(degradeErr)}`)
-          }
+          markDegraded(decision.scope, decision.reason)
         }
         return
       }
 
+      try {
+        options.onReplacementPending?.()
+      } catch (pendingErr) {
+        logger.warn(`[fatal-guard] onReplacementPending threw: ${describeError(pendingErr)}`)
+      }
       requestRestart(decision.reason)
     } catch (handlerErr) {
       try {
@@ -105,11 +118,13 @@ export function installFatalGuard(options: FatalGuardOptions = {}): { guard: Fat
   const requestRestart = (reason: string): void => {
     if (options.requestRestart === undefined) {
       logger.warn(`[fatal-guard] restart requested (${reason}) but no host control endpoint; continuing degraded`)
+      markDegraded('runtime', `${reason}; replacement control is unavailable`)
       return
     }
     const at = now()
     if (lastRestartRequestAt !== null && at - lastRestartRequestAt < restartMinIntervalMs) {
       logger.warn(`[fatal-guard] restart requested (${reason}) but rate-limited; continuing degraded`)
+      markDegraded('runtime', `${reason}; replacement request was rate-limited`)
       return
     }
     lastRestartRequestAt = at
@@ -122,10 +137,12 @@ export function installFatalGuard(options: FatalGuardOptions = {}): { guard: Fat
           logger.warn(
             `[fatal-guard] container restart unavailable (${result.reason ?? 'unknown'}); continuing degraded`,
           )
+          markDegraded('runtime', `${reason}; replacement unavailable: ${result.reason ?? 'unknown'}`)
         }
       })
       .catch((restartErr) => {
         logger.warn(`[fatal-guard] container restart request threw: ${describeError(restartErr)}; continuing degraded`)
+        markDegraded('runtime', `${reason}; replacement request threw: ${describeError(restartErr)}`)
       })
   }
 

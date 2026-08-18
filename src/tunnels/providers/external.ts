@@ -1,4 +1,4 @@
-import type { TunnelConfig, TunnelProviderHandle, TunnelState } from '../types'
+import type { TunnelConfig, TunnelProviderHandle, TunnelState, TunnelStateSubscriber } from '../types'
 
 export type ExternalProviderOptions = {
   config: TunnelConfig
@@ -25,26 +25,39 @@ export function createExternalProvider(options: ExternalProviderOptions): Tunnel
     lastUrlAt: null,
     detail: '',
   }
+  const stateSubscribers = new Set<TunnelStateSubscriber>()
+
+  function setStatus(status: TunnelState['status']): void {
+    state.status = status
+    const snapshot = { ...state }
+    for (const subscriber of stateSubscribers) subscriber(snapshot)
+  }
 
   return {
     async start(): Promise<void> {
       if (started) return
       started = true
       state.url = url
-      state.status = 'healthy'
       state.lastUrlAt = Date.now()
+      setStatus('healthy')
       onUrlChange(url)
     },
     async stop(): Promise<void> {
       if (!started) return
       started = false
-      state.status = 'stopped'
+      setStatus('stopped')
     },
     snapshot(): TunnelState {
       return { ...state }
     },
     tail(): string[] {
       return []
+    },
+    subscribeToState(cb: TunnelStateSubscriber): () => void {
+      stateSubscribers.add(cb)
+      return () => {
+        stateSubscribers.delete(cb)
+      }
     },
     subscribeToLogs(): () => void {
       return () => {}

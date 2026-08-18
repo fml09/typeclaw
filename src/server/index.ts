@@ -34,9 +34,11 @@ import {
 } from '@/agent/todo/continuation-wiring'
 import { SUBAGENT_OUTPUT_TOOL_NAME } from '@/agent/tools/subagent-output'
 import { promptPersistentTurnWithFallback } from '@/agent/turn-runner'
+import type { RuntimeRestarter } from '@/capabilities'
 import type { ChannelRouter } from '@/channels/router'
 import { getConfig, resolveModel } from '@/config'
 import { aggregateCronList, type CronJob, type CronListEntry, loadCron } from '@/cron'
+import type { RuntimeHealth } from '@/health'
 import type { McpManager } from '@/mcp'
 import type { PermissionService } from '@/permissions'
 import type { HookBus } from '@/plugin'
@@ -89,6 +91,8 @@ export type ServerOptions = {
   // as retired instead of showing a stale future fire time. Omit in tests/dev.
   getFiredCount?: (job: CronJob) => number
   containerName?: string
+  restarter?: RuntimeRestarter
+  health?: RuntimeHealth
   runtimeVersion?: string
   tuiToken?: string
   // Optional in-process portbroker handler. When provided, requests to the
@@ -286,6 +290,8 @@ export function createServer({
   permissions,
   getFiredCount,
   containerName,
+  restarter,
+  health,
   runtimeVersion,
   tuiToken,
   containerBroker,
@@ -436,6 +442,22 @@ export function createServer({
       port,
       fetch(req, server) {
         const url = new URL(req.url)
+        if (req.method === 'GET' && (url.pathname === '/health/live' || url.pathname === '/health/ready')) {
+          const snapshot =
+            health?.snapshot() ??
+            ({
+              schemaVersion: 1,
+              status: 'ready',
+              ready: true,
+              degraded: false,
+              degradedComponents: [],
+            } as const)
+          const status = url.pathname === '/health/ready' && !snapshot.ready ? 503 : 200
+          return Response.json(snapshot, {
+            status,
+            headers: { 'cache-control': 'no-store' },
+          })
+        }
         if (url.pathname === '/portbroker') {
           if (!containerBroker) return new Response('portbroker disabled', { status: 404 })
           const data: BrokerWsData = { kind: 'portbroker', authed: false }
@@ -538,6 +560,7 @@ export function createServer({
               ...(pluginsWiring ? { plugins: pluginsWiring } : {}),
               ...(permissions !== undefined ? { permissions } : {}),
               ...(containerName !== undefined ? { containerName } : {}),
+              ...(restarter !== undefined ? { restarter } : {}),
               ...(runtimeVersion !== undefined ? { runtimeVersion } : {}),
               ...(liveSubagentRegistry !== undefined ? { liveSubagentRegistry } : {}),
               ...(subagentCoalescer !== undefined ? { subagentCoalescer } : {}),
@@ -752,7 +775,7 @@ export function createServer({
           }
 
           if (msg.type === 'restart') {
-            await handleRestart(ws, state, containerName, agentDir, stream)
+            await handleRestart(ws, state, containerName, agentDir, stream, restarter)
             return
           }
 
@@ -1726,6 +1749,7 @@ async function handleRestart(
   containerName: string | undefined,
   agentDir: string | undefined,
   stream: Stream | undefined,
+  restarter: RuntimeRestarter | undefined,
 ): Promise<void> {
   if (containerName === undefined) {
     send(ws, {
@@ -1744,9 +1768,11 @@ async function handleRestart(
   const originatingSessionFile = state?.sessionManager?.getSessionFile()
   const result = await requestContainerRestart({
     containerName,
+    ...(restarter !== undefined ? { restarter } : {}),
     ...(agentDir !== undefined ? { agentDir } : {}),
     ...(state?.sessionFileId !== undefined ? { originatingSessionId: state.sessionFileId } : {}),
     ...(originatingSessionFile !== undefined ? { originatingSessionFile } : {}),
+    handoffOrigin: { kind: 'tui' },
     ...(stream !== undefined ? { stream } : {}),
   })
   if (!result.ok) {

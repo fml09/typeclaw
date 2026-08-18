@@ -394,6 +394,38 @@ describe('channel manager — connection recovery', () => {
     expect(recoveredAdapter.stopCalls).toBe(1)
   })
 
+  test('marks a channel degraded when recovery construction throws', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock({ startMs: 1_000, checkIntervalMs: 10, disconnectedGraceMs: 100 })
+    const firstAdapter = makeFakeAdapter()
+    const degraded: Array<{ component: string; reason: string }> = []
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => {
+        constructions++
+        if (constructions === 1) return firstAdapter
+        throw new Error('replacement factory failed')
+      },
+      connectionRecovery: clock.connectionRecovery,
+      onDegrade: (component, reason) => degraded.push({ component, reason }),
+    })
+
+    await mgr.start()
+    firstAdapter.connected = false
+    clock.fire()
+    clock.advanceBy(101)
+    await flushManagerWork()
+
+    expect(firstAdapter.stopCalls).toBe(1)
+    expect(degraded).toEqual([
+      { component: 'channel:discord-bot', reason: 'failed to start: replacement factory failed' },
+    ])
+    await mgr.stop()
+  })
+
   test('heals a boot-time start failure only when its retry deadline is due', async () => {
     cfg['discord-bot'] = enabledAdapterCfg()
     const clock = fakeRecoveryClock()
@@ -571,12 +603,14 @@ describe('channel manager — connection recovery', () => {
     const first = makeFakeAdapter()
     const revived = makeFakeAdapter()
     const adapters = [first, revived]
+    const degraded: Array<{ component: string; reason: string }> = []
     const mgr = createChannelManager({
       agentDir,
       channelsConfigRef: () => cfg,
       env,
       createDiscordAdapter: () => adapters.shift()!,
       connectionRecovery: clock.connectionRecovery,
+      onDegrade: (component, reason) => degraded.push({ component, reason }),
     })
 
     await mgr.start()
@@ -587,6 +621,7 @@ describe('channel manager — connection recovery', () => {
     const result = await mgr.reload()
     expect(result.stopped).toContain('discord-bot')
     expect(first.stopCalls).toBe(1)
+    expect(degraded).toEqual([{ component: 'channel:discord-bot', reason: 'missing credentials: DISCORD_BOT_TOKEN' }])
 
     // then: it stays under supervision rather than dropping out entirely
     env.DISCORD_BOT_TOKEN = 'token-restored'
@@ -878,17 +913,20 @@ describe('channel manager — connection recovery', () => {
   test('best-effort stops a partially initialized adapter after start throws', async () => {
     cfg['discord-bot'] = enabledAdapterCfg()
     const failedAdapter = makeStartFailingAdapter()
+    const degraded: Array<{ component: string; reason: string }> = []
     const mgr = createChannelManager({
       agentDir,
       channelsConfigRef: () => cfg,
       env: { DISCORD_BOT_TOKEN: 'token' },
       createDiscordAdapter: () => failedAdapter,
+      onDegrade: (component, reason) => degraded.push({ component, reason }),
     })
 
     await mgr.start()
 
     expect(failedAdapter.startCalls).toBe(1)
     expect(failedAdapter.stopCalls).toBe(1)
+    expect(degraded).toEqual([{ component: 'channel:discord-bot', reason: expect.stringContaining('failed to start') }])
     await mgr.stop()
   })
 })

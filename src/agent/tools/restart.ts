@@ -3,12 +3,16 @@ import { defineTool } from '@mariozechner/pi-coding-agent'
 
 import { requestContainerRestart } from '@/agent/restart'
 import type { RestartHandoffOrigin } from '@/agent/restart-handoff'
+import type { RuntimeRestarter } from '@/capabilities'
 import type { Stream } from '@/stream'
-
-const EXIT_DELAY_MS = 500
 
 export type CreateRestartToolOptions = {
   containerName: string
+  // Bound runtime replacement capability. Managed runtimes inject a
+  // platform-neutral adapter; omission preserves legacy hostd discovery.
+  restarter?: RuntimeRestarter
+  // Retained as a compatibility seam for embedders. Restart acceptance never
+  // calls it: the host daemon or managed relay owns SIGTERM and graceful stop.
   exit?: (code: number) => void
   hostdUrl?: string
   hostdToken?: string
@@ -70,6 +74,7 @@ export type { ContainerRestartingBroadcast } from '@/agent/restart'
 
 export function createRestartTool({
   containerName,
+  restarter,
   exit,
   hostdUrl,
   hostdToken,
@@ -81,21 +86,20 @@ export function createRestartTool({
   handoffOrigin,
   triggeringAuthorIdProvider,
 }: CreateRestartToolOptions) {
-  const doExit = exit ?? ((code: number) => process.exit(code))
+  void exit
 
   return defineTool({
     name: 'restart',
     label: 'Restart Container',
     description:
-      'Restart the typeclaw container this agent is running in. The host daemon ACKs the request, ' +
-      'this process exits, and the host daemon then runs `typeclaw stop` followed by `typeclaw start` ' +
-      'for the agent folder. Use when on-disk source has changed in a way that `reload` cannot pick up — ' +
+      'Request replacement of the typeclaw runtime this agent is running in. The configured runtime ' +
+      'controller accepts the request and then owns graceful process termination. Use when ' +
+      'on-disk source has changed in a way that `reload` cannot pick up — ' +
       'e.g. the typeclaw CLI itself was updated, the Dockerfile template changed, or a boot-only config ' +
       'field needs to take effect (port, mounts, plugins). The current session is lost; the ' +
       'TUI must reconnect after the new container is up. Pass `build: true` to also rebuild the ' +
-      'Docker image (equivalent to `typeclaw restart --build`) — required when a dependency in the ' +
-      'Dockerfile template changed but the image already exists, since `start` only rebuilds if the ' +
-      'image is missing or `build` is set.',
+      'Docker image in host mode (equivalent to `typeclaw restart --build`). Managed runtimes may reject ' +
+      'image rebuild requests because image rollout belongs to the platform.',
     parameters: Type.Object({
       build: Type.Optional(
         Type.Boolean({
@@ -119,6 +123,7 @@ export function createRestartTool({
         containerName,
         build,
         originatingSessionId,
+        ...(restarter !== undefined ? { restarter } : {}),
         ...(hostdUrl !== undefined ? { hostdUrl } : {}),
         ...(hostdToken !== undefined ? { hostdToken } : {}),
         ...(ackTimeoutMs !== undefined ? { ackTimeoutMs } : {}),
@@ -136,19 +141,13 @@ export function createRestartTool({
         }
       }
 
-      // Schedule the exit on the next tick so the tool result is delivered to
-      // the model before the process dies. The host daemon polls for the
-      // container's removal before re-running `start`, so a small delay here
-      // does not gate the restart end-to-end.
-      setTimeout(() => doExit(0), EXIT_DELAY_MS)
-
       const details: RestartToolDetails = { ok: true, containerName }
       const buildSuffix = build ? ' (with image rebuild)' : ''
       return {
         content: [
           {
             type: 'text' as const,
-            text: `restart${buildSuffix} scheduled for ${containerName}; this process will exit shortly and a new container will be started by the host daemon.`,
+            text: `restart${buildSuffix} scheduled for ${containerName}; the runtime controller will terminate this process gracefully and start its replacement.`,
           },
         ],
         details,
