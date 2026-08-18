@@ -15,24 +15,28 @@ const MAX_DELAY_MS = 5_000
 // How much added latency a call site can absorb before the caller would rather
 // see a failure. Deliberately NOT the model-profile name: the retry layer cares
 // about latency tolerance, not which tier the operator configured. 'responsive'
-// is every interactive path (channel chat, TUI, slash commands, cron) and keeps
-// the historical fast-fail behavior; 'patient' is a background path where a
-// human is already waiting minutes for a considered answer. Today the only
-// producer is a subagent whose REQUESTED profile is `deep` (reviewer,
-// researcher) — see resolveRetryPolicy in subagents.ts.
+// is every interactive path (channel chat, TUI, slash commands, multimodal
+// look-at); 'patient' is a background path where a human is already waiting
+// minutes for a considered answer. Today the only producer of 'patient' is a
+// subagent whose REQUESTED profile is `deep` (reviewer, researcher) — see
+// subagents.ts. Cron does NOT flow through here: it rebuilds a fresh session per
+// attempt via promptWithFallback (model-fallback.ts), so a capacity wait can't
+// push one scheduled run into the next.
 export type RetryPolicy = 'responsive' | 'patient'
 
-// Capacity backoff, used ONLY for throttle/overload under the 'patient' policy.
-// Kept separate from retryBackoffMs above on purpose: that curve (1–5s) is sized
-// for a one-off socket blip, and widening it globally would add dead air to the
-// TUI, slash commands, multimodal look-at, cron, and ordinary network errors.
-// An overload is a capacity outage measured in minutes, not milliseconds — the
-// incident that motivated this burned every retry in 4 seconds against a ~60s
-// outage — so it gets its own, much longer curve.
+// Capacity backoff, used ONLY for throttle/overload and ONLY on the last usable
+// ref. Kept separate from retryBackoffMs above on purpose: that curve (1–5s) is
+// sized for a one-off socket blip, and widening it globally would add dead air
+// to ordinary network errors too.
 //
-// Nominal delays are 10s, 20s, 30s, 30s, 30s, 30s (±20% jitter), so six retries
-// span roughly 120–180s of waiting and place the last attempt late enough to
-// outlive a two-minute blip.
+// Overload is normally handled by failing OVER (isRetryableSameRef excludes it),
+// so this curve only exists for the case where there is no other ref to reach:
+// a single-ref chain, or the tail of an exhausted one. Both policies get a
+// curve; they differ in how long the caller can stand to wait.
+//
+// 'patient': nominal 10s, 20s, 30s, 30s, 30s, 30s (±20% jitter), so six retries
+// span roughly 120–180s and place the last attempt late enough to outlive a
+// two-minute blip.
 export const PATIENT_OVERLOAD_RETRIES = 6
 const PATIENT_OVERLOAD_BASE_MS = 10_000
 const PATIENT_OVERLOAD_CAP_MS = 30_000
@@ -42,13 +46,61 @@ const PATIENT_OVERLOAD_CAP_MS = 30_000
 // inside the 30m reviewer/researcher spawn timeout.
 export const PATIENT_OVERLOAD_WINDOW_MS = 180_000
 
+// 'responsive': nominal 5s then 10s (±20% jitter), so two retries add at most
+// ~18s of scheduled waiting. Sized against a LIVE chat turn, where the channel
+// is already showing a typing indicator: short enough to read as thinking rather
+// than as a hang (and far inside the 120s typing-silence cap), long enough to
+// clear the intermittent capacity dips that make up the common case — the
+// incident that motivated this saw ~14% of turns fail while 85% succeeded around
+// them, so most single failures had a healthy provider seconds later.
+//
+// It deliberately does NOT try to outlive a sustained multi-minute outage. That
+// is what failing over to another ref is for; when no such ref exists, surfacing
+// the notice a few seconds later beats holding a chat thread for minutes.
+export const RESPONSIVE_OVERLOAD_RETRIES = 2
+const RESPONSIVE_OVERLOAD_BASE_MS = 5_000
+const RESPONSIVE_OVERLOAD_CAP_MS = 10_000
+export const RESPONSIVE_OVERLOAD_WINDOW_MS = 25_000
+
 // Proportional (±20%) rather than full jitter: full jitter can return ~0ms,
 // which against a capacity outage means retrying instantly into the same wall.
 // The floor keeps every wait meaningful while still decorrelating concurrent
-// subagents recovering from one upstream blip.
+// callers recovering from one upstream blip.
+function proportionalJitter(nominalMs: number, random: () => number): number {
+  return Math.floor(nominalMs * (0.8 + random() * 0.4))
+}
+
 export function patientOverloadBackoffMs(attempt: number, random: () => number = Math.random): number {
-  const nominal = Math.min(PATIENT_OVERLOAD_CAP_MS, PATIENT_OVERLOAD_BASE_MS * 2 ** attempt)
-  return Math.floor(nominal * (0.8 + random() * 0.4))
+  return proportionalJitter(Math.min(PATIENT_OVERLOAD_CAP_MS, PATIENT_OVERLOAD_BASE_MS * 2 ** attempt), random)
+}
+
+export function responsiveOverloadBackoffMs(attempt: number, random: () => number = Math.random): number {
+  return proportionalJitter(Math.min(RESPONSIVE_OVERLOAD_CAP_MS, RESPONSIVE_OVERLOAD_BASE_MS * 2 ** attempt), random)
+}
+
+export type OverloadRetryBudget = {
+  retries: number
+  windowMs: number
+  backoffMs: (attempt: number, random?: () => number) => number
+}
+
+// Single source of truth for "how long may this caller wait out a capacity
+// outage it cannot fail over from". An omitted policy resolves to 'responsive':
+// the safe default is the short curve, so a new call site that never thought
+// about retries still recovers from a blip instead of dropping the turn.
+export function overloadRetryBudget(policy: RetryPolicy | undefined): OverloadRetryBudget {
+  if (policy === 'patient') {
+    return {
+      retries: PATIENT_OVERLOAD_RETRIES,
+      windowMs: PATIENT_OVERLOAD_WINDOW_MS,
+      backoffMs: (attempt, random) => patientOverloadBackoffMs(attempt, random ?? Math.random),
+    }
+  }
+  return {
+    retries: RESPONSIVE_OVERLOAD_RETRIES,
+    windowMs: RESPONSIVE_OVERLOAD_WINDOW_MS,
+    backoffMs: (attempt, random) => responsiveOverloadBackoffMs(attempt, random ?? Math.random),
+  }
 }
 
 // Full-jitter exponential backoff: random in [0, min(cap, base·2^attempt)].
@@ -131,6 +183,12 @@ export async function retryTurnAfterCompletedToolResult(
     random?: () => number
     authorize: () => boolean
     onBackoffStart?: () => void
+    // Overrides the ordinary jittered backoff, exactly as in
+    // retryTurnOnPersistentSession. A capacity retry has already chosen its
+    // delay from the policy budget; without this the post-tool path would fall
+    // back to the 1–5s blip curve (which can jitter to ~0ms) and start
+    // hammering an overloaded ref far sooner than the budget advertises.
+    delayMs?: number
   },
 ): Promise<boolean> {
   const agent = (session as { agent?: ContinuableAgent }).agent
@@ -138,7 +196,7 @@ export async function retryTurnAfterCompletedToolResult(
   if (!hasCompletedToolResultErrorTail(agent.state?.messages)) return false
 
   opts.onBackoffStart?.()
-  await sleep(retryBackoffMs(opts.attempt, opts.random), opts.signal)
+  await sleep(opts.delayMs ?? retryBackoffMs(opts.attempt, opts.random), opts.signal)
   if (opts.signal?.aborted) return false
 
   // Re-read after the backoff: another actor may have advanced the transcript
@@ -202,10 +260,11 @@ export async function promptWithSameRefRetryOnly(
     retryPolicy?: RetryPolicy
     random?: () => number
     now?: () => number
-    patientBackoffMs?: (attempt: number) => number
+    overloadBackoffMs?: (attempt: number) => number
   } = {},
 ): Promise<SameRefPromptResult> {
   const now = opts.now ?? (() => performance.now())
+  const overloadBudget = overloadRetryBudget(opts.retryPolicy)
   let softError: Error | undefined
   // Feature-detect subscribe: some lightweight call sites / test fakes pass a
   // session without an event stream. Without it we simply can't observe soft
@@ -223,7 +282,7 @@ export async function promptWithSameRefRetryOnly(
     let priorHardError: Error | undefined
     let lastError: Error | undefined
     let overloadRetries = 0
-    let patientWindowStartedAt: number | undefined
+    let overloadWindowStartedAt: number | undefined
     let nextDelayMs: number | undefined
     for (let attempt = 0; ; attempt++) {
       softError = undefined
@@ -249,25 +308,25 @@ export async function promptWithSameRefRetryOnly(
       const error = hardError ?? softError
       if (error === undefined) return { success: true }
       lastError = error
-      // A patient call site rides out a capacity outage on the same ref: there is
-      // no cross-ref failover on this path, so declining to retry an overload
+      // Every call site here rides out a capacity outage on the same ref: there
+      // is no cross-ref failover on this path, so declining to retry an overload
       // (isRetryableSameRef excludes it, expecting failover to handle it) would
-      // leave it with no recovery at all.
+      // leave it with no recovery at all. How long it may wait comes from the
+      // policy's budget — see overloadRetryBudget.
       // The delay is budgeted BEFORE the retry is accepted: an elapsed-only check
       // would let a retry taken just under the deadline sleep past it.
       const nowMs = now()
-      const patientDelayMs =
-        opts.retryPolicy === 'patient' && isThrottleOrOverload(error.message)
-          ? (opts.patientBackoffMs ?? ((n: number) => patientOverloadBackoffMs(n, opts.random)))(overloadRetries)
-          : undefined
-      const patientElapsedMs = patientWindowStartedAt === undefined ? 0 : nowMs - patientWindowStartedAt
-      const patientOverload =
-        patientDelayMs !== undefined &&
-        overloadRetries < PATIENT_OVERLOAD_RETRIES &&
-        patientElapsedMs + patientDelayMs <= PATIENT_OVERLOAD_WINDOW_MS
-      if (patientOverload) {
-        patientWindowStartedAt ??= nowMs
-        nextDelayMs = patientDelayMs
+      const overloadDelayMs = isThrottleOrOverload(error.message)
+        ? (opts.overloadBackoffMs ?? ((n: number) => overloadBudget.backoffMs(n, opts.random)))(overloadRetries)
+        : undefined
+      const overloadElapsedMs = overloadWindowStartedAt === undefined ? 0 : nowMs - overloadWindowStartedAt
+      const overloadRetry =
+        overloadDelayMs !== undefined &&
+        overloadRetries < overloadBudget.retries &&
+        overloadElapsedMs + overloadDelayMs <= overloadBudget.windowMs
+      if (overloadRetry) {
+        overloadWindowStartedAt ??= nowMs
+        nextDelayMs = overloadDelayMs
         overloadRetries++
       } else if (attempt < RETRIES_PER_REF && isRetryableSameRef(error.message)) {
         nextDelayMs = undefined
