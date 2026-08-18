@@ -23,6 +23,8 @@ import type { ToolDefinition } from '@mariozechner/pi-coding-agent'
 import { Type } from 'typebox'
 import { z } from 'zod'
 
+import bunHygienePlugin from '@/bundled-plugins/bun-hygiene'
+import guardPlugin from '@/bundled-plugins/guard'
 import { createDreamingSubagent } from '@/bundled-plugins/memory/dreaming'
 import { createWriteReportTool } from '@/bundled-plugins/researcher/write-report'
 import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
@@ -30,7 +32,8 @@ import { buildOperationalIncidentChecks } from '@/doctor/operational-incidents'
 import { hooklessGitArgs } from '@/git/hookless'
 import { DeclaredSkillBinUnresolvedError, IncidentLedger, readIncidentLedger, RemediationRegistry } from '@/operations'
 import { createPermissionService } from '@/permissions/permissions'
-import { createHookBus, defineTool, type PluginRegistry, type ToolResult } from '@/plugin'
+import { createHookBus, defineTool, loadPlugins, type PluginRegistry, type ToolResult } from '@/plugin'
+import { emptyRegistry } from '@/plugin/registry'
 import {
   buildSandboxedCommand,
   canWriteAgentRootInSandbox,
@@ -129,6 +132,96 @@ describe('zodToToolParameters', () => {
 })
 
 describe('wrapPluginTool', () => {
+  test('exposes the reserved acknowledgement envelope to hooks but not plugin execution', async () => {
+    const hookArgs: Record<string, unknown>[] = []
+    const executionArgs: Record<string, unknown>[] = []
+    const tool = defineTool({
+      description: '',
+      parameters: z.object({ value: z.string() }),
+      async execute(args) {
+        executionArgs.push(args)
+        return { content: [{ type: 'text', text: args.value }] }
+      },
+    })
+    const hooks = createHookBus()
+    hooks.registerAll('guard', '/agent', noopLogger, {
+      'tool.before': (event) => {
+        hookArgs.push(structuredClone(event.args))
+      },
+    })
+    const guardAcknowledgements = new Map([['plugin_echo', new Set(['fixtureAck'])]])
+    const wrapped = wrapPluginTool(tool, {
+      pluginName: 'fixture',
+      toolName: 'plugin_echo',
+      agentDir: '/agent',
+      sessionId: 's',
+      logger: noopLogger,
+      hooks,
+      guardAcknowledgements,
+    })
+
+    const parameters = wrapped.parameters as {
+      properties?: Record<string, { properties?: Record<string, unknown>; additionalProperties?: boolean }>
+    }
+    expect(Object.keys(parameters.properties?.acknowledgeGuards?.properties ?? {})).toEqual(['fixtureAck'])
+    expect(parameters.properties?.acknowledgeGuards?.additionalProperties).toBe(false)
+
+    const result = await wrapped.execute(
+      'c',
+      { value: 'ok', acknowledgeGuards: { fixtureAck: true } },
+      undefined,
+      undefined,
+      {} as never,
+    )
+
+    expect(textOfFirstContent(result)).toBe('ok')
+    expect(hookArgs).toEqual([{ value: 'ok', acknowledgeGuards: { fixtureAck: true } }])
+    expect(executionArgs).toEqual([{ value: 'ok' }])
+  })
+
+  test('rejects undeclared acknowledgement keys before plugin hooks or execution', async () => {
+    let hookRan = false
+    let executed = false
+    const hooks = createHookBus()
+    hooks.registerAll('guard', '/agent', noopLogger, {
+      'tool.before': () => {
+        hookRan = true
+      },
+    })
+    const wrapped = wrapPluginTool(
+      defineTool({
+        description: '',
+        parameters: z.object({ value: z.string() }),
+        async execute() {
+          executed = true
+          return { content: [] }
+        },
+      }),
+      {
+        pluginName: 'fixture',
+        toolName: 'plugin_echo',
+        agentDir: '/agent',
+        sessionId: 's',
+        logger: noopLogger,
+        hooks,
+        guardAcknowledgements: new Map([['plugin_echo', new Set(['fixtureAck'])]]),
+      },
+    )
+
+    const result = await wrapped.execute(
+      'c',
+      { value: 'no', acknowledgeGuards: { otherAck: true } },
+      undefined,
+      undefined,
+      {} as never,
+    )
+
+    expect(result).toMatchObject({ isError: true })
+    expect(textOfFirstContent(result)).toContain('otherAck')
+    expect(hookRan).toBe(false)
+    expect(executed).toBe(false)
+  })
+
   test('blocks a declared filename operand that targets a canonical secret', async () => {
     const calls: string[] = []
     const tool = defineTool({
@@ -1010,7 +1103,12 @@ describe('wrapSystemTool', () => {
         },
       })
 
-      const wrapped = wrapSystemTool(tool, { agentDir, sessionId: 's', hooks })
+      const wrapped = wrapSystemTool(tool, {
+        agentDir,
+        sessionId: 's',
+        hooks,
+        guardAcknowledgements: new Map([['write', new Set(['nonWorkspaceWrite'])]]),
+      })
 
       const parameters = wrapped.parameters as { properties?: Record<string, unknown> }
       expect(parameters.properties).toHaveProperty('acknowledgeGuards')
@@ -2945,7 +3043,12 @@ describe('wrapBuiltinToolDefinition (hook + guard pipeline)', () => {
         },
       })
 
-      const wrapped = wrapBuiltinToolDefinition(tool, { agentDir, sessionId: 's', hooks })
+      const wrapped = wrapBuiltinToolDefinition(tool, {
+        agentDir,
+        sessionId: 's',
+        hooks,
+        guardAcknowledgements: new Map([['edit', new Set(['nonWorkspaceWrite'])]]),
+      })
 
       const parameters = wrapped.parameters as { properties?: Record<string, unknown> }
       expect(parameters.properties).toHaveProperty('acknowledgeGuards')
@@ -3263,55 +3366,57 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
     expect(overrides.map((t) => t.name)).toEqual(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'])
   })
 
-  test('buildBuiltinPiToolOverrides preserves edit guard-acknowledgement schema (so the model can pass acknowledgeGuards on edit)', async () => {
-    const hooks = createHookBus()
-    const overrides = buildBuiltinPiToolOverrides({ agentDir: '/agent', sessionId: 's', hooks })
-    const edit = overrides.find((t) => t.name === 'edit')
-    expect(edit).toBeDefined()
-    const params = (edit as ToolDefinition).parameters as { properties?: Record<string, unknown> }
-    expect(params.properties).toBeDefined()
-    expect(params.properties).toHaveProperty('acknowledgeGuards')
-  })
+  test('publishes the exact advisory acknowledgement schema owned by each tool', async () => {
+    const { registry } = await loadPlugins({
+      entries: [],
+      agentDir: '/agent',
+      configsByName: {},
+      bundled: [
+        { name: 'guard', version: undefined, source: '<bundled>', defined: guardPlugin },
+        { name: 'bun-hygiene', version: undefined, source: '<bundled>', defined: bunHygienePlugin },
+      ],
+    })
+    const registered = Object.fromEntries(
+      [...registry.guardAcknowledgements]
+        .map(([tool, keys]) => [tool, [...keys]] as const)
+        .sort(([left], [right]) => left.localeCompare(right)),
+    )
+    expect(registered).toEqual({
+      bash: ['globalInstall', 'nonBunPackageManager'],
+      edit: ['nonWorkspaceWrite'],
+      read: ['imageReadRedirect'],
+      write: ['nonWorkspaceWrite'],
+    })
 
-  // given: the security plugin's tool.before policies read
-  //   `acknowledgeGuards.<guardName>: true` keys
-  // when: a new high-tier guard ships expecting an ack key
-  // then: the published JSON Schema for `acknowledgeGuards` MUST advertise
-  //       that key, OR strict-mode LLM clients (OpenAI strict tool calling,
-  //       Anthropic with `additionalProperties: false`) will refuse to emit
-  //       it AND lax clients will strip it before the tool wrapper sees it.
-  //       This test pins every ack key the security/guard plugins read.
-  test('ACKNOWLEDGE_GUARDS_SCHEMA advertises every guard key the security/guard plugins read', async () => {
-    const hooks = createHookBus()
-    const overrides = buildBuiltinPiToolOverrides({ agentDir: '/agent', sessionId: 's', hooks })
-    const write = overrides.find((t) => t.name === 'write')
-    const params = (write as ToolDefinition).parameters as { properties?: Record<string, unknown> }
-    const ack = params.properties?.acknowledgeGuards as { properties?: Record<string, unknown> } | undefined
-    expect(ack).toBeDefined()
-    const ackProps = ack?.properties ?? {}
-    expect(ackProps).toHaveProperty('nonWorkspaceWrite')
-    expect(ackProps).toHaveProperty('rolePromotion')
-    expect(ackProps).toHaveProperty('cronPromotion')
-  })
-
-  // given: the acknowledgeGuards schema permits exactly the keys we
-  //   advertise
-  // when: a future refactor relaxes the schema to allow arbitrary keys
-  // then: typos like `acknowledgeGuards: { rolePromotin: true }` would
-  //   silently no-op (the strict schema currently rejects them, so the
-  //   model gets immediate feedback). Pin additionalProperties:false on
-  //   BOTH write and edit since both expose the schema. Oracle PR #305
-  //   finding #7.
-  test('ACKNOWLEDGE_GUARDS_SCHEMA pins additionalProperties:false on write and edit (no silent typo passthrough)', async () => {
-    const hooks = createHookBus()
-    const overrides = buildBuiltinPiToolOverrides({ agentDir: '/agent', sessionId: 's', hooks })
-    for (const toolName of ['write', 'edit'] as const) {
-      const tool = overrides.find((t) => t.name === toolName)
-      const params = (tool as ToolDefinition).parameters as { properties?: Record<string, unknown> }
-      const ack = params.properties?.acknowledgeGuards as { additionalProperties?: boolean } | undefined
-      expect(ack).toBeDefined()
-      expect(ack?.additionalProperties).toBe(false)
-    }
+    const overrides = buildBuiltinPiToolOverrides({
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks: createHookBus(),
+      guardAcknowledgements: registry.guardAcknowledgements,
+    })
+    const schemas = Object.fromEntries(
+      overrides.map((tool) => {
+        const params = tool.parameters as { properties?: Record<string, unknown> }
+        const envelope = params.properties?.acknowledgeGuards as
+          | { properties?: Record<string, unknown>; additionalProperties?: boolean }
+          | undefined
+        return [
+          tool.name,
+          envelope === undefined
+            ? undefined
+            : { keys: Object.keys(envelope.properties ?? {}), additionalProperties: envelope.additionalProperties },
+        ]
+      }),
+    )
+    expect(schemas).toEqual({
+      read: { keys: ['imageReadRedirect'], additionalProperties: false },
+      bash: { keys: ['globalInstall', 'nonBunPackageManager'], additionalProperties: false },
+      edit: { keys: ['nonWorkspaceWrite'], additionalProperties: false },
+      write: { keys: ['nonWorkspaceWrite'], additionalProperties: false },
+      grep: undefined,
+      find: undefined,
+      ls: undefined,
+    })
   })
 })
 
@@ -5134,16 +5239,7 @@ describe('setupSession integration: builtin pi tools route through customTools w
     hooks.registerAll('p1', agentDir, noopLogger, {
       'tool.before': () => undefined,
     })
-    const registry: PluginRegistry = {
-      tools: [],
-      subagents: [],
-      cronJobs: [],
-      skills: [],
-      skillsDirs: [],
-      doctorChecks: [],
-      commands: [],
-      disposers: [],
-    }
+    const registry: PluginRegistry = emptyRegistry()
 
     const session = await createSession({
       plugins: { registry, hooks, sessionId: 'test-session', agentDir },
@@ -5188,16 +5284,7 @@ describe('setupSession integration: builtin pi tools route through customTools w
     hooks.registerAll('p1', agentDir, noopLogger, {
       'tool.before': () => undefined,
     })
-    const registry: PluginRegistry = {
-      tools: [],
-      subagents: [],
-      cronJobs: [],
-      skills: [],
-      skillsDirs: [],
-      doctorChecks: [],
-      commands: [],
-      disposers: [],
-    }
+    const registry: PluginRegistry = emptyRegistry()
 
     const session = await createSession({
       plugins: { registry, hooks, sessionId: 'test-session', agentDir },
@@ -5215,16 +5302,7 @@ describe('setupSession integration: builtin pi tools route through customTools w
     hooks.registerAll('p1', agentDir, noopLogger, {
       'tool.before': () => undefined,
     })
-    const registry: PluginRegistry = {
-      tools: [],
-      subagents: [],
-      cronJobs: [],
-      skills: [],
-      skillsDirs: [],
-      doctorChecks: [],
-      commands: [],
-      disposers: [],
-    }
+    const registry: PluginRegistry = emptyRegistry()
 
     const session = await createSession({
       plugins: { registry, hooks, sessionId: 'test-session', agentDir },
@@ -5257,16 +5335,7 @@ describe('setupSession integration: builtin pi tools route through customTools w
     hooks.registerAll('p1', agentDir, noopLogger, {
       'tool.before': () => undefined,
     })
-    const registry: PluginRegistry = {
-      tools: [],
-      subagents: [],
-      cronJobs: [],
-      skills: [],
-      skillsDirs: [],
-      doctorChecks: [],
-      commands: [],
-      disposers: [],
-    }
+    const registry: PluginRegistry = emptyRegistry()
 
     const session = await createSession({
       plugins: { registry, hooks, sessionId: 'test-session', agentDir },

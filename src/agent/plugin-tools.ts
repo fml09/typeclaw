@@ -39,6 +39,7 @@ import type { PermissionService } from '@/permissions/permissions'
 import type {
   BuiltinToolRef,
   ContentPart,
+  GuardAcknowledgementRegistry,
   HookBus,
   PluginLogger,
   Tool,
@@ -47,6 +48,7 @@ import type {
   ToolFileOperands,
   ToolResult,
 } from '@/plugin'
+import { FIRST_PARTY_GUARD_ACKNOWLEDGEMENT_DECLARATIONS } from '@/plugin/guard-acknowledgements'
 import {
   buildSandboxedCommand,
   canWriteAgentRootInSandbox,
@@ -158,16 +160,19 @@ export function sanitizeBashSpawnEnvironment(
   return env
 }
 
-const ACKNOWLEDGE_GUARDS_SCHEMA = Type.Optional(
-  Type.Object(
-    {
-      nonWorkspaceWrite: Type.Optional(Type.Boolean()),
-      rolePromotion: Type.Optional(Type.Boolean()),
-      cronPromotion: Type.Optional(Type.Boolean()),
-    },
-    { additionalProperties: false },
-  ),
-)
+// Folds the whole declaration list: indexing element 0 would silently drop a
+// second first-party declaration, or a second tool on an existing one.
+const FIRST_PARTY_GUARD_ACKNOWLEDGEMENTS: GuardAcknowledgementRegistry = (() => {
+  const registry = new Map<string, Set<string>>()
+  for (const { key, tools } of FIRST_PARTY_GUARD_ACKNOWLEDGEMENT_DECLARATIONS) {
+    for (const tool of tools) {
+      const keys = registry.get(tool) ?? new Set<string>()
+      keys.add(key)
+      registry.set(tool, keys)
+    }
+  }
+  return registry
+})()
 
 // pi-coding-agent 0.73 contract (load-bearing for hook coverage):
 //   - `createAgentSession({ tools: string[] })` is a name allowlist: only the
@@ -265,6 +270,7 @@ export type WrapToolOptions = {
   // session whose `agent.abort` this points at. See `fireLoopAbort`.
   getAbort?: () => ((reason?: string) => void) | undefined
   getLoopGuardTurn?: () => number | undefined
+  guardAcknowledgements?: GuardAcknowledgementRegistry
 }
 
 export type BashSandboxBoundary = {
@@ -310,6 +316,7 @@ export type WrapSystemToolOptions = {
   // returning undefined keeps the existing fail-closed scan.
   resolvePreflightFileOperands?: (tool: string, args: Record<string, unknown>) => ToolFileOperands | undefined
   incidentLedger?: IncidentLedger
+  guardAcknowledgements?: GuardAcknowledgementRegistry
 }
 
 // Zod 4 emits a top-level `"$schema": "https://json-schema.org/draft/2020-12/schema"`
@@ -334,7 +341,12 @@ export function zodToToolParameters(schema: z.ZodType<unknown>): TSchema {
 }
 
 export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefinition {
-  const parameters = zodToToolParameters(tool.parameters)
+  const guardAcknowledgements = opts.guardAcknowledgements ?? FIRST_PARTY_GUARD_ACKNOWLEDGEMENTS
+  const parameters = withGuardAcknowledgements(
+    opts.toolName,
+    zodToToolParameters(tool.parameters),
+    guardAcknowledgements,
+  )
 
   return piDefineTool({
     name: opts.toolName,
@@ -342,12 +354,18 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
     description: tool.description,
     parameters,
     async execute(toolCallId, params, signal) {
-      const validated = tool.parameters.safeParse(params)
+      const envelope = extractGuardAcknowledgements(params, opts.toolName, guardAcknowledgements)
+      if (!envelope.ok) return errorResult(`invalid arguments: ${envelope.error}`)
+
+      const validated = tool.parameters.safeParse(envelope.pluginArgs)
       if (!validated.success) {
         return errorResult(`invalid arguments: ${validated.error.message}`)
       }
 
       const mutableArgs = validated.data as Record<string, unknown>
+      if (envelope.acknowledgements !== undefined) {
+        mutableArgs[ACKNOWLEDGE_GUARDS] = envelope.acknowledgements
+      }
       const liveOrigin = opts.getOrigin?.()
       const before: ToolBeforeEvent = {
         tool: opts.toolName,
@@ -363,6 +381,7 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
       if (blockResult !== undefined) {
         return errorResult(`blocked: ${blockResult.reason}`)
       }
+      stripGuardAcknowledgements(mutableArgs)
 
       const loopGate = gateLoopGuard(
         opts.sessionId,
@@ -445,7 +464,11 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
 ): ToolDefinition<TParams, TDetails, TState> {
   return piDefineTool({
     ...tool,
-    parameters: withGuardAcknowledgements(tool.name, tool.parameters),
+    parameters: withGuardAcknowledgements(
+      tool.name,
+      tool.parameters,
+      opts.guardAcknowledgements ?? FIRST_PARTY_GUARD_ACKNOWLEDGEMENTS,
+    ),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const mutableArgs = params as Record<string, unknown>
       normalizeDefaultTreeRoot(tool.name, mutableArgs)
@@ -552,7 +575,11 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
 ): ToolDefinition<TParams, TDetails, TState> {
   return piDefineTool({
     ...tool,
-    parameters: withGuardAcknowledgements(tool.name, tool.parameters),
+    parameters: withGuardAcknowledgements(
+      tool.name,
+      tool.parameters,
+      opts.guardAcknowledgements ?? FIRST_PARTY_GUARD_ACKNOWLEDGEMENTS,
+    ),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const mutableArgs = params as Record<string, unknown>
       const originalBashCommand =
@@ -1382,20 +1409,64 @@ function runFinalReadGuards(options: { tool: string; args: Record<string, unknow
   return checkImageReadRedirect(options)
 }
 
-function withGuardAcknowledgements<TParams extends TSchema>(toolName: string, parameters: TParams): TParams {
-  if (toolName !== 'write' && toolName !== 'edit') return parameters
+function withGuardAcknowledgements<TParams extends TSchema>(
+  toolName: string,
+  parameters: TParams,
+  registry: GuardAcknowledgementRegistry,
+): TParams {
+  const allowedKeys = registry.get(toolName)
+  if (allowedKeys === undefined || allowedKeys.size === 0) return parameters
 
   const schema = parameters as Record<string, unknown>
   const properties = schema.properties
   if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return parameters
+  if (ACKNOWLEDGE_GUARDS in properties) {
+    throw new Error(`tool "${toolName}" declares reserved parameter "${ACKNOWLEDGE_GUARDS}"`)
+  }
+
+  const acknowledgementProperties: Record<string, TSchema> = {}
+  for (const key of allowedKeys) acknowledgementProperties[key] = Type.Optional(Type.Boolean())
 
   return {
     ...schema,
     properties: {
       ...(properties as Record<string, unknown>),
-      [ACKNOWLEDGE_GUARDS]: ACKNOWLEDGE_GUARDS_SCHEMA,
+      [ACKNOWLEDGE_GUARDS]: Type.Optional(Type.Object(acknowledgementProperties, { additionalProperties: false })),
     },
   } as unknown as TParams
+}
+
+function extractGuardAcknowledgements(
+  params: unknown,
+  toolName: string,
+  registry: GuardAcknowledgementRegistry,
+): { ok: true; pluginArgs: unknown; acknowledgements?: Record<string, boolean> } | { ok: false; error: string } {
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+    return { ok: true, pluginArgs: params }
+  }
+
+  const pluginArgs = { ...(params as Record<string, unknown>) }
+  if (!Object.hasOwn(pluginArgs, ACKNOWLEDGE_GUARDS)) return { ok: true, pluginArgs }
+
+  const rawAcknowledgements = pluginArgs[ACKNOWLEDGE_GUARDS]
+  delete pluginArgs[ACKNOWLEDGE_GUARDS]
+  if (rawAcknowledgements === null || typeof rawAcknowledgements !== 'object' || Array.isArray(rawAcknowledgements)) {
+    return { ok: false, error: `${ACKNOWLEDGE_GUARDS} must be an object` }
+  }
+
+  const allowedKeys = registry.get(toolName)
+  const acknowledgements: Record<string, boolean> = {}
+  for (const [key, value] of Object.entries(rawAcknowledgements as Record<string, unknown>)) {
+    if (allowedKeys?.has(key) !== true) {
+      return { ok: false, error: `${ACKNOWLEDGE_GUARDS}.${key} is not allowed for tool "${toolName}"` }
+    }
+    if (typeof value !== 'boolean') {
+      return { ok: false, error: `${ACKNOWLEDGE_GUARDS}.${key} must be a boolean` }
+    }
+    acknowledgements[key] = value
+  }
+
+  return { ok: true, pluginArgs, acknowledgements }
 }
 
 function stripGuardAcknowledgements(args: Record<string, unknown>): void {
