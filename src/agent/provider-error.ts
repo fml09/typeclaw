@@ -210,7 +210,12 @@ const NETWORK_OR_5XX =
 // session drops, observer stalls, and network/5xx blips. It intentionally EXCLUDES
 // throttle/overload (429/503) — those mean "this ref is out of capacity now", so
 // they should fail OVER to another ref rather than burn same-ref retries — and
-// account-wide faults (auth/billing/quota/cyber_policy), which must surface. It
+// account-wide faults (auth/billing/quota/cyber_policy), which must surface.
+// NOTE the overload exclusion assumes a ref to fail over to EXISTS. When one does
+// not (last usable ref, or a single-ref chain), the callers apply their own
+// capacity backoff on top of this predicate rather than widening it — see
+// overloadRetryBudget in retry-same-ref.ts. Widening it here instead would make
+// every ref in a healthy chain burn retries before failing over. It
 // does NOT match context-overflow: that stays on the SDK compaction path and must
 // never be treated as a retryable provider failure.
 export function isRetryableSameRef(raw: string): boolean {
