@@ -14,6 +14,7 @@ import { createMemorySearchTool } from '@/bundled-plugins/memory/search-tool'
 import type { CronJob } from '@/cron'
 import { createPermissionService, type PermissionService } from '@/permissions'
 import { createHookBus, type HookBus, type PluginRegistry } from '@/plugin'
+import { emptyRegistry } from '@/plugin/registry'
 import { createPluginRuntime, type PluginRuntime } from '@/run/plugin-runtime'
 import { createSessionFactory, type SessionFactory } from '@/sessions'
 import type { ServerMessage, TunnelLogsServerMessage } from '@/shared'
@@ -39,16 +40,7 @@ function makeRuntime(opts: { registry: PluginRegistry; hooks: HookBus }): Plugin
   })
 }
 
-const EMPTY_REGISTRY: PluginRegistry = {
-  tools: [],
-  subagents: [],
-  cronJobs: [],
-  skills: [],
-  skillsDirs: [],
-  doctorChecks: [],
-  commands: [],
-  disposers: [],
-}
+const EMPTY_REGISTRY: PluginRegistry = emptyRegistry()
 
 function makeRuntimeWith(opts: { subagents: SubagentRegistry }): PluginRuntime {
   return createPluginRuntime({

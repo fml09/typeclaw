@@ -3,21 +3,9 @@ import { describe, expect, test } from 'bun:test'
 import { z } from 'zod'
 
 import type { PluginRegistry, Subagent as PluginSubagent } from '@/plugin'
+import { emptyRegistry } from '@/plugin/registry'
 
 import { mergeSubagents } from './index'
-
-function emptyRegistry(): PluginRegistry {
-  return {
-    tools: [],
-    subagents: [],
-    cronJobs: [],
-    skills: [],
-    skillsDirs: [],
-    doctorChecks: [],
-    commands: [],
-    disposers: [],
-  }
-}
 
 function registerSubagent(reg: PluginRegistry, name: string, subagent: PluginSubagent<any>): PluginRegistry {
   reg.subagents.push({ pluginName: 'test-plugin', subagentName: name, subagent })

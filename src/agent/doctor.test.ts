@@ -8,23 +8,11 @@ import type {
   PluginLogger,
   PluginRegistry,
 } from '@/plugin'
+import { emptyRegistry } from '@/plugin/registry'
 
 import { runPluginDoctorChecks, runPluginDoctorFix, sanitizeChangedPaths } from './doctor'
 
 const silentLogger: PluginLogger = { info: () => {}, warn: () => {}, error: () => {} }
-
-function emptyRegistry(): PluginRegistry {
-  return {
-    tools: [],
-    subagents: [],
-    cronJobs: [],
-    skills: [],
-    skillsDirs: [],
-    doctorChecks: [],
-    commands: [],
-    disposers: [],
-  }
-}
 
 function registerCheck(
   registry: PluginRegistry,
