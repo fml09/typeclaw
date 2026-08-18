@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { formatLocalDateTime, resolveLocalTimezoneName } from '@/shared'
 
@@ -67,26 +69,59 @@ describe('operator-owned dependencies', () => {
 
 describe('agent folder vs project repo', () => {
   // Guards the confusion where the agent treats its own backup repo as the
-  // project under development — tries to push it as a PR, or claims it has no
-  // remote so it "can't open the PR". Both prompts must keep the distinction:
-  // the agent folder is a private, remote-less backup repo; project work and PRs
-  // happen in a separate clone (e.g. /tmp/<repo>).
+  // project under development, or strands handoff-bound work in per-session
+  // /tmp. Both prompts must keep the project clone durable and split the two
+  // publication capabilities: a standalone push is brokered, `gh pr create` is
+  // host-stage only.
   test.each([
     ['default prompt', DEFAULT_SYSTEM_PROMPT],
     ['slim prompt', SLIM_SYSTEM_PROMPT],
   ])('states the agent folder is a backup repo, not a project checkout, in the %s', (_name, prompt) => {
     expect(prompt).toMatch(/no (github )?remote/i)
-    expect(prompt).toMatch(/clone[\s\S]*?\/tmp/i)
+    expect(prompt).toContain('`workspace/<repo>`')
+    expect(prompt).toMatch(/\/tmp[\s\S]*?per-session[\s\S]*?dies with the container/i)
+    expect(prompt).not.toMatch(/clone[\s\S]{0,80}?\/tmp\/<repo>/i)
     expect(prompt).toMatch(/not a (software )?project (checkout|you develop)|not a checkout of any project/i)
+  })
+
+  // The runtime brokers a per-repo credential for a standalone project push, so
+  // neither prompt may claim model-driven bash cannot push. `gh pr create` is
+  // the only host-stage-only step; conflating the two strands real work.
+  test.each([
+    ['default prompt', DEFAULT_SYSTEM_PROMPT],
+    ['slim prompt', SLIM_SYSTEM_PROMPT],
+  ])('splits brokered push from host-stage-only PR creation in the %s', (_name, prompt) => {
+    expect(prompt).toContain('git -C workspace/<repo> push -u origin <branch>')
+    expect(prompt).toMatch(/broker[\s\S]*?credential/i)
+    expect(prompt).toMatch(/gh pr create[\s\S]*?host-stage only/i)
+    expect(prompt).toMatch(/refuse it/i)
+    expect(prompt).not.toMatch(/cannot push or create a PR/i)
   })
 
   test('the default prompt explicitly tells the agent where project work and PRs happen', () => {
     const start = DEFAULT_SYSTEM_PROMPT.indexOf('it is your own private backup repo')
     expect(start).toBeGreaterThan(-1)
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, start + 900)
+    const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('\n\n', start + 400))
     expect(section).toMatch(/not\*{0,2} a checkout of any project/i)
-    expect(section).toMatch(/open the PR from that clone/i)
+    expect(section).toMatch(/anything a human must act on later cannot live there alone/i)
+    expect(section).toMatch(/gitExfil/)
     expect(section).toMatch(/ask the user where it lives/i)
+  })
+
+  // The prompts and the two GitHub skills are mirrored guidance; the skills are
+  // what the agent actually loads for PR work, so a fix applied only to the
+  // prompts leaves the operative instruction contradicting itself.
+  test.each([
+    ['channel-github skill', 'typeclaw-channel-github'],
+    ['github-contributing skill', 'typeclaw-github-contributing'],
+  ])('mirrors the brokered-push / host-stage-PR split in the %s', (_name, slug) => {
+    const skill = readFileSync(join(import.meta.dir, '..', 'skills', slug, 'SKILL.md'), 'utf8')
+    expect(skill).toMatch(/push -u origin <branch>/)
+    expect(skill).toMatch(/broker[\s\S]*?credential/i)
+    expect(skill).toMatch(/gh pr create[\s\S]*?host-stage only/i)
+    expect(skill).toMatch(/refuse it/i)
+    expect(skill).not.toMatch(/cannot (push or create|create or push) a PR/i)
+    expect(skill).not.toMatch(/cannot run `gh pr checkout` or authenticated `git push`/i)
   })
 })
 
