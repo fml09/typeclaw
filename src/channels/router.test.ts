@@ -15611,6 +15611,89 @@ describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-ind
     expect(sent.filter((t) => t.startsWith('⚠️'))).toHaveLength(1)
   })
 
+  test('does not carry tool activity into a finished-subagent completion wake', async () => {
+    // given: the production incident. A PR turn spawned a background reviewer (a
+    // tool call) and deliberately ended silent, per the subagent contract. The
+    // reviewer finished, and the completion wake carrying its verdict died on a
+    // provider overload WITHOUT touching a tool. Turn A's tool activity must not
+    // license silence for the wake, or the verdict is lost with no signal at all.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '이 PR 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => {
+      sessions[0]!.emit({ type: 'tool_execution_start' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent.filter((t) => t.startsWith('⚠️'))).toHaveLength(0)
+
+    // when: the completion wake arrives and its prompt dies on the provider
+    sessions[0]!.onPrompt = () => {
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'server_is_overloaded' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'reviewer',
+      taskId: 'bg_reviewer',
+      ok: true,
+      durationMs: 5_000,
+    })
+    await waitFor(() => sent.some((t) => t.startsWith('⚠️')))
+
+    // then: the wake ran as its own logical turn and its death is visible
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('bg_reviewer')
+    expect(sent.filter((t) => t.startsWith('⚠️'))).toHaveLength(1)
+    expect(logs.some((m) => /provider_error_notice_suppressed reason=tool_activity_this_turn/.test(m))).toBe(false)
+  })
+
+  test('still carries tool activity across a retry nudge in the same logical turn', async () => {
+    // given: the negative half of the contract above. A retry nudge is the SAME
+    // logical turn trying again, so the tool activity that already ran does still
+    // license silence. Resetting indiscriminately on every reminder-only
+    // iteration would strand a false "provider failed" notice above real work.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '이 PR 다시 봐줘' }))
+    let promptAttempt = 0
+    sessions[0]!.onPrompt = () => {
+      promptAttempt++
+      if (promptAttempt === 1) {
+        sessions[0]!.emit({ type: 'tool_execution_start' })
+        sessions[0]!.setAssistantMidTurn('', 'length')
+        return
+      }
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'server_is_overloaded' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(promptAttempt).toBeGreaterThan(1)
+    expect(sent.filter((t) => t.startsWith('⚠️'))).toHaveLength(0)
+    expect(logs.some((m) => /provider_error_notice_suppressed reason=tool_activity_this_turn/.test(m))).toBe(true)
+  })
+
   test('keeps the deferred warning latched when recovery queues an empty-continuation nudge', async () => {
     const dir = await tempDir()
     const sent: string[] = []
@@ -16509,6 +16592,107 @@ describe('ChannelRouter background-child await suppression', () => {
     expect(sent).toEqual([ACK])
     expect(logs.some((m) => m.includes('send_willingness_nudge'))).toBe(false)
   })
+
+  test('a completion wake stays suppressed while an older sibling child is still running', async () => {
+    // given: two background children spawned in the same turn. A finishes and its
+    // completion wake arrives while B is STILL running. The wake opens a new
+    // logical turn, but the await-suppression gate must keep seeing B — otherwise
+    // the recovery ladder manufactures a status post for a session that is still
+    // legitimately waiting, which is the duplicate-comment failure f1f36462 fixed.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const nowRef = { value: CHILD_STARTED_AT }
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef,
+      newestRunningChildSubagentStartedAt: runningChild,
+    })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent).toEqual([])
+
+    // when: the clock advances and child A's completion wakes the session
+    nowRef.value = CHILD_STARTED_AT + 60_000
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'reviewer',
+      taskId: 'bg_child_a',
+      ok: true,
+      durationMs: 5_000,
+    })
+    await waitFor(() => sessions[0]!.prompts.length >= 2)
+
+    // then: sibling B still mutes the ladder — no manufactured post
+    expect(sent).toEqual([])
+    expect(logs.some((m) => m.includes('empty_turn_retry'))).toBe(false)
+    expect(logs.some((m) => m.includes('empty_turn_fallback'))).toBe(false)
+    expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(true)
+  })
+
+  for (const wakeupFirst of [true, false]) {
+    const order = wakeupFirst ? 'wakeup-then-retry' : 'retry-then-wakeup'
+    test(`a NO_REPLY wake in a mixed ${order} batch does not post a willingness fallback`, async () => {
+      // given: a willingness nudge (retry) and a completion wake coalesce into one
+      // reminder-only iteration. The wake wins the logical-turn boundary and clears
+      // the nudge budget, so the willingness bookkeeping describes a superseded
+      // turn. A legitimate NO_REPLY from the wake must not be read as a dropped
+      // promise from that older turn.
+      const dir = await tempDir()
+      const logs: string[] = []
+      const sent: string[] = []
+      const { router, sessions } = makeRouter(dir, { logs })
+      router.registerOutbound('discord-bot', async (msg) => {
+        sent.push(msg.text ?? '')
+        return { ok: true }
+      })
+
+      await router.route(inbound({ text: 'PR 좀 리뷰해줘' }))
+      let promptAttempt = 0
+      sessions[0]!.onPrompt = async () => {
+        promptAttempt++
+        if (promptAttempt === 1) {
+          await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '살펴볼게.' })
+          // Queued mid-drain so both land in the SAME next iteration; the drain is
+          // already running, so the completion wake will not start its own.
+          const queueWake = (): void => {
+            router.injectSubagentCompletionReminder({
+              parentSessionId: 'ses_fake_1',
+              subagent: 'reviewer',
+              taskId: 'bg_reviewer',
+              ok: true,
+              durationMs: 5_000,
+            })
+          }
+          const queueRetry = (): void => router.__testing!.injectContinuationReminder(KEY, WILLINGNESS_NUDGE)
+          if (wakeupFirst) {
+            queueWake()
+            queueRetry()
+          } else {
+            queueRetry()
+            queueWake()
+          }
+          sessions[0]!.setAssistantText('')
+          return
+        }
+        sessions[0]!.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(KEY)
+
+      // then: the wake's deliberate silence is honored, not converted to a fallback
+      expect(promptAttempt).toBe(2)
+      expect(sent).toEqual(['살펴볼게.'])
+      expect(sent).not.toContain(EMPTY_TURN_FALLBACK_TEXT)
+      expect(logs.some((m) => m.includes('no_reply_after_willingness_nudge'))).toBe(false)
+    })
+  }
 
   test('a child past the stuck backstop stops suppressing and the normal retry resumes', async () => {
     const dir = await tempDir()
