@@ -74,19 +74,21 @@ The flow:
    gh api /repos/owner/repo/pulls/<N>/comments --jq '[.[] | {path, line, user: .user.login, body}]'
    ```
 
-2. **Update the PR's branch with host-stage help.** Model-driven bash cannot run `gh pr checkout` or authenticated `git push`: both may execute local hooks while carrying reusable credentials. Ask the operator to run the checkout from the host-stage repository directory:
+2. **Get the branch checked out, then push it yourself.** `gh pr checkout` is host-stage only — it may execute local hooks while carrying reusable credentials — so ask the operator to run it from the host-stage repository directory:
 
    ```sh
    gh pr checkout <N> --repo owner/repo
    ```
 
-   After the operator confirms the checkout, make the minimal fixes and commit them locally with `typeclaw-git` hygiene. Then ask the operator to push that same branch from the host stage:
+   After the operator confirms the checkout, make the minimal fixes and commit them locally with `typeclaw-git` hygiene. Pushing is **not** host-stage only: the broker mints a per-repo credential for a standalone push, so run it yourself from the accessible checkout, naming the remote and branch explicitly:
 
    ```sh
-   git push
+   git -C <checkout> push -u origin <branch>
    ```
 
-   Do **not** open a _new_ PR to fix your existing one; the operator pushes to the same branch so the open PR updates in place.
+   Fix ordinary Git errors (missing upstream, stale ref, needs a rebase) yourself and retry. Hand the operator that exact push command only when the broker or your permissions refuse it — no brokered credential for the repo, or your role lacks the `gitExfil` bypass.
+
+   Do **not** open a _new_ PR to fix your existing one; the push goes to the same branch so the open PR updates in place.
 
    If a point is a genuine disagreement (the reviewer is mistaken, or the behavior is intentional), don't silently change it — reply in the thread with your reasoning instead.
 
@@ -94,9 +96,9 @@ The flow:
    - **Do not resolve the threads.** On your own PR the open inline threads were authored by your **reviewer**, not by you — and the base principle is _whoever opened the thread closes it_. Resolving is the reviewer's call once they're satisfied; the runtime enforces this (it only lets you resolve threads whose root comment **you** authored). Push the fix, reply, and leave the thread for the reviewer to close.
    - **Do not post a verdict.** "LGTM", "Approved", "Request changes" are reviewer words. As the author you reply in plain prose; you never emit a review verdict on your own PR.
 
-4. **If CI is failing on your PR**, that's also contributor work: read the failing check, fix the cause on the checked-out branch, commit locally, then ask the operator to run `git push` from the host stage. You can't always read another system's CI logs — if you can't, say so and ask for the error rather than guessing.
+4. **If CI is failing on your PR**, that's also contributor work: read the failing check, fix the cause on the checked-out branch, commit locally, then push it yourself the same way. You can't always read another system's CI logs — if you can't, say so and ask for the error rather than guessing.
 
-That's the whole contributor loop: read feedback → operator checks out at the host stage → fix and commit locally → operator pushes at the host stage → reply. No subagent, no formal review, no thread resolution.
+That's the whole contributor loop: read feedback → operator checks out at the host stage → fix and commit locally → push the branch yourself → reply. No subagent, no formal review, no thread resolution.
 
 ### When you are being asked to review
 
@@ -307,7 +309,13 @@ gh issue create --repo owner/repo --title 'Bug: ...' --body '...'
 
 ```
 
-For a pull request, prepare the exact title, body, pushed head branch, and base branch, then ask the operator to run `gh pr create --repo owner/repo --title 'Fix: ...' --head my-branch --base main --body '...'` at the host stage from the repository checkout. Model-driven bash cannot push or create a PR because network Git and `gh pr create` may execute local Git hooks with reusable credentials.
+For a pull request from a project repo you cloned into `workspace/<repo>`, push the head branch yourself — the broker mints a per-repo credential for a standalone push. A fresh PR branch has no upstream, so name the remote and branch explicitly:
+
+```sh
+git -C workspace/<repo> push -u origin <branch>
+```
+
+Then prepare the exact title, body, head branch and base branch and ask the operator to run `gh pr create --repo owner/repo --title 'Fix: ...' --head my-branch --base main --body '...'` at the host stage from that same checkout: `gh pr create` is host-stage only because it may execute local Git hooks with reusable credentials. Fix ordinary Git errors yourself and retry; hand the operator the push command only when the broker or your permissions refuse it — no brokered credential, or your role lacks the `gitExfil` bypass. When you do hand off, name the host-accessible `workspace/<repo>` checkout; never direct them to a per-session `/tmp` path.
 
 For the supported issue form under App auth, TypeClaw mints a short-lived token for the explicit `--repo owner/repo` target and withholds it from sibling commands and shell expansions.
 
