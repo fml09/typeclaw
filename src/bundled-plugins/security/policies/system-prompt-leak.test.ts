@@ -99,13 +99,13 @@ describe('checkSystemPromptLeakGuard', () => {
     expect(checkSystemPromptLeakGuard({ tool: 'channel_send', args: { text: 'hello world' } })).toBeUndefined()
   })
 
-  test('allows acknowledged leak', () => {
-    expect(
-      checkSystemPromptLeakGuard({
-        tool: 'channel_send',
-        args: { text: SAMPLE_LEAKED_SYSTEM_PROMPT, acknowledgeGuards: { systemPromptLeak: true } },
-      }),
-    ).toBeUndefined()
+  test('does not let a model-authored acknowledgement bypass a system-prompt leak', () => {
+    const result = checkSystemPromptLeakGuard({
+      tool: 'channel_send',
+      args: { text: SAMPLE_LEAKED_SYSTEM_PROMPT, acknowledgeGuards: { systemPromptLeak: true } },
+    })
+    expect(result?.block).toBe(true)
+    expect(result?.reason).not.toContain('acknowledgeGuards')
   })
 
   test('does not apply to non-channel tools', () => {

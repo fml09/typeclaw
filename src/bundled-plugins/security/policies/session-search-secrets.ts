@@ -1,5 +1,5 @@
 import type { SecuritySeverity } from '../permissions'
-import { ACKNOWLEDGE_GUARDS, type SecurityBlock, isGuardAcknowledged } from '../policy'
+import type { SecurityBlock } from '../policy'
 
 export const GUARD_SESSION_SEARCH_SECRETS = 'sessionSearchSecrets'
 // Classified `medium` (silent-attack axis): bypass returns secret-shaped
@@ -63,8 +63,6 @@ export function checkSessionSearchSecretsGuard(options: {
 }): SecurityBlock | undefined {
   const { tool, args } = options
   if (!SESSION_SEARCH_TOOLS.has(tool)) return undefined
-  if (isGuardAcknowledged(args, GUARD_SESSION_SEARCH_SECRETS)) return undefined
-
   const queries = collectQueryStrings(args)
   for (const query of queries) {
     const hits = detectSessionSearchSecretQuery(query)
@@ -75,7 +73,7 @@ export function checkSessionSearchSecretsGuard(options: {
       reason: [
         `Guard \`${GUARD_SESSION_SEARCH_SECRETS}\` blocked ${tool}: query targets credential-shaped keywords (${summary}).`,
         'Searching session history for secret-shaped strings is a recon pattern - even if the index returns no hits today, a future session that accidentally typed a credential will match.',
-        `If this is genuinely intentional (e.g. auditing past leaks deliberately), retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_SESSION_SEARCH_SECRETS}: true\` in the tool arguments.`,
+        'Intentional auditing requires an operator-configured security bypass permission.',
       ].join(' '),
     }
   }

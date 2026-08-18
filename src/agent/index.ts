@@ -472,6 +472,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     getAbort,
     getLoopGuardTurn,
     permissions: options.permissions ?? noopPermissionService,
+    ...(options.plugins !== undefined ? { guardAcknowledgements: options.plugins.registry.guardAcknowledgements } : {}),
     ...(options.bashPolicy !== undefined ? { bashPolicy: options.bashPolicy } : {}),
   })
   const wrappedCustomSystemTools = wrapSystemTools(customSystemTools, {
@@ -481,6 +482,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     getOrigin,
     getAbort,
     getLoopGuardTurn,
+    ...(options.plugins !== undefined ? { guardAcknowledgements: options.plugins.registry.guardAcknowledgements } : {}),
     ...(options.mcpManager === undefined ? {} : { mcpManager: options.mcpManager }),
   })
   const customToolsPreBudget = [...wrappedCustomSystemTools, ...pluginCustomTools, ...builtinPiToolOverrides]
@@ -934,6 +936,7 @@ function wrapRegistryTools(
       getOrigin,
       getAbort,
       getLoopGuardTurn,
+      guardAcknowledgements: plugins.registry.guardAcknowledgements,
       ...(permissions !== undefined ? { permissions } : {}),
     }),
   )
@@ -949,6 +952,7 @@ export function wrapSystemTools(
     getAbort: () => ((reason?: string) => void) | undefined
     getLoopGuardTurn?: () => number | undefined
     mcpManager?: McpManager
+    guardAcknowledgements?: PluginRegistry['guardAcknowledgements']
   },
 ): ToolDefinition[] {
   const mcpManager = options.mcpManager
@@ -965,6 +969,7 @@ export function wrapSystemTools(
       getOrigin: options.getOrigin,
       getAbort: options.getAbort,
       getLoopGuardTurn: options.getLoopGuardTurn,
+      ...(options.guardAcknowledgements !== undefined ? { guardAcknowledgements: options.guardAcknowledgements } : {}),
       ...(resolvePreflightFileOperands === undefined ? {} : { resolvePreflightFileOperands }),
     }),
   )
@@ -991,6 +996,7 @@ export function wrapSubagentCustomTools(
       getOrigin,
       getAbort,
       getLoopGuardTurn,
+      guardAcknowledgements: plugins.registry.guardAcknowledgements,
       ...(permissions !== undefined ? { permissions } : {}),
     }),
   )

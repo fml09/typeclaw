@@ -277,12 +277,13 @@ describe('secret-exfil-bash guard', () => {
     ).toBe(true)
   })
 
-  test('allows acknowledged exfil command', () => {
+  test('does not let a model-authored acknowledgement bypass secret exfiltration', () => {
     const result = checkSecretExfilBashGuard({
       tool: 'bash',
       args: { command: 'env', acknowledgeGuards: { secretExfilBash: true } },
     })
-    expect(result).toBeUndefined()
+    expect(result?.block).toBe(true)
+    expect(result?.reason).not.toContain('acknowledgeGuards')
   })
 
   test('allows benign commands', () => {

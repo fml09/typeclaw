@@ -1,8 +1,12 @@
 import { definePlugin } from '@/plugin'
 
-import { checkBunHygieneGuard } from './policy'
+import { GUARD_GLOBAL_INSTALL, GUARD_NON_BUN_PACKAGE_MANAGER, checkBunHygieneGuard } from './policy'
 
 export default definePlugin({
+  guardAcknowledgements: [
+    { key: GUARD_GLOBAL_INSTALL, tools: ['bash'] },
+    { key: GUARD_NON_BUN_PACKAGE_MANAGER, tools: ['bash'] },
+  ],
   plugin: async () => ({
     hooks: {
       'tool.before': (event) => checkBunHygieneGuard({ tool: event.tool, args: event.args }),

@@ -1,5 +1,5 @@
 import type { SecuritySeverity } from '../permissions'
-import { ACKNOWLEDGE_GUARDS, type SecurityBlock, isGuardAcknowledged } from '../policy'
+import type { SecurityBlock } from '../policy'
 
 export const GUARD_OUTBOUND_SECRET = 'outboundSecret'
 // Classified `high` (audience-leak axis): bypass posts credential-shaped
@@ -156,8 +156,6 @@ export function checkOutboundSecretGuard(options: {
 }): SecurityBlock | undefined {
   const { tool, args } = options
   if (tool !== 'channel_send' && tool !== 'channel_reply') return undefined
-  if (isGuardAcknowledged(args, GUARD_OUTBOUND_SECRET)) return undefined
-
   const env = options.env ?? process.env
   for (const key of TEXT_KEYS) {
     const value = args[key]
@@ -175,7 +173,7 @@ export function checkOutboundSecretGuard(options: {
       reason: [
         lead,
         'Posting secrets - or even the names of which secrets exist - to a channel persists them in chat history and exposes them to every reader.',
-        `If this is genuinely intentional and the value is not actually sensitive, retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_OUTBOUND_SECRET}: true\` in the tool arguments.`,
+        'Intentional disclosure requires an operator-configured security bypass permission.',
       ].join(' '),
     }
   }

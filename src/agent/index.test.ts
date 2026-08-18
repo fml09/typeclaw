@@ -15,6 +15,7 @@ import { configSchema, type Models, resolveProfile, type ResolvedProfile, type T
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { ModelRef } from '@/config/providers'
 import { createHookBus, type PluginRegistry } from '@/plugin'
+import { emptyRegistry } from '@/plugin/registry'
 import { createStream } from '@/stream'
 
 import {
@@ -444,19 +445,13 @@ describe('createResourceLoader', () => {
   test('exposes the agent-browser bundled plugin skill to the agent', async () => {
     const hooks = createHookBus()
     const registry: PluginRegistry = {
-      tools: [],
-      subagents: [],
-      cronJobs: [],
-      skills: [],
+      ...emptyRegistry(),
       skillsDirs: [
         {
           pluginName: 'agent-browser',
           path: join(import.meta.dir, '..', 'bundled-plugins', 'agent-browser', 'skills'),
         },
       ],
-      doctorChecks: [],
-      commands: [],
-      disposers: [],
     }
 
     const loader = await createResourceLoader({
@@ -573,16 +568,7 @@ describe('createResourceLoader', () => {
         event.prompt = `${event.prompt}\n\nPLUGIN-INJECTED-MARKER`
       },
     })
-    const registry: PluginRegistry = {
-      tools: [],
-      subagents: [],
-      cronJobs: [],
-      skills: [],
-      skillsDirs: [],
-      doctorChecks: [],
-      commands: [],
-      disposers: [],
-    }
+    const registry: PluginRegistry = emptyRegistry()
 
     // when
     const loader = await createResourceLoader({
@@ -608,16 +594,7 @@ describe('createResourceLoader', () => {
         capturedOrigin = event.origin
       },
     })
-    const registry: PluginRegistry = {
-      tools: [],
-      subagents: [],
-      cronJobs: [],
-      skills: [],
-      skillsDirs: [],
-      doctorChecks: [],
-      commands: [],
-      disposers: [],
-    }
+    const registry: PluginRegistry = emptyRegistry()
     const origin: SessionOrigin = {
       kind: 'channel',
       adapter: 'discord-bot',
