@@ -782,6 +782,37 @@ type TimedAttachment = { ts: number; attachment: InboundAttachment }
 
 type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | undefined }
 
+// Provenance of a queued system reminder, which decides whether the
+// reminder-only drain iteration it drives CONTINUES the current logical turn or
+// OPENS a new one.
+//
+// `retry` — the router's own turn-recovery ladder asking the SAME logical turn
+// to try again (empty-turn, tool-leak, stranded-tooluse, cold-start,
+// empty-stop, willingness). Per-logical-turn attribution and the recovery
+// budgets must survive these, or the ladder would refill its own budget and
+// loop forever.
+//
+// `wakeup` — work injected from OUTSIDE the session's own turn machinery: a
+// finished background subagent, a restart resume, a PR-verdict stand-down.
+// These are a new episode that merely happens to arrive without a user
+// message, so carrying the previous turn's attribution into them is wrong.
+//
+// The todo/idle continuation is deliberately `retry`, not `wakeup`: it is the
+// same work episode continuing, and its turn must keep citing the durable work
+// already completed.
+//
+// Provenance is per ENTRY rather than a single session-level flag because both
+// kinds can coalesce into one iteration; a wakeup in the batch opens a new
+// logical turn regardless of what else it rode in with. Matching on reminder
+// TEXT was rejected: a wakeup body that happened to equal a nudge constant
+// would silently misclassify, and every future enqueue site would inherit the
+// default instead of being forced to choose.
+type PendingSystemReminder = { text: string; kind: 'retry' | 'wakeup' }
+
+const retryReminder = (text: string): PendingSystemReminder => ({ text, kind: 'retry' })
+
+const wakeupReminder = (text: string): PendingSystemReminder => ({ text, kind: 'wakeup' })
+
 type LiveSession = {
   key: ChannelKey
   keyId: string
@@ -963,7 +994,7 @@ type LiveSession = {
   // every `drain()` iteration alongside the regular promptQueue batch;
   // the drain loop's run condition checks BOTH queues so a system
   // reminder alone is enough to trigger a turn.
-  pendingSystemReminders: string[]
+  pendingSystemReminders: PendingSystemReminder[]
   // True only for the reminder-only iteration that consumed a willingness
   // nudge. `willingnessNudges` persists across the logical turn, so it remains
   // nonzero after a substantive result and would misclassify NO_REPLY from a
@@ -2935,7 +2966,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               logger.info(`[channels] ${live.keyId}: dropping todo continuation reminder after user stop`)
               return
             }
-            live.pendingSystemReminders.push(text)
+            // Self-continuation of the SAME work episode, not external injection:
+            // `qualifyingWorkThisLogicalTurn` must survive it so a follow-up reply
+            // can still cite the durable work this turn already did.
+            live.pendingSystemReminders.push(retryReminder(text))
           },
         })
       } catch (err) {
@@ -3222,6 +3256,49 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  // Open a new logical turn for externally-injected work that arrived without a
+  // user message. Deliberately a SUBSET of the fresh-batch reset above: only
+  // state whose meaning is scoped to "the episode that just ended" is cleared.
+  //
+  // `promisedWorkOutstandingThisLogicalTurn` is the notable survivor. A
+  // completion wakeup usually exists BECAUSE the agent promised a later result,
+  // and that promise is exactly what makes a silent death user-visible harm —
+  // clearing it here would re-open the hole this fix closes. It is cleared
+  // authoritatively by a terminal send instead.
+  //
+  // Author identity is restored by the caller's existing reminder branch and
+  // must not be reset: role resolution for the wakeup's own channel_reply
+  // depends on it. `stagedFallbackCause` and the question signals also survive —
+  // a wakeup can be the recovery opportunity a staged fallback was waiting for.
+  //
+  // `logicalTurnStartedAt` deliberately does NOT advance here. It exists solely
+  // as the boundary `isAwaitingBackgroundChild` compares a child's `startedAt`
+  // against, and advancing it would hide an older SIBLING child that is still
+  // running: one child's completion wake would stop counting as "awaiting", and
+  // the recovery ladder, todo continuation and staged fallback would all re-fire
+  // while that sibling still works — exactly the duplicate-comment failure
+  // f1f36462 fixed. The wake for A must stay silent while B runs; B's own
+  // completion is what ends the wait.
+  const beginWakeupTurn = (live: LiveSession): void => {
+    live.pendingProviderError = null
+    live.consecutiveSends.clear()
+    live.lastSentText.clear()
+    live.lastSendLeafId = null
+    // Safe to refill precisely because retry nudges are `kind: 'retry'` and
+    // never reach here: the ladder this wakeup turn may itself queue cannot
+    // refill its own budget, so there is no unbounded loop.
+    live.emptyTurnRetries = 0
+    live.toolLeakRetries = 0
+    live.emptyStopAfterToolWorkArmed = false
+    live.willingnessNudges = 0
+    live.abortReasonThisTurn = null
+    live.userStoppedTurnSeq = null
+    live.nextPromptMaxTokens = undefined
+    live.githubReviewOutputTurn = null
+    live.toolExecutionThisLogicalTurn = false
+    live.qualifyingWorkThisLogicalTurn = false
+  }
+
   const drain = async (live: LiveSession): Promise<void> => {
     if (live.draining || live.destroyed) return
     live.draining = true
@@ -3250,8 +3327,27 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const observed = live.contextBuffer.splice(0, live.contextBuffer.length)
         const reminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
         live.currentTurnAttachments = collectTurnAttachments(observed, batch)
+        // A reminder-only iteration carrying externally-injected work opens a
+        // NEW logical turn. Without this, the completed-subagent wakeup that
+        // follows a turn which spawned it inherits that turn's
+        // `toolExecutionThisLogicalTurn`, and a provider failure on the wakeup
+        // is misread as "the turn already ran tools, so it wasn't silent" —
+        // suppressing the notice for a prompt that ran no tool and produced
+        // nothing. Observed in production as a review verdict lost with zero
+        // user-visible signal. Retry nudges deliberately do NOT trip this: they
+        // ARE the same logical turn retrying.
+        const wakeupTurn = batch.length === 0 && reminders.some((r) => r.kind === 'wakeup')
+        // Gated on `!wakeupTurn` because a willingness nudge can coalesce into the
+        // same iteration as a wakeup. The wakeup wins the boundary and clears the
+        // nudge budget, so the willingness bookkeeping now describes a superseded
+        // turn — and a legitimate NO_REPLY from the wake (a PR stand-down, say)
+        // would otherwise post a bogus `no_reply_after_willingness_nudge`
+        // fallback. Same defect the branch that reads this flag already guards
+        // against for later unrelated reminders.
         live.willingnessReminderIteration =
-          batch.length === 0 && reminders.some((r) => r === WILLINGNESS_NUDGE || r === SEND_WILLINGNESS_NUDGE)
+          !wakeupTurn &&
+          batch.length === 0 &&
+          reminders.some((r) => r.text === WILLINGNESS_NUDGE || r.text === SEND_WILLINGNESS_NUDGE)
 
         if (batch.length > 0) {
           // A fresh user batch starts a NEW logical turn. Drop any provider
@@ -3328,6 +3424,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         } else {
           live.currentTurnEngageReactions = []
         }
+        // After the author-identity restore above, which a wakeup turn still needs.
+        if (wakeupTurn) beginWakeupTurn(live)
 
         // Update the live origin holder so this turn's tool.before events
         // carry the current actor's id, and resolve the live role from it for
@@ -3343,7 +3441,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           adapter: live.key.adapter,
           loopGuardActive: live.loopGuardActive,
           groupChatNudge: live.multiHumanGroup,
-          systemReminders: reminders,
+          systemReminders: reminders.map((r) => r.text),
           role: liveRole,
         })
 
@@ -3585,7 +3683,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     key: ChannelKey,
     inbounds: QueuedInbound[],
     observed: ObservedInbound[],
-    reminders: string[],
+    reminders: PendingSystemReminder[],
   ): Promise<void> => {
     // Observed context alone is carried too: observe() can buffer post-reload
     // messages onto contextBuffer with no queued prompt, and dropping them would
@@ -4904,7 +5002,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     logger.info(
       `[channels] ${live.keyId} willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES}`,
     )
-    live.pendingSystemReminders.push(WILLINGNESS_NUDGE)
+    live.pendingSystemReminders.push(retryReminder(WILLINGNESS_NUDGE))
   }
 
   const validateChannelTurn = async (live: LiveSession, successfulSendsBeforePrompt: number): Promise<void> => {
@@ -4995,7 +5093,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           `[channels] ${live.keyId}: suppressed plain_text_tool_call_leak (nudge ` +
             `attempt=${live.toolLeakRetries}/${MAX_TOOL_LEAK_RETRIES}) text_len=${leakedText.length}`,
         )
-        live.pendingSystemReminders.push(TOOL_CALL_LEAK_NUDGE)
+        live.pendingSystemReminders.push(retryReminder(TOOL_CALL_LEAK_NUDGE))
         return
       }
       logger.warn(
@@ -5051,7 +5149,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             `[channels] ${live.keyId} send_willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES} ` +
               `cause=empty_stop_after_continue_reply`,
           )
-          live.pendingSystemReminders.push(SEND_WILLINGNESS_NUDGE)
+          live.pendingSystemReminders.push(retryReminder(SEND_WILLINGNESS_NUDGE))
         } else {
           stageEmptyTurnFallback('empty_stop_after_continue_reply_nudges_exhausted')
         }
@@ -5087,7 +5185,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             `[channels] ${live.keyId} send_willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES} ` +
               `cause=empty_stop_after_send_ack`,
           )
-          live.pendingSystemReminders.push(SEND_WILLINGNESS_NUDGE)
+          live.pendingSystemReminders.push(retryReminder(SEND_WILLINGNESS_NUDGE))
         } else {
           stageEmptyTurnFallback('empty_stop_after_send_ack_nudges_exhausted')
         }
@@ -5124,7 +5222,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
                 `cause=stranded_toolUse_after_send abort_reason=${abortReason}`,
             )
-            live.pendingSystemReminders.push(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
+            live.pendingSystemReminders.push(retryReminder(STRANDED_TOOLUSE_CONTINUATION_NUDGE))
           } else {
             await postEmptyTurnFallback(live, 'stranded_toolUse_retries_exhausted')
           }
@@ -5239,7 +5337,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
             `max_tokens=${live.nextPromptMaxTokens ?? CHANNEL_MAX_OUTPUT_TOKENS}`,
         )
-        live.pendingSystemReminders.push(EMPTY_TURN_RETRY_NUDGE)
+        live.pendingSystemReminders.push(retryReminder(EMPTY_TURN_RETRY_NUDGE))
         return
       }
       await postEmptyTurnFallback(live, attemptedSendThisTurn ? 'send_thrash' : 'retries_exhausted')
@@ -5274,7 +5372,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
               `cause=cold_start_solo_bare_empty`,
           )
-          live.pendingSystemReminders.push(COLD_START_REPLY_NUDGE)
+          live.pendingSystemReminders.push(retryReminder(COLD_START_REPLY_NUDGE))
           return
         }
         await postEmptyTurnFallback(live, 'cold_start_solo_bare_empty_retries_exhausted')
@@ -5310,7 +5408,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
               `cause=empty_stop_after_tool_work`,
           )
-          live.pendingSystemReminders.push(EMPTY_STOP_AFTER_TOOL_WORK_NUDGE)
+          live.pendingSystemReminders.push(retryReminder(EMPTY_STOP_AFTER_TOOL_WORK_NUDGE))
           return
         }
         await postEmptyTurnFallback(live, 'empty_stop_after_tool_work_retries_exhausted')
@@ -5865,7 +5963,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // either way. Still skip the generic synthetic wake.
         if (reservation.sawInbound) {
           if (handoff.interruptedSubagents !== undefined && handoff.interruptedSubagents.length > 0) {
-            live.pendingSystemReminders.push(buildInterruptedSubagentNotice(handoff.interruptedSubagents))
+            live.pendingSystemReminders.push(
+              wakeupReminder(buildInterruptedSubagentNotice(handoff.interruptedSubagents)),
+            )
             logger.info(
               `[channels] ${keyId}: restart-resume coalesced with a real inbound; delivering interrupted-subagent notice`,
             )
@@ -5886,7 +5986,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           logger.error(`[channels] ${keyId}: restart-resume clear abort suppression failed: ${describeError(err)}`),
         )
 
-        live.pendingSystemReminders.push(buildRestartResumeWakeReminder(handoff.interruptedSubagents))
+        live.pendingSystemReminders.push(wakeupReminder(buildRestartResumeWakeReminder(handoff.interruptedSubagents)))
         logger.info(`[channels] ${keyId}: restart-resume waking session ${live.sessionId}`)
         void drain(live)
       },
@@ -5994,7 +6094,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       channel: true,
       adapter,
     })
-    live.pendingSystemReminders.push(text)
+    live.pendingSystemReminders.push(wakeupReminder(text))
     // The reminder tells the agent to fetch this result now; clear the
     // subagent_output window so an earlier premature-polling streak can't
     // hard-block that legitimate fetch.
@@ -6061,7 +6161,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // stand down from its own legitimate review.
       if (live.sessionId === args.sessionId) continue
       const text = renderPrVerdictStandDownReminder({ prNumber: args.prNumber, verdict: args.verdict })
-      live.pendingSystemReminders.push(text)
+      live.pendingSystemReminders.push(wakeupReminder(text))
       logger.info(`[channels] ${live.keyId}: pr-verdict stand-down queued pr=${chat} verdict=${args.verdict}`)
       if (!live.draining) void drain(live)
       count++
@@ -6445,7 +6545,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       injectContinuationReminder: (key: ChannelKey, text: string): void => {
         const live = liveSessions.get(channelKeyId(key))
         if (!live) return
-        live.pendingSystemReminders.push(text)
+        live.pendingSystemReminders.push(retryReminder(text))
       },
       enqueueUserInbound: (key: ChannelKey, event: InboundMessage): void => {
         const live = liveSessions.get(channelKeyId(key))
