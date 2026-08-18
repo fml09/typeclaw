@@ -1,7 +1,7 @@
 import path from 'node:path'
 
 import type { SecuritySeverity } from '../permissions'
-import { ACKNOWLEDGE_GUARDS, type SecurityBlock, isGuardAcknowledged } from '../policy'
+import type { SecurityBlock } from '../policy'
 
 export const GUARD_SECRET_EXFIL_READ = 'secretExfilRead'
 // Classified `medium` (silent-attack axis): bypass returns `.env` /
@@ -63,8 +63,6 @@ export function checkSecretExfilReadGuard(options: {
 }): SecurityBlock | undefined {
   const { tool, args } = options
   if (tool !== 'read' && tool !== 'grep' && tool !== 'find' && tool !== 'ls') return undefined
-  if (isGuardAcknowledged(args, GUARD_SECRET_EXFIL_READ)) return undefined
-
   for (const key of PATH_LIKE_KEYS) {
     const value = args[key]
     const candidates = collectStringValues(value)
@@ -76,7 +74,7 @@ export function checkSecretExfilReadGuard(options: {
           reason: [
             `Guard \`${GUARD_SECRET_EXFIL_READ}\` blocked ${tool} of ${reason}: ${candidate}.`,
             'Reading secret material is treated as exfiltration even when the agent only intends to inspect it.',
-            `If this is genuinely intentional, retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_SECRET_EXFIL_READ}: true\` in the tool arguments.`,
+            'Intentional access requires an operator-configured security bypass permission.',
           ].join(' '),
         }
       }

@@ -1,5 +1,5 @@
 import type { SecuritySeverity } from '../permissions'
-import { ACKNOWLEDGE_GUARDS, type SecurityBlock, isGuardAcknowledged } from '../policy'
+import type { SecurityBlock } from '../policy'
 
 export const GUARD_SECRET_EXFIL_BASH = 'secretExfilBash'
 // Classified `medium` (silent-attack axis): bypass dumps the whole
@@ -98,8 +98,6 @@ export function checkSecretExfilBashGuard(options: {
 
   const command = args.command
   if (typeof command !== 'string') return undefined
-  if (isGuardAcknowledged(args, GUARD_SECRET_EXFIL_BASH)) return undefined
-
   const matched = DANGEROUS_COMMAND_PATTERNS.find(({ pattern }) => pattern.test(command))
   if (!matched) return undefined
 
@@ -107,8 +105,7 @@ export function checkSecretExfilBashGuard(options: {
     block: true,
     reason: [
       `Guard \`${GUARD_SECRET_EXFIL_BASH}\` blocked bash command that looks like secret exfiltration: ${matched.label}.`,
-      'If this is genuinely intentional and the user explicitly asked for it, retry with',
-      `\`${ACKNOWLEDGE_GUARDS}.${GUARD_SECRET_EXFIL_BASH}: true\` in the bash arguments.`,
+      'Intentional access requires an operator-configured security bypass permission.',
     ].join(' '),
   }
 }

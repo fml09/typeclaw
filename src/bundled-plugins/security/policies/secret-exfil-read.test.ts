@@ -80,12 +80,13 @@ describe('secret-exfil-read guard', () => {
     expect(checkSecretExfilReadGuard({ tool: 'read', args: { paths: ['notes.md', '.env'] } })?.block).toBe(true)
   })
 
-  test('allows acknowledged read of .env', () => {
+  test('does not let a model-authored acknowledgement bypass a secret read', () => {
     const result = checkSecretExfilReadGuard({
       tool: 'read',
       args: { path: '.env', acknowledgeGuards: { secretExfilRead: true } },
     })
-    expect(result).toBeUndefined()
+    expect(result?.block).toBe(true)
+    expect(result?.reason).not.toContain('acknowledgeGuards')
   })
 
   test('allows reads of regular files', () => {
