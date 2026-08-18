@@ -4,7 +4,12 @@ import type { ModelRef } from '@/config/providers'
 
 import type { AgentSession } from './index'
 import { isFailoverWorthy } from './provider-error'
-import { PATIENT_OVERLOAD_RETRIES, PATIENT_OVERLOAD_WINDOW_MS } from './retry-same-ref'
+import {
+  PATIENT_OVERLOAD_RETRIES,
+  PATIENT_OVERLOAD_WINDOW_MS,
+  RESPONSIVE_OVERLOAD_RETRIES,
+  RESPONSIVE_OVERLOAD_WINDOW_MS,
+} from './retry-same-ref'
 import { ThrottleCircuit } from './throttle-circuit'
 import { promptPersistentTurnWithFallback } from './turn-runner'
 
@@ -906,6 +911,68 @@ describe('promptPersistentTurnWithFallback same-ref retry', () => {
     expect(messages.filter((message) => message.role === 'user')).toHaveLength(1)
   })
 
+  test('an authorized post-tool capacity retry waits the selected overload delay', async () => {
+    // given: an overload arriving right after a completed tool result, and a
+    // retryRandom that would make the ORDINARY blip curve sleep its 1000ms max.
+    // The overload budget picks 0ms, so consulting retryRandom at all means the
+    // post-tool path fell back to the wrong curve.
+    const listeners = new Set<(event: FakeEvent) => void>()
+    const messages: Array<{ role: string; stopReason?: string }> = []
+    let continueCalls = 0
+    let randomCalls = 0
+    const session = {
+      prompt: async () => {
+        messages.push(
+          { role: 'user' },
+          { role: 'assistant', stopReason: 'toolUse' },
+          { role: 'toolResult' },
+          { role: 'assistant', stopReason: 'error' },
+        )
+        for (const cb of listeners) cb({ type: 'tool_execution_start' })
+        for (const cb of listeners) cb({ type: 'tool_execution_end' })
+        for (const cb of listeners) {
+          cb({
+            type: 'message_end',
+            message: { role: 'assistant', stopReason: 'error', errorMessage: 'server_is_overloaded' },
+          })
+        }
+      },
+      subscribe: (cb: (event: FakeEvent) => void) => {
+        listeners.add(cb)
+        return () => listeners.delete(cb)
+      },
+      agent: {
+        state: { messages },
+        continue: async () => {
+          continueCalls++
+          messages.push({ role: 'assistant', stopReason: 'stop' })
+        },
+      },
+    } as unknown as AgentSession
+
+    const startedAt = performance.now()
+    const result = await promptPersistentTurnWithFallback({
+      refs: [REF_A],
+      currentModelRef: REF_A,
+      session,
+      text: 'hello',
+      circuit: new ThrottleCircuit(),
+      shouldFailover: (err) => isFailoverWorthy(err.message),
+      setModelForRef: async () => {},
+      authorizeRetryAfterCompletedToolResult: () => true,
+      overloadBackoffMs: () => 0,
+      retryRandom: () => {
+        randomCalls++
+        return 1
+      },
+    })
+
+    expect(result.success).toBe(true)
+    expect(continueCalls).toBe(1)
+    expect(randomCalls).toBe(0)
+    expect(performance.now() - startedAt).toBeLessThan(500)
+  })
+
   test('authorization alone cannot retry an unsafe transcript tail', async () => {
     const listeners = new Set<(event: FakeEvent) => void>()
     const messages = [{ role: 'user' }, { role: 'assistant', stopReason: 'error' }]
@@ -1161,12 +1228,12 @@ describe('promptPersistentTurnWithFallback same-ref retry', () => {
   })
 })
 
-describe('promptPersistentTurnWithFallback patient overload retry', () => {
+describe('promptPersistentTurnWithFallback overload retry on the last usable ref', () => {
   const patientOpts = {
     circuit: new ThrottleCircuit(),
     shouldFailover: (err: Error) => isFailoverWorthy(err.message),
     setModelForRef: async () => {},
-    patientBackoffMs: () => 0,
+    overloadBackoffMs: () => 0,
   }
 
   test('rides out a capacity outage on a single-ref chain and recovers', async () => {
@@ -1185,8 +1252,40 @@ describe('promptPersistentTurnWithFallback patient overload retry', () => {
     expect(fake.attempts()).toBe(4)
   })
 
-  test('a responsive call site still fails fast on the same outage', async () => {
-    const fake = retryableFakeSession(['soft-throttle', 'soft-throttle', 'soft-throttle', 'success'])
+  test('a responsive call site rides out a brief dip on a single-ref chain', async () => {
+    const fake = retryableFakeSession(['soft-throttle', 'soft-throttle', 'success'])
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'hi',
+      retryPolicy: 'responsive',
+    })
+
+    expect(result.success).toBe(true)
+    expect(fake.attempts()).toBe(3)
+    expect(fake.userMessages()).toBe(1)
+  })
+
+  test('omitting retryPolicy still recovers, on the responsive budget', async () => {
+    const fake = retryableFakeSession(['soft-throttle', 'success'])
+
+    const result = await promptPersistentTurnWithFallback({
+      ...patientOpts,
+      refs: [ANTHROPIC_REF],
+      currentModelRef: ANTHROPIC_REF,
+      session: fake.session,
+      text: 'hi',
+    })
+
+    expect(result.success).toBe(true)
+    expect(fake.attempts()).toBe(2)
+  })
+
+  test('gives up once the responsive retry budget is exhausted', async () => {
+    const fake = retryableFakeSession(['soft-throttle'])
 
     const result = await promptPersistentTurnWithFallback({
       ...patientOpts,
@@ -1198,22 +1297,33 @@ describe('promptPersistentTurnWithFallback patient overload retry', () => {
     })
 
     expect(result.success).toBe(false)
-    expect(fake.attempts()).toBe(1)
+    expect(fake.attempts()).toBe(RESPONSIVE_OVERLOAD_RETRIES + 1)
   })
 
-  test('omitting retryPolicy keeps the historical fast-fail behavior', async () => {
+  test('a responsive turn waits far less than a patient one', async () => {
+    expect(RESPONSIVE_OVERLOAD_RETRIES).toBeLessThan(PATIENT_OVERLOAD_RETRIES)
+    expect(RESPONSIVE_OVERLOAD_WINDOW_MS).toBeLessThan(PATIENT_OVERLOAD_WINDOW_MS)
+  })
+
+  test('a responsive non-terminal ref fails OVER instead of waiting', async () => {
     const fake = retryableFakeSession(['soft-throttle', 'success'])
+    const attemptedRefs: ModelRef[] = []
 
     const result = await promptPersistentTurnWithFallback({
       ...patientOpts,
-      refs: [ANTHROPIC_REF],
-      currentModelRef: ANTHROPIC_REF,
+      refs: [REF_A, ANTHROPIC_REF],
+      currentModelRef: REF_A,
       session: fake.session,
       text: 'hi',
+      retryPolicy: 'responsive',
+      beforeAttempt: (ref) => {
+        attemptedRefs.push(ref)
+      },
     })
 
-    expect(result.success).toBe(false)
-    expect(fake.attempts()).toBe(1)
+    expect(result.success).toBe(true)
+    expect(attemptedRefs).toEqual([REF_A, ANTHROPIC_REF])
+    expect(fake.attempts()).toBe(2)
   })
 
   test('gives up once the patient retry budget is exhausted', async () => {
@@ -1270,7 +1380,7 @@ describe('promptPersistentTurnWithFallback patient overload retry', () => {
       session: fake.session,
       text: 'review this',
       retryPolicy: 'patient',
-      patientBackoffMs: () => BACKOFF_MS,
+      overloadBackoffMs: () => BACKOFF_MS,
       now: () => clock,
     })
 
