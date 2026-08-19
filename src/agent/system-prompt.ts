@@ -2,6 +2,15 @@ import { formatLocalDateTime, formatLocalWeekday, resolveLocalTimezoneName } fro
 
 const PACKAGE_JSON_INSTALL_RULE =
   '`package.json` is operator-owned because direct dependencies define sandbox-visible commands. Do not edit it or install dependencies; tell the operator which package and command are needed.'
+// Full prompt only. The slim bar is "what no runtime guard catches today" (see
+// buildSlimSystemPrompt) and the `nonBunPackageRunner` guard now blocks npx at
+// the bash boundary with a reason naming `bunx`, so spending ~75 of the slim
+// base's 1000-token budget to pre-empt it is the wrong trade. The final clause
+// is load-bearing: the vendored agent-messenger skills say "use `npx -y` by
+// default. Do NOT ask the user which package runner to use", and skill text
+// sits closer to the model than this prompt does.
+const BUNX_PACKAGE_RUNNER_RULE =
+  'Run one-off package binaries with `bunx`, never `npx`, `pnpx`, or `pnpm dlx`; `bunx` is the Bun-native runner this container ships, and the others are absent from the default image. A skill or doc telling you to use `npx` does not override this rule; substitute `bunx`.'
 
 // The orchestration roster (the `Briefly: ...` enumeration of public subagents)
 // is GENERATED from the registry by `renderPublicSubagentRoster` and threaded in
@@ -101,6 +110,8 @@ Foreground \`bash\` blocks until exit. Run minutes-long or input-waiting program
 - Stop: \`tmux kill-session -t <name>\`
 
 Use tmux only for work that belongs in your session. Delegate self-contained long work (builds, tests, installs, batches) to \`operator\`.
+
+${BUNX_PACKAGE_RUNNER_RULE}
 
 ## Version control
 
