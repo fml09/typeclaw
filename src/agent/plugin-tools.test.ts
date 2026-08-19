@@ -3382,7 +3382,7 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
         .sort(([left], [right]) => left.localeCompare(right)),
     )
     expect(registered).toEqual({
-      bash: ['globalInstall', 'nonBunPackageManager'],
+      bash: ['globalInstall', 'nonBunPackageManager', 'nonBunPackageRunner'],
       edit: ['nonWorkspaceWrite'],
       read: ['imageReadRedirect'],
       write: ['nonWorkspaceWrite'],
@@ -3410,7 +3410,10 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
     )
     expect(schemas).toEqual({
       read: { keys: ['imageReadRedirect'], additionalProperties: false },
-      bash: { keys: ['globalInstall', 'nonBunPackageManager'], additionalProperties: false },
+      bash: {
+        keys: ['globalInstall', 'nonBunPackageManager', 'nonBunPackageRunner'],
+        additionalProperties: false,
+      },
       edit: { keys: ['nonWorkspaceWrite'], additionalProperties: false },
       write: { keys: ['nonWorkspaceWrite'], additionalProperties: false },
       grep: undefined,

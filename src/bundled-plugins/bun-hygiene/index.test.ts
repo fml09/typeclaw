@@ -17,17 +17,18 @@ describe('bun-hygiene plugin', () => {
     expect(result?.reason).toContain('globalInstall')
   })
 
-  test('blocks non-bun install managers and allows bun + ephemeral runners through the hook', async () => {
+  test('blocks non-bun install managers and runners while allowing bunx through the hook', async () => {
     const hook = await toolBeforeHook()
 
     const blocked = await hook(toolEvent('bash', { command: 'npm install' }), hookContext())
     const allowedBunx = await hook(toolEvent('bash', { command: 'bunx create-next-app' }), hookContext())
-    const allowedNpx = await hook(toolEvent('bash', { command: 'npx create-next-app' }), hookContext())
+    const blockedNpx = await hook(toolEvent('bash', { command: 'npx create-next-app' }), hookContext())
 
     expect(blocked?.block).toBe(true)
     expect(blocked?.reason).toContain('nonBunPackageManager')
     expect(allowedBunx).toBeUndefined()
-    expect(allowedNpx).toBeUndefined()
+    expect(blockedNpx?.block).toBe(true)
+    expect(blockedNpx?.reason).toContain('nonBunPackageRunner')
   })
 
   test('respects the acknowledgeGuards bypass', async () => {
