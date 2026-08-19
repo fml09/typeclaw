@@ -3,6 +3,14 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const workflow = readFileSync(join(import.meta.dir, '..', '.github', 'workflows', 'release.yml'), 'utf8')
+const parsedWorkflow = Bun.YAML.parse(workflow) as {
+  jobs: Record<
+    string,
+    {
+      steps?: Array<{ uses?: string; with?: { ref?: string } }>
+    }
+  >
+}
 
 describe('release workflow immutable version tags', () => {
   test('serializes all versions before any mutable release state is written', () => {
@@ -49,5 +57,19 @@ describe('release workflow immutable version tags', () => {
     expect(workflow).toContain('main moved before version ${VERSION} was reserved')
     expect(workflow).toContain('ref: ${{ needs.checks.outputs.source_sha }}')
     expect(workflow).toContain('BUMP_SHA: ${{ needs.reserve-version.outputs.bump_sha }}')
+  })
+
+  test('checks out the canonical release source in every downstream job', () => {
+    const unpinned = Object.entries(parsedWorkflow.jobs).flatMap(([name, job]) =>
+      name === 'checks'
+        ? []
+        : (job.steps ?? [])
+            .filter((step) => step.uses?.startsWith('actions/checkout@'))
+            .flatMap((step, index) =>
+              step.with?.ref === '${{ needs.checks.outputs.source_sha }}' ? [] : [`${name} checkout ${index + 1}`],
+            ),
+    )
+
+    expect(unpinned).toEqual([])
   })
 })
