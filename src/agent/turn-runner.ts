@@ -9,9 +9,7 @@ import {
   subscribeProviderErrors,
 } from './provider-error'
 import {
-  PATIENT_OVERLOAD_RETRIES,
-  PATIENT_OVERLOAD_WINDOW_MS,
-  patientOverloadBackoffMs,
+  overloadRetryBudget,
   RETRIES_PER_REF,
   retryTurnAfterCompletedToolResult,
   retryTurnOnPersistentSession,
@@ -61,7 +59,7 @@ export async function promptPersistentTurnWithFallback(opts: {
   detectSoftErrorFromLeaf?: boolean
   authorizeRetryAfterCompletedToolResult?: () => boolean
   retryRandom?: () => number
-  patientBackoffMs?: (attempt: number) => number
+  overloadBackoffMs?: (attempt: number) => number
   onRetryBackoffStart?: () => void
   beforeAttempt?: (ref: ModelRef) => void
   onAttemptFailed?: (attempt: PersistentTurnAttempt) => void
@@ -80,6 +78,7 @@ export async function promptPersistentTurnWithFallback(opts: {
   // NTP/system-clock correction the way Date.now() can, which would otherwise
   // prematurely trip or stall the 60s cap.
   const now = opts.now ?? (() => performance.now())
+  const overloadBudget = overloadRetryBudget(opts.retryPolicy)
   const hasNonCodexFallback = opts.refs.some((ref) => !isCodexRef(ref))
   let noHeaderAttempts = 0
   let cumulativeNoProgressMs = 0
@@ -127,7 +126,7 @@ export async function promptPersistentTurnWithFallback(opts: {
       let outcome: AttemptOutcome | undefined
       let retryAfterCompletedToolResult = false
       let overloadRetries = 0
-      let patientWindowStartedAt: number | undefined
+      let overloadWindowStartedAt: number | undefined
       let nextDelayMs: number | undefined
       for (let retry = 0; ; retry++) {
         softError = undefined
@@ -175,23 +174,28 @@ export async function promptPersistentTurnWithFallback(opts: {
         // is to fail OVER rather than burn same-ref retries — which is why
         // isRetryableSameRef excludes it. But on the LAST usable ref there is
         // nothing to fail over to, and a single-ref chain is all last, so that
-        // policy leaves a capacity outage with no recovery whatsoever. A patient
-        // call site rides it out here instead; a responsive one still fails fast.
+        // policy would leave a capacity outage with no recovery whatsoever: the
+        // turn dies on its first attempt in seconds and the caller drops the
+        // user's message. Both policies therefore ride it out here, differing
+        // only in how long (see overloadRetryBudget) — patient for minutes,
+        // responsive for a live-chat-sized handful of seconds.
         // Budget the delay BEFORE accepting the retry. Testing only the elapsed
         // window lets a retry accepted just under the deadline sleep past it, so
         // the next provider attempt would START after the window we advertise.
         const nowMs = now()
-        const patientDelayMs =
-          opts.retryPolicy === 'patient' && isLast && isThrottleOrOverload(outcome.error.message)
-            ? (opts.patientBackoffMs ?? ((n: number) => patientOverloadBackoffMs(n, opts.retryRandom)))(overloadRetries)
+        const overloadDelayMs =
+          isLast && isThrottleOrOverload(outcome.error.message)
+            ? (opts.overloadBackoffMs ?? ((n: number) => overloadBudget.backoffMs(n, opts.retryRandom)))(
+                overloadRetries,
+              )
             : undefined
-        const patientElapsedMs = patientWindowStartedAt === undefined ? 0 : nowMs - patientWindowStartedAt
-        const patientOverload =
-          patientDelayMs !== undefined &&
-          overloadRetries < PATIENT_OVERLOAD_RETRIES &&
-          patientElapsedMs + patientDelayMs <= PATIENT_OVERLOAD_WINDOW_MS
+        const overloadElapsedMs = overloadWindowStartedAt === undefined ? 0 : nowMs - overloadWindowStartedAt
+        const overloadRetry =
+          overloadDelayMs !== undefined &&
+          overloadRetries < overloadBudget.retries &&
+          overloadElapsedMs + overloadDelayMs <= overloadBudget.windowMs
         const retryableWithinBudget =
-          patientOverload || (retry < RETRIES_PER_REF && isRetryableSameRef(outcome.error.message))
+          overloadRetry || (retry < RETRIES_PER_REF && isRetryableSameRef(outcome.error.message))
         const mayRetryWithoutActivity = !activity.producedAssistantOutput && !activity.startedToolExecution
         retryAfterCompletedToolResult =
           retryableWithinBudget &&
@@ -199,9 +203,9 @@ export async function promptPersistentTurnWithFallback(opts: {
           opts.authorizeRetryAfterCompletedToolResult?.() === true
         const mayRetry = retryableWithinBudget && (mayRetryWithoutActivity || retryAfterCompletedToolResult)
         if (!mayRetry) break
-        if (patientOverload) {
-          patientWindowStartedAt ??= nowMs
-          nextDelayMs = patientDelayMs
+        if (overloadRetry) {
+          overloadWindowStartedAt ??= nowMs
+          nextDelayMs = overloadDelayMs
           overloadRetries++
         } else {
           nextDelayMs = undefined
