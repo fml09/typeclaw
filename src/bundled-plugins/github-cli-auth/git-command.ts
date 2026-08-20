@@ -3,10 +3,16 @@
 
 import { mapVirtualTmpPath } from '@/sandbox'
 
+// GitHub refuses anonymous writes, so a `write` decision the broker cannot fund
+// is already doomed — the caller turns that into a block with guidance rather
+// than letting git die on a credential prompt. Reads stay fundable-but-optional:
+// public clone/fetch/ls-remote succeed with no token at all.
+export type GitRemoteAccess = 'read' | 'write'
+
 export type GitCommandDecision =
   | { kind: 'pass-through' }
   | { kind: 'block'; reason: string }
-  | { kind: 'inject'; repoSlug: string; rewrittenCommand?: string }
+  | { kind: 'inject'; repoSlug: string; access: GitRemoteAccess; rewrittenCommand?: string }
 
 export type GitRemoteResolver = (cwd: string, remote: string, forPush: boolean) => Promise<string | null>
 export type GitConfigResolver = (cwd: string, key: string) => Promise<string | null>
@@ -166,7 +172,11 @@ async function decideStandalone(invocation: MintableInvocation, resolvers: GitRe
   if (repos.size === 0) return { kind: 'pass-through' }
   if (!evidence.complete) return { kind: 'pass-through' }
   if (repos.size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
-  return { kind: 'inject', repoSlug: [...repos][0] as string }
+  return { kind: 'inject', repoSlug: [...repos][0] as string, access: remoteAccess(invocation.subcommand) }
+}
+
+function remoteAccess(subcommand: RemoteSubcommand): GitRemoteAccess {
+  return subcommand === 'push' ? 'write' : 'read'
 }
 
 function parseMintableGitInvocation(command: string, baseCwd: string): MintableInvocation | null {
@@ -625,6 +635,7 @@ function analyzeCloneThenInspect(command: string): GitCommandDecision | null {
   return {
     kind: 'inject',
     repoSlug: parsed.repoSlug,
+    access: 'read',
     rewrittenCommand: `${canonicalHead} && ${TAIL_STRIP_PREFIX} ${posixSingleQuote(split.tail)}`,
   }
 }
