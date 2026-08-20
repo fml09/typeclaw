@@ -47,11 +47,14 @@ export async function resolveBackupPushAuthEnv(
     GIT_ASKPASS: askpass,
     TYPECLAW_GIT_TOKEN: token.token,
     GIT_TERMINAL_PROMPT: '0',
-    GIT_CONFIG_COUNT: '2',
-    GIT_CONFIG_KEY_0: 'url.https://github.com/.insteadOf',
-    GIT_CONFIG_VALUE_0: 'git@github.com:',
+    GIT_ALLOW_PROTOCOL: 'https',
+    GIT_CONFIG_COUNT: '3',
+    GIT_CONFIG_KEY_0: 'credential.helper',
+    GIT_CONFIG_VALUE_0: '',
     GIT_CONFIG_KEY_1: 'url.https://github.com/.insteadOf',
-    GIT_CONFIG_VALUE_1: 'ssh://git@github.com/',
+    GIT_CONFIG_VALUE_1: 'git@github.com:',
+    GIT_CONFIG_KEY_2: 'url.https://github.com/.insteadOf',
+    GIT_CONFIG_VALUE_2: 'ssh://git@github.com/',
   }
 }
 
