@@ -41,6 +41,56 @@ describe('parseInteractionAsCommand', () => {
     })
   })
 
+  test('carries a canonical thread parent from the interaction channel object', () => {
+    const event = makeInteraction({
+      channel_id: '100000000000000001',
+      guild_id: '100000000000000002',
+    }) as DiscordGatewayInteractionEvent & {
+      channel: { id: string; type: number; parent_id: string }
+    }
+    event.channel = {
+      id: '100000000000000001',
+      type: 11,
+      parent_id: '100000000000000003',
+    }
+
+    const result = parseInteractionAsCommand(event, known)
+
+    expect(result.kind).toBe('parsed')
+    if (result.kind !== 'parsed') return
+    expect(result.command.parentChat).toBe('100000000000000003')
+  })
+
+  test('does not trust malformed or non-thread interaction parent metadata', () => {
+    const event = makeInteraction() as DiscordGatewayInteractionEvent & {
+      channel: { type: number; parent_id: string }
+    }
+    event.channel = { type: 0, parent_id: '100000000000000003' }
+    expect(parseInteractionAsCommand(event, known)).not.toHaveProperty('command.parentChat')
+
+    event.channel = { type: 11, parent_id: 'not-a-snowflake' }
+    expect(parseInteractionAsCommand(event, known)).not.toHaveProperty('command.parentChat')
+  })
+
+  test('does not trust thread metadata for another channel or without a guild', () => {
+    const event = makeInteraction({
+      channel_id: '100000000000000001',
+      guild_id: '100000000000000002',
+    }) as DiscordGatewayInteractionEvent & {
+      channel: { id: string; type: number; parent_id: string }
+    }
+    event.channel = {
+      id: '100000000000000009',
+      type: 11,
+      parent_id: '100000000000000003',
+    }
+    expect(parseInteractionAsCommand(event, known)).not.toHaveProperty('command.parentChat')
+
+    event.guild_id = undefined
+    event.channel.id = '100000000000000001'
+    expect(parseInteractionAsCommand(event, known)).not.toHaveProperty('command.parentChat')
+  })
+
   test('DM interaction (no guild_id) maps workspace to @dm and reads user.id', () => {
     const result = parseInteractionAsCommand(
       makeInteraction({ guild_id: undefined, member: undefined, user: { id: 'u-bob', username: 'bob' } }),
