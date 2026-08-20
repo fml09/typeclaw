@@ -55,6 +55,10 @@ If slash command registration returns 403, re-invite with `applications.commands
 
 `/help`, `/stop`, `/reload`, `/restart`. Auto-registered on connect.
 
+## Permission scopes
+
+Discord role match rules use `discord:<guildId>` for a server and `discord:<guildId>/<channelId>` for a concrete channel. A parent-channel scope also covers its resolved child threads, while a scope naming a thread ID remains exact. DMs use `discord:dm/*`. See the [match-rule DSL](/docs/reference/match-rule-dsl).
+
 ## Config
 
 ```json
