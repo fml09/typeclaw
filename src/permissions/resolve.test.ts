@@ -26,6 +26,11 @@ const discordChat: MatchableOrigin = {
   workspace: '9999',
   chat: '123456',
 }
+const discordThread: MatchableOrigin = {
+  ...discordChat,
+  chat: 'thread-123',
+  parentChat: '123456',
+}
 const lineSquare: MatchableOrigin = {
   kind: 'channel',
   adapter: 'line',
@@ -64,6 +69,18 @@ const SLACK_CHAT: MatchRule = { kind: 'channel', platform: 'slack', workspace: '
 const SLACK_WS_AUTHOR: MatchRule = { kind: 'channel', platform: 'slack', workspace: 'T0123', author: 'U_ME' }
 const SLACK_DM_BUCKET: MatchRule = { kind: 'channel', platform: 'slack', bucket: 'dm' }
 const DISCORD_GUILD: MatchRule = { kind: 'channel', platform: 'discord', workspace: '9999' }
+const DISCORD_PARENT: MatchRule = {
+  kind: 'channel',
+  platform: 'discord',
+  workspace: '9999',
+  chat: '123456',
+}
+const DISCORD_THREAD: MatchRule = {
+  kind: 'channel',
+  platform: 'discord',
+  workspace: '9999',
+  chat: 'thread-123',
+}
 const LINE_SQUARE_BUCKET: MatchRule = { kind: 'channel', platform: 'line', bucket: 'square' }
 const KAKAO_GROUP_BUCKET: MatchRule = { kind: 'channel', platform: 'kakao', bucket: 'group' }
 const WEBEX_DM_BUCKET: MatchRule = { kind: 'channel', platform: 'webex', bucket: 'dm' }
@@ -130,7 +147,31 @@ describe('matchesOrigin — channel coordinates', () => {
 
   test('discord workspace match', () => {
     expect(matchesOrigin(DISCORD_GUILD, discordChat)).toBe(true)
+    expect(matchesOrigin(DISCORD_GUILD, discordThread)).toBe(true)
     expect(matchesOrigin(DISCORD_GUILD, { ...discordChat, workspace: '8888' })).toBe(false)
+  })
+
+  test('discord parent channel matches its resolved child thread', () => {
+    expect(matchesOrigin(DISCORD_PARENT, discordThread)).toBe(true)
+    expect(matchesOrigin(DISCORD_PARENT, { ...discordThread, parentChat: 'other-parent' })).toBe(false)
+    expect(matchesOrigin(DISCORD_PARENT, { ...discordThread, parentChat: undefined })).toBe(false)
+  })
+
+  test('discord explicit thread remains strict and does not match its parent or siblings', () => {
+    expect(matchesOrigin(DISCORD_THREAD, discordThread)).toBe(true)
+    expect(matchesOrigin(DISCORD_THREAD, discordChat)).toBe(false)
+    expect(matchesOrigin(DISCORD_THREAD, { ...discordThread, chat: 'sibling-thread' })).toBe(false)
+  })
+
+  test('discord parent channel does not match a DM carrying the same chat id', () => {
+    expect(
+      matchesOrigin(DISCORD_PARENT, {
+        ...discordThread,
+        workspace: '@dm',
+        chat: '123456',
+        parentChat: undefined,
+      }),
+    ).toBe(false)
   })
 
   test('line square bucket matches the @line-square workspace prefix', () => {
