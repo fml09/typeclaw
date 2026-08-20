@@ -3,6 +3,8 @@
 
 import { mapVirtualTmpPath } from '@/sandbox'
 
+import { GIT_CREDENTIAL_ENV_KEYS } from './git-credential-env'
+
 // GitHub refuses anonymous writes, so a `write` decision the broker cannot fund
 // is already doomed — the caller turns that into a block with guidance rather
 // than letting git die on a credential prompt. Reads stay fundable-but-optional:
@@ -84,11 +86,11 @@ const COMPOSITION_REASON =
   'which is rewritten to `git -C <path> …`. Run local Git commands separately, ' +
   'then retry the remote operation as a standalone `git -C <path> …` command.'
 
-const TAIL_STRIP_PREFIX =
-  'exec /usr/bin/env -u TYPECLAW_GIT_TOKEN -u GIT_ASKPASS -u GH_TOKEN -u GITHUB_TOKEN ' +
-  '-u GIT_TERMINAL_PROMPT -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 ' +
-  '-u GIT_CONFIG_KEY_1 -u GIT_CONFIG_VALUE_1 -u GIT_CONFIG_KEY_2 -u GIT_CONFIG_VALUE_2 ' +
-  '-u GIT_CONFIG_KEY_3 -u GIT_CONFIG_VALUE_3 /bin/bash -c'
+const AMBIENT_GITHUB_TOKEN_ENV_KEYS = ['GH_TOKEN', 'GITHUB_TOKEN'] as const
+const TAIL_STRIP_ENV_KEYS = GIT_CREDENTIAL_ENV_KEYS.flatMap((key) =>
+  key === 'GIT_ASKPASS' ? [key, ...AMBIENT_GITHUB_TOKEN_ENV_KEYS] : [key],
+)
+const TAIL_STRIP_PREFIX = `exec /usr/bin/env ${TAIL_STRIP_ENV_KEYS.map((key) => `-u ${key}`).join(' ')} /bin/bash -c`
 
 type RemoteSubcommand = 'push' | 'fetch' | 'pull' | 'clone' | 'ls-remote'
 

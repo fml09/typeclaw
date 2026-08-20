@@ -1,10 +1,10 @@
-import { TYPECLAW_INTERNAL_BASH_ENV } from '@/agent/plugin-tools'
+import { TYPECLAW_INTERNAL_BASH_ENV, TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV } from '@/agent/plugin-tools'
 import type { SessionOrigin } from '@/agent/session-origin'
 import {
   configureReviewVerdictCoordinator,
   createSharedReviewVerdictGuard,
 } from '@/channels/github-review-verdict-coordinator'
-import { hasEnvKey } from '@/init/env-file'
+import { hasEnvKey, readEnvFile } from '@/init/env-file'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
 import { definePlugin } from '@/plugin'
 
@@ -22,6 +22,7 @@ import {
   defaultGitResolvers,
   resolveGhDefaultRepoFromCwd,
 } from './git-command'
+import { buildGitCredentialEnv } from './git-credential-env'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
 import { classifyGhToken, shouldMintAppToken } from './token-class'
@@ -77,6 +78,23 @@ export default definePlugin({
       return undefined
     }
 
+    // Stricter than sandboxInheritedGhToken(), and deliberately not merged with it.
+    // `gh` only needs to know WHICH token the sandbox will hand it, so the live
+    // value is the right answer there. Brokering to git asserts something stronger
+    // — that the operator deliberately exposed THIS value — and a declared NAME
+    // does not authenticate a live VALUE: PAT-mode channel auth overwrites
+    // process.env.GH_TOKEN at runtime (channels/adapters/github/index.ts), so a
+    // declared name can carry a credential the operator never wrote to `.env`.
+    // Compare against the same literal `readEnvFile` parse Docker's --env-file
+    // injects, and fail closed on any mismatch.
+    const declaredGhTokenForGitBroker = (): { envName: 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string } | undefined => {
+      const inherited = sandboxInheritedGhToken()
+      if (inherited === undefined) return undefined
+      const declared = readEnvFile(ctx.agentDir).get(inherited.envName)
+      if (declared === undefined || declared === '' || declared !== inherited.value) return undefined
+      return inherited
+    }
+
     // A process-only PAT (runtime/App-seeded process.env, NOT declared in `.env`)
     // is stripped by --clearenv for this role, and a PAT is not re-mintable per
     // repo, so there is no token to inject. Tell the AGENT (model-visible block)
@@ -95,16 +113,14 @@ export default definePlugin({
     // Deliberately claims only what this process can prove: a resolver is absent.
     // It cannot tell PAT-configured from App-configured-but-adapter-down, so it
     // names both remedies instead of guessing one. The closing lines exist because
-    // the mute version of this failure sent an agent chasing `gh auth setup-git`
-    // and then telling its operator a nonexistent upstream fix needed deploying.
+    // a mute refusal here is indistinguishable from broken auth, so the caller
+    // retries credential-management commands that are themselves blocked.
     const missingAppAuthForPushReason =
       'Pushing to github.com needs a credential and this runtime has no live GitHub App token minter, ' +
-      'so TypeClaw has nothing to give git. A GitHub PAT is never brokered to git by design (git runs ' +
-      'repo-local hooks and credential helpers, and a PAT is not repo-confined), so `GH_TOKEN` in `.env` ' +
-      'does NOT enable push even though it authenticates `gh`. Operator remedy: set ' +
-      '`secrets.json#channels.github.auth` to `{"type":"app", "appId":…, "privateKey":…}`, install that App ' +
-      'on the target repo, list the repo in `typeclaw.json#channels.github.repos[]`, and restart; if App auth ' +
-      'is already configured, the adapter failed to start — check `typeclaw logs`. Do not retry with ' +
+      'so TypeClaw has nothing to give git. Operator remedy: declare `GH_TOKEN` in the agent `.env` and ' +
+      'restart (no further config is needed), or configure GitHub App auth under `channels.github` for ' +
+      'per-repo, short-lived tokens. If App auth is already configured, the adapter failed to start — check ' +
+      '`typeclaw logs`. Do not retry with ' +
       '`gh auth setup-git`, a credential helper, or a tokenized remote URL: those are blocked and the ' +
       'credential files are masked in this sandbox. This is configuration/runtime state, not a stale ' +
       'TypeClaw version — a rebuild or restart alone will not change it. To open a PR without pushing ' +
@@ -371,7 +387,7 @@ export default definePlugin({
     }
 
     const handleGitCommand = async (params: {
-      event: { args: Record<string, unknown> }
+      event: { args: Record<string, unknown>; origin?: SessionOrigin }
       command: string
       agentDir: string
       sessionId: string
@@ -384,14 +400,34 @@ export default definePlugin({
       if (decision.kind === 'pass-through') return
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
 
-      // Only a per-repo GitHub App token is brokered to git — never a PAT (git,
-      // unlike gh, runs repo-local hooks/helpers, and a PAT is not repo-confined).
-      // With no App minter a read can still succeed anonymously, so it passes
-      // through; a write cannot, and passing it through strands git on a
-      // credential prompt whose `could not read Username` says nothing about the
-      // real cause. Block the write instead, so the agent reports the actual
-      // remedy rather than inventing one.
+      const buildGitCredentialOverlay = async (token: string, existing: unknown): Promise<Record<string, string>> => {
+        const askpass = await ensureGitAskPassHelper(resolveSandboxGitAskPassPath())
+        const overlay = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
+        return {
+          ...overlay,
+          ...buildGitCredentialEnv(token, askpass),
+        }
+      }
+
       if (!hasAppTokenResolver()) {
+        const inherited = declaredGhTokenForGitBroker()
+        const tokenClass = classifyGhToken(inherited?.value)
+        if (
+          // The analyzer emits write access only for its push subcommand grammar.
+          decision.access === 'write' &&
+          inherited !== undefined &&
+          (tokenClass === 'cross-owner' || tokenClass === 'fine-grained-pat') &&
+          canUsePat(event.origin)
+        ) {
+          event.args[TYPECLAW_INTERNAL_BASH_ENV] = await buildGitCredentialOverlay(
+            inherited.value,
+            event.args[TYPECLAW_INTERNAL_BASH_ENV],
+          )
+          // Withhold wins only when the same ambient names are absent from the overlay.
+          event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV] = ['GH_TOKEN', 'GITHUB_TOKEN']
+          if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
+          return
+        }
         return decision.access === 'write' ? { block: true, reason: missingAppAuthForPushReason } : undefined
       }
       const result = await resolveTokenForRepo(decision.repoSlug)
@@ -406,26 +442,10 @@ export default definePlugin({
       // belong in a separate agent (see docs/internals/sandbox.mdx).
       // Sandboxed bash: the helper must be on a sandbox-visible path (baked /usr),
       // not the unsandboxed /tmp default the tmpfs would hide.
-      const askpass = await ensureGitAskPassHelper(resolveSandboxGitAskPassPath())
-      const existing = event.args[TYPECLAW_INTERNAL_BASH_ENV]
-      const overlay = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
-      event.args[TYPECLAW_INTERNAL_BASH_ENV] = {
-        ...overlay,
-        GIT_ASKPASS: askpass,
-        TYPECLAW_GIT_TOKEN: result.token,
-        GIT_TERMINAL_PROMPT: '0',
-        GIT_CONFIG_COUNT: '4',
-        GIT_CONFIG_KEY_0: 'core.hooksPath',
-        GIT_CONFIG_VALUE_0: '/dev/null',
-        GIT_CONFIG_KEY_1: 'credential.helper',
-        GIT_CONFIG_VALUE_1: '',
-        // Both ssh remote spellings fold to https so the askpass credential applies:
-        // the scp short form (git@github.com:owner/repo) and the ssh:// URL form.
-        GIT_CONFIG_KEY_2: 'url.https://github.com/.insteadOf',
-        GIT_CONFIG_VALUE_2: 'git@github.com:',
-        GIT_CONFIG_KEY_3: 'url.https://github.com/.insteadOf',
-        GIT_CONFIG_VALUE_3: 'ssh://git@github.com/',
-      }
+      event.args[TYPECLAW_INTERNAL_BASH_ENV] = await buildGitCredentialOverlay(
+        result.token,
+        event.args[TYPECLAW_INTERNAL_BASH_ENV],
+      )
       if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
       return
     }
