@@ -335,6 +335,24 @@ describe('PermissionService — role resolution cache', () => {
     expect(svc.resolveRole({ ...slackOwnerChat, chat: 'C_OTHER' })).toBe('guest')
   })
 
+  test('discord thread parent is matched and isolated in the role cache', () => {
+    const roles = parseRoles({ trusted: { match: ['discord:GUILD/PARENT author:U_ME'] } })
+    const svc = createPermissionService({ roles, pluginPermissions: PLUGIN_PERMS })
+    const thread: SessionOrigin = {
+      kind: 'channel',
+      adapter: 'discord-bot',
+      workspace: 'GUILD',
+      chat: 'THREAD',
+      thread: null,
+      parentChat: 'PARENT',
+      lastInboundAuthorId: 'U_ME',
+    }
+
+    expect(svc.resolveRole(thread)).toBe('trusted')
+    expect(svc.resolveRole({ ...thread, parentChat: 'OTHER_PARENT' })).toBe('guest')
+    expect(svc.resolveRole({ ...thread, parentChat: undefined })).toBe('guest')
+  })
+
   test('adapter is part of the key (identical coordinates under discord-bot do not inherit slack verdict)', () => {
     // Same workspace/chat/author, different adapter. Only slack is trusted;
     // if `adapter` were omitted from the key, the discord origin would inherit
