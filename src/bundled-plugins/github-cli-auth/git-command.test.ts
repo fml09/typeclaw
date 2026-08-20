@@ -84,24 +84,28 @@ describe('analyzeGitCommand — inject (explicit url)', () => {
     expect(await analyze('git clone https://github.com/acme/widgets.git')).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
+      access: 'read',
     })
   })
   test('ls-remote scp-like', async () => {
     expect(await analyze('git ls-remote git@github.com:acme/widgets.git')).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
+      access: 'read',
     })
   })
   test('push --repo url', async () => {
     expect(await analyze('git push --repo https://github.com/acme/widgets.git main')).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
+      access: 'write',
     })
   })
   test('push --repo=url', async () => {
     expect(await analyze('git push --repo=https://github.com/acme/widgets.git main')).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
+      access: 'write',
     })
   })
 })
@@ -110,16 +114,32 @@ describe('analyzeGitCommand — inject (remote resolution)', () => {
   const ghRemote = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
 
   test('fetch origin', async () => {
-    expect(await analyze('git fetch origin', ghRemote)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git fetch origin', ghRemote)).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      access: 'read',
+    })
   })
   test('pull origin main', async () => {
-    expect(await analyze('git pull origin main', ghRemote)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git pull origin main', ghRemote)).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      access: 'read',
+    })
   })
   test('push origin main', async () => {
-    expect(await analyze('git push origin main', ghRemote)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git push origin main', ghRemote)).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      access: 'write',
+    })
   })
   test('push -u origin branch (value flag skipped)', async () => {
-    expect(await analyze('git push -u origin feature', ghRemote)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git push -u origin feature', ghRemote)).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      access: 'write',
+    })
   })
 })
 
@@ -130,7 +150,7 @@ describe('analyzeGitCommand — bare push remote resolution chain', () => {
       resolveConfig: async (_cwd, key) => (key === 'branch.feature.pushRemote' ? 'upstream' : null),
       resolveRemoteUrl: async (_cwd, remote) => (remote === 'upstream' ? 'https://github.com/acme/widgets.git' : null),
     })
-    expect(await analyze('git push', r)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git push', r)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets', access: 'write' })
   })
   test('falls back to remote.pushDefault', async () => {
     const r = resolvers({
@@ -138,14 +158,14 @@ describe('analyzeGitCommand — bare push remote resolution chain', () => {
       resolveConfig: async (_cwd, key) => (key === 'remote.pushDefault' ? 'origin2' : null),
       resolveRemoteUrl: async (_cwd, remote) => (remote === 'origin2' ? 'git@github.com:acme/widgets.git' : null),
     })
-    expect(await analyze('git push', r)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git push', r)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets', access: 'write' })
   })
   test('falls back to origin', async () => {
     const r = resolvers({
       resolveCurrentBranch: async () => 'main',
       resolveRemoteUrl: async (_cwd, remote) => (remote === 'origin' ? 'https://github.com/acme/widgets.git' : null),
     })
-    expect(await analyze('git push', r)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git push', r)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets', access: 'write' })
   })
 })
 
@@ -174,6 +194,7 @@ describe('analyzeGitCommand — cd rewrite', () => {
     expect(result).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
+      access: 'write',
       rewrittenCommand: "git -C '/agent/workspace/repo' push origin main",
     })
   })
@@ -300,7 +321,7 @@ describe('analyzeGitCommand — git -C resolution', () => {
       },
     })
     const result = await analyze('git -C workspace/repo push origin main', r)
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets', access: 'write' })
     expect(seen).toContain('/agent/workspace/repo')
   })
 })
@@ -320,11 +341,19 @@ describe('analyzeGitCommand — push uses pushurl, not fetch url', () => {
   })
 
   test('push resolves the push url (forPush=true)', async () => {
-    expect(await analyze('git push origin main', splitRemote)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git push origin main', splitRemote)).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      access: 'write',
+    })
   })
 
   test('fetch resolves the fetch url (forPush=false)', async () => {
-    expect(await analyze('git fetch origin', splitRemote)).toEqual({ kind: 'inject', repoSlug: 'other/fetchonly' })
+    expect(await analyze('git fetch origin', splitRemote)).toEqual({
+      kind: 'inject',
+      repoSlug: 'other/fetchonly',
+      access: 'read',
+    })
   })
 
   test('forPush flag is passed to the resolver per subcommand', async () => {
@@ -377,7 +406,7 @@ describe('analyzeGitCommand — multi-remote resolution', () => {
   test('fetch --multiple where every target resolves to the same repo still injects', async () => {
     const r = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
     const result = await analyze('git fetch --multiple origin https://github.com/acme/widgets.git', r)
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets', access: 'read' })
   })
 
   test('repeated -C is cumulative: a relative second -C resolves under the first (git semantics)', async () => {
@@ -568,7 +597,7 @@ describe('analyzeGitCommand — push-default fallback is push-only', () => {
     resolveRemoteUrl: async (_cwd, remote) => (remote === 'origin' ? 'https://github.com/acme/widgets.git' : null),
   })
   test('bare push falls back to origin', async () => {
-    expect(await analyze('git push', chain)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(await analyze('git push', chain)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets', access: 'write' })
   })
   test('bare fetch does NOT use push-default → pass-through', async () => {
     expect((await analyze('git fetch', chain)).kind).toBe('pass-through')
@@ -703,6 +732,7 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
     expect(result).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
+      access: 'read',
       rewrittenCommand: HEAD + ' && ' + STRIP + " 'cd /tmp/x && grep -r foo .'",
     })
   })
@@ -906,7 +936,7 @@ describe('createSessionTmpGitResolvers', () => {
       resolvers: createSessionTmpGitResolvers(CWD, SESSION, base),
     })
 
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets', access: 'write' })
   })
 
   test('without the mapping the same command falls through unbrokered', async () => {
@@ -958,6 +988,7 @@ describe('createSessionTmpGitResolvers', () => {
     expect(result).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
+      access: 'write',
       rewrittenCommand: "git -C '/tmp/clone' push",
     })
   })

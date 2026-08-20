@@ -1307,7 +1307,7 @@ describe('github-cli-auth plugin — git path', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
-  test('no App minter: authenticated git passes through so git fails honestly', async () => {
+  test('no App minter: a github push blocks with actionable guidance instead of failing mute', async () => {
     delete process.env.GH_TOKEN
     let resolverCalled = false
     const hook = await hookFor(async () => {
@@ -1318,9 +1318,55 @@ describe('github-cli-auth plugin — git path', () => {
 
     const result = await hook(event, hookCtx)
 
-    expect(result).toBeUndefined()
+    expect(result).toMatchObject({ block: true })
+    const reason = (result as { reason: string }).reason
+    // The operator remedy, and the two wrong turns this failure historically caused.
+    expect(reason).toContain('channels.github')
+    expect(reason).toContain('gh auth setup-git')
+    expect(reason).toContain('not a stale')
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
     expect(resolverCalled).toBe(false)
+  })
+
+  test('no App minter: a github read still passes through so public repos keep working', async () => {
+    delete process.env.GH_TOKEN
+    const hook = await hookFor(tokenResolver('ghs_minted'), false)
+
+    for (const command of [
+      'git clone https://github.com/acme/widgets.git',
+      'git fetch https://github.com/acme/widgets.git main',
+      'git ls-remote https://github.com/acme/widgets.git',
+    ]) {
+      const event = bashEvent(command)
+
+      const result = await hook(event, hookCtx)
+
+      expect(result).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    }
+  })
+
+  test('no App minter: a non-github push is left alone', async () => {
+    delete process.env.GH_TOKEN
+    const hook = await hookFor(tokenResolver('ghs_minted'), false)
+    const event = bashEvent('git push https://gitlab.com/acme/widgets.git main')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+
+  test('no App minter: a PAT never leaks into the blocked push reason', async () => {
+    process.env.GH_TOKEN = 'ghp_classic'
+    const hook = await hookFor(tokenResolver('ghs_minted'), false, { permissions: privilegedPermissions })
+    const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toMatchObject({ block: true })
+    expect(JSON.stringify(result)).not.toContain('ghp_classic')
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
   test('unavailable bridge (repo not in repos[]) blocks with the adapter reason', async () => {

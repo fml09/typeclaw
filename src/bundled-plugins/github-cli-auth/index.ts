@@ -92,6 +92,24 @@ export default definePlugin({
       'sandbox. Configure GitHub App auth (channels.github) for per-repo, short-lived tokens that work ' +
       'for sandboxed roles, or declare the PAT in `.env` to deliberately expose it to model bash.'
 
+    // Deliberately claims only what this process can prove: a resolver is absent.
+    // It cannot tell PAT-configured from App-configured-but-adapter-down, so it
+    // names both remedies instead of guessing one. The closing lines exist because
+    // the mute version of this failure sent an agent chasing `gh auth setup-git`
+    // and then telling its operator a nonexistent upstream fix needed deploying.
+    const missingAppAuthForPushReason =
+      'Pushing to github.com needs a credential and this runtime has no live GitHub App token minter, ' +
+      'so TypeClaw has nothing to give git. A GitHub PAT is never brokered to git by design (git runs ' +
+      'repo-local hooks and credential helpers, and a PAT is not repo-confined), so `GH_TOKEN` in `.env` ' +
+      'does NOT enable push even though it authenticates `gh`. Operator remedy: set ' +
+      '`secrets.json#channels.github.auth` to `{"type":"app", "appId":…, "privateKey":…}`, install that App ' +
+      'on the target repo, list the repo in `typeclaw.json#channels.github.repos[]`, and restart; if App auth ' +
+      'is already configured, the adapter failed to start — check `typeclaw logs`. Do not retry with ' +
+      '`gh auth setup-git`, a credential helper, or a tokenized remote URL: those are blocked and the ' +
+      'credential files are masked in this sandbox. This is configuration/runtime state, not a stale ' +
+      'TypeClaw version — a rebuild or restart alone will not change it. To open a PR without pushing ' +
+      'from here, hand the branch to the host operator.'
+
     let warnedSandboxedPatWithheld = false
     const warnSandboxedPatWithheldOnce = (): void => {
       if (warnedSandboxedPatWithheld) return
@@ -368,8 +386,14 @@ export default definePlugin({
 
       // Only a per-repo GitHub App token is brokered to git — never a PAT (git,
       // unlike gh, runs repo-local hooks/helpers, and a PAT is not repo-confined).
-      // With no App minter, pass through so git fails honestly.
-      if (!hasAppTokenResolver()) return
+      // With no App minter a read can still succeed anonymously, so it passes
+      // through; a write cannot, and passing it through strands git on a
+      // credential prompt whose `could not read Username` says nothing about the
+      // real cause. Block the write instead, so the agent reports the actual
+      // remedy rather than inventing one.
+      if (!hasAppTokenResolver()) {
+        return decision.access === 'write' ? { block: true, reason: missingAppAuthForPushReason } : undefined
+      }
       const result = await resolveTokenForRepo(decision.repoSlug)
       if (result.kind === 'unavailable') return { block: true, reason: result.reason }
 
