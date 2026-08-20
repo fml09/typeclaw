@@ -56,7 +56,9 @@ import {
   buildSandboxEnvPolicy,
   defaultBuiltinPiToolDefinitions,
   forgetSharedLoopGuardTool,
+  sanitizeBashSpawnEnvironment,
   TYPECLAW_INTERNAL_BASH_ENV,
+  TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV,
   wrapBuiltinToolDefinition,
   wrapPluginTool,
   wrapSystemTool,
@@ -4802,6 +4804,128 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     )
     expect(seenInHook).toBeUndefined()
   })
+
+  test('a client-supplied env withhold list is stripped before hooks run', async () => {
+    const record: { command?: string } = {}
+    let seenInHook: unknown = 'unset'
+    const hooks = createHookBus()
+    hooks.registerAll('observer', '/agent', noopLogger, {
+      'tool.before': (event) => {
+        seenInHook = (event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
+      },
+    })
+    const args: Record<string, unknown> = {
+      command: 'echo hi',
+      [TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]: ['SERVICE_TOKEN'],
+    }
+    const wrapped = wrapBuiltinToolDefinition(fakeBash(record), {
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks,
+      getOrigin: () => tui,
+    })
+
+    await expect(wrapped.execute('c', args as never, undefined, undefined, {} as never)).rejects.toThrow(
+      /permission service/i,
+    )
+    expect(seenInHook).toBeUndefined()
+    expect(args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+  })
+
+  test('a hook-set env withhold removes an ambient name from sandbox inherit and spawn env', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-withhold-env-boundary-'))
+    const name = 'TYPECLAW_COMMAND_TOKEN'
+    process.env[name] = 'ambient-token'
+    try {
+      await writeFile(path.join(agentDir, '.env'), `${name}=operator-token\n`)
+      const hooks = createHookBus()
+      hooks.registerAll('env-withholder', agentDir, noopLogger, {
+        'tool.before': (event) => {
+          ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV] = [name]
+        },
+      })
+      const bash = defaultBuiltinPiToolDefinitions(agentDir).find((tool) => tool.name === 'bash')
+      if (bash === undefined) throw new Error('bash tool definition not found')
+      const wrapped = wrapBuiltinToolDefinition(bash, {
+        agentDir,
+        sessionId: 'withhold-env-boundary',
+        hooks,
+        getOrigin: () => tui,
+        permissions: createPermissionService(),
+        bashSandboxBoundary: {
+          ensureAvailable: async () => {},
+          buildCommand(command, options) {
+            if (options === undefined) throw new Error('sandbox options were not provided')
+            expect(options.env?.inherit ?? []).not.toContain(name)
+            expect(options.env?.set?.[name]).toBeUndefined()
+            expect(options.env?.withhold).toContain(name)
+            return { ...buildSandboxedCommand(command, options), commandString: command }
+          },
+        },
+      })
+
+      const result = await wrapped.execute(
+        'c',
+        { command: `printf '%s' "\${${name}:-missing}"` },
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      expect(textOfFirstContent(result)).toBe('missing')
+    } finally {
+      delete process.env[name]
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a hook overlay wins when it also withholds the ambient name', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-withhold-overlay-boundary-'))
+    const name = 'TYPECLAW_COMMAND_TOKEN'
+    process.env[name] = 'ambient-token'
+    try {
+      await writeFile(path.join(agentDir, '.env'), `${name}=operator-token\n`)
+      const hooks = createHookBus()
+      hooks.registerAll('env-replacer', agentDir, noopLogger, {
+        'tool.before': (event) => {
+          const args = event.args as Record<string, unknown>
+          args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV] = [name]
+          args[TYPECLAW_INTERNAL_BASH_ENV] = { [name]: 'injected-token' }
+        },
+      })
+      const bash = defaultBuiltinPiToolDefinitions(agentDir).find((tool) => tool.name === 'bash')
+      if (bash === undefined) throw new Error('bash tool definition not found')
+      const wrapped = wrapBuiltinToolDefinition(bash, {
+        agentDir,
+        sessionId: 'withhold-overlay-boundary',
+        hooks,
+        getOrigin: () => tui,
+        permissions: createPermissionService(),
+        bashSandboxBoundary: {
+          ensureAvailable: async () => {},
+          buildCommand(command, options) {
+            if (options === undefined) throw new Error('sandbox options were not provided')
+            expect(options.env?.inherit).toContain(name)
+            expect(options.env?.withhold ?? []).not.toContain(name)
+            return { ...buildSandboxedCommand(command, options), commandString: command }
+          },
+        },
+      })
+
+      const result = await wrapped.execute(
+        'c',
+        { command: `printf '%s' "$${name}"` },
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      expect(textOfFirstContent(result)).toBe('injected-token')
+    } finally {
+      delete process.env[name]
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('buildSandboxEnvPolicy exposable .env names', () => {
@@ -4820,6 +4944,43 @@ describe('buildSandboxEnvPolicy exposable .env names', () => {
   test('deduplicates a name that is both a secret-pattern overlay and an exposable name', () => {
     const policy = buildSandboxEnvPolicy({ FOO_TOKEN: 'x' }, undefined, ['FOO_TOKEN'])
     expect(policy.inherit).toEqual(['FOO_TOKEN'])
+  })
+
+  test('withhold wins over privileged runtime set and exposable inheritance', () => {
+    const policy = buildSandboxEnvPolicy(
+      undefined,
+      { SERVICE_TOKEN: 'runtime-token' },
+      ['SERVICE_TOKEN'],
+      ['SERVICE_TOKEN'],
+    )
+
+    expect(policy.inherit ?? []).not.toContain('SERVICE_TOKEN')
+    expect(policy.set?.SERVICE_TOKEN).toBeUndefined()
+    expect(policy.withhold).toEqual(['SERVICE_TOKEN'])
+  })
+
+  test('overlay wins over a withhold request for the same name', () => {
+    const policy = buildSandboxEnvPolicy(
+      { SERVICE_TOKEN: 'injected-token' },
+      { SERVICE_TOKEN: 'runtime-token' },
+      ['SERVICE_TOKEN'],
+      ['SERVICE_TOKEN'],
+    )
+
+    expect(policy.inherit).toEqual(['SERVICE_TOKEN'])
+    expect(policy.set?.SERVICE_TOKEN).toBeUndefined()
+    expect(policy.withhold).toBeUndefined()
+  })
+
+  test('fallback spawn env removes withheld ambient values before applying the overlay', () => {
+    const env = sanitizeBashSpawnEnvironment(
+      { AMBIENT_TOKEN: 'ambient', REPLACED_TOKEN: 'ambient' },
+      { REPLACED_TOKEN: 'injected' },
+      ['AMBIENT_TOKEN', 'REPLACED_TOKEN'],
+    )
+
+    expect(env.AMBIENT_TOKEN).toBeUndefined()
+    expect(env.REPLACED_TOKEN).toBe('injected')
   })
 
   test('inherits runtime-injected Git identity by name so values stay out of argv', () => {

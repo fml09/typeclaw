@@ -109,8 +109,10 @@ let sharedLoopGuard: LoopGuard = createLoopGuard()
 // is stripped from client-supplied args before tool.before so only trusted
 // hooks can set it.
 export const TYPECLAW_INTERNAL_BASH_ENV = '__typeclawBashEnv'
+export const TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV = '__typeclawBashWithholdEnv'
 
 type BashEnvOverlay = Record<string, string>
+type BashEnvWithhold = string[]
 const SECRET_BASH_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN'])
 
 // Transport classifier for the TRUSTED hook-injected overlay only (e.g.
@@ -125,6 +127,7 @@ function isOverlaySecretName(name: string): boolean {
 
 type BashSpawnEnvContext = {
   overlay?: BashEnvOverlay
+  withhold?: BashEnvWithhold
   // Exact env for the outer bwrap process on a sandboxed call. When present, the
   // spawn hook uses it verbatim rather than the live inherited env, so a secret
   // that appears in process.env between policy build and spawn stays out of the
@@ -144,18 +147,29 @@ function readBashEnvOverlay(args: Record<string, unknown>): BashEnvOverlay | und
   return Object.keys(overlay).length > 0 ? overlay : undefined
 }
 
+function readBashEnvWithhold(args: Record<string, unknown>): BashEnvWithhold | undefined {
+  const raw = args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
+  if (!Array.isArray(raw) || !raw.every((name) => typeof name === 'string')) return undefined
+  const names = [...new Set(raw)]
+  return names.length > 0 ? names : undefined
+}
+
 function bashSpawnHookWithOverlay(context: BashSpawnContext): BashSpawnContext {
   const store = bashEnvStore.getStore()
   if (store?.sandboxSpawnEnv !== undefined) return { ...context, env: { ...store.sandboxSpawnEnv } }
-  return { ...context, env: sanitizeBashSpawnEnvironment(context.env, store?.overlay) }
+  return { ...context, env: sanitizeBashSpawnEnvironment(context.env, store?.overlay, store?.withhold) }
 }
 
 export function sanitizeBashSpawnEnvironment(
   inherited: NodeJS.ProcessEnv | undefined,
   overlay: BashEnvOverlay | undefined,
+  withhold: readonly string[] = [],
 ): NodeJS.ProcessEnv {
   const env = { ...inherited }
   for (const name of SECRET_BASH_ENV_NAMES) delete env[name]
+  for (const name of withhold) delete env[name]
+  // A trusted overlay deliberately replaces ambient state for this command, so
+  // it wins when the same name is also withheld.
   if (overlay !== undefined) Object.assign(env, overlay)
   return env
 }
@@ -586,9 +600,10 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         tool.name === 'bash' && typeof mutableArgs.command === 'string' ? mutableArgs.command : undefined
       normalizeDefaultTreeRoot(tool.name, mutableArgs)
       const liveOrigin = opts.getOrigin?.()
-      // Defense-in-depth: strip any pre-existing internal env-overlay key
-      // before hooks run so only trusted tool.before hooks can set it.
+      // Defense-in-depth: strip pre-existing internal env-control keys before
+      // hooks run so only trusted tool.before hooks can set them.
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
       const blockResult = await opts.hooks.runToolBefore({
         tool: tool.name,
         sessionId: opts.sessionId,
@@ -604,7 +619,9 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       // the bash tool destructures them, so the overlay never reaches logs,
       // loop-detection state, or pi's execute.
       const bashEnvOverlay = readBashEnvOverlay(mutableArgs)
+      const bashEnvWithhold = readBashEnvWithhold(mutableArgs)
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
         fireLoopAbort(opts.getAbort, 'loop_guard:block')
@@ -667,6 +684,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               opts.agentDir,
               opts.sessionId,
               bashEnvOverlay,
+              bashEnvWithhold,
               sandboxBoundary,
             )
           }
@@ -691,9 +709,12 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
           })
           await preparedSandboxRuntime?.verify()
           const spawnEnvContext: BashSpawnEnvContext | undefined =
-            bashEnvOverlay !== undefined || preparedSandboxRuntime?.spawnEnv !== undefined
+            bashEnvOverlay !== undefined ||
+            bashEnvWithhold !== undefined ||
+            preparedSandboxRuntime?.spawnEnv !== undefined
               ? {
                   ...(bashEnvOverlay !== undefined ? { overlay: bashEnvOverlay } : {}),
+                  ...(bashEnvWithhold !== undefined ? { withhold: bashEnvWithhold } : {}),
                   ...(preparedSandboxRuntime?.spawnEnv !== undefined
                     ? { sandboxSpawnEnv: preparedSandboxRuntime.spawnEnv }
                     : {}),
@@ -892,6 +913,7 @@ async function applyBashSandbox(
   agentDir: string,
   sessionId: string,
   envOverlay: BashEnvOverlay | undefined,
+  envWithhold: BashEnvWithhold | undefined,
   boundary: BashSandboxBoundary,
 ): Promise<PreparedBashSandbox> {
   const command = mutableArgs.command
@@ -906,6 +928,7 @@ async function applyBashSandbox(
   const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
   const envNames = resolveExposableBashEnvNames(agentDir)
   const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, envOverlay)
+  const effectiveEnvWithhold = (envWithhold ?? []).filter((name) => !Object.hasOwn(sandboxEnvOverlay ?? {}, name))
   const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
   await boundary.ensureAvailable()
   const sessionTmp = await ensureSessionTmpDir(sessionId)
@@ -959,7 +982,9 @@ async function applyBashSandbox(
       cwd: agentDir,
       proc,
       procSelfExe: resolveProcSelfExe(),
-      ...spreadSandboxEnv(buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, envNames.exposable)),
+      ...spreadSandboxEnv(
+        buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, envNames.exposable, envWithhold),
+      ),
     })
     mutableArgs.command = commandString
     // The overlay carries command-scoped secret VALUES (e.g. a per-repo GH_TOKEN)
@@ -973,7 +998,7 @@ async function applyBashSandbox(
       cleanup,
       spawnEnv: mergedSpawnEnv,
       dependencyBins,
-      withheld: { paths: maskTargets, envNames: envNames.withheld },
+      withheld: { paths: maskTargets, envNames: [...new Set([...envNames.withheld, ...effectiveEnvWithhold])] },
     }
   } catch (error) {
     await cleanup()
@@ -1022,12 +1047,19 @@ export function buildSandboxEnvPolicy(
   overlay: BashEnvOverlay | undefined,
   runtimeEnv: Record<string, string> | undefined,
   exposableEnvNames: readonly string[] = [],
-): { inherit?: string[]; set?: Record<string, string> } {
-  const set = { ...runtimeEnv }
+  withhold: readonly string[] = [],
+): { inherit?: string[]; set?: Record<string, string>; withhold?: string[] } {
+  const requestedWithhold = new Set(withhold)
+  const overlayNames = new Set(Object.keys(overlay ?? {}))
+  // The overlay is a deliberate command-scoped replacement, while withholding
+  // only removes ambient values; an overlay therefore wins for the same name.
+  const effectiveWithhold = [...requestedWithhold].filter((name) => !overlayNames.has(name))
+  const effectiveWithholdSet = new Set(effectiveWithhold)
+  const set = Object.fromEntries(Object.entries(runtimeEnv ?? {}).filter(([key]) => !requestedWithhold.has(key)))
   const inherit: string[] = []
   const inheritSeen = new Set<string>()
   const pushInherit = (key: string): void => {
-    if (Object.hasOwn(set, key) || inheritSeen.has(key)) return
+    if (effectiveWithholdSet.has(key) || Object.hasOwn(set, key) || inheritSeen.has(key)) return
     inheritSeen.add(key)
     inherit.push(key)
   }
@@ -1048,12 +1080,19 @@ export function buildSandboxEnvPolicy(
   // /tmp/.X11-unix bind is needed: Chrome reaches Xvfb over the netns-scoped
   // abstract X11 socket while bash keeps network:'inherit'.
   const display = process.env['DISPLAY']
-  if (display !== undefined && display !== '' && !Object.hasOwn(set, 'DISPLAY') && !inheritSeen.has('DISPLAY')) {
+  if (
+    display !== undefined &&
+    display !== '' &&
+    !effectiveWithholdSet.has('DISPLAY') &&
+    !Object.hasOwn(set, 'DISPLAY') &&
+    !inheritSeen.has('DISPLAY')
+  ) {
     set['DISPLAY'] = display
   }
   return {
     ...(inherit.length > 0 ? { inherit } : {}),
     ...(Object.keys(set).length > 0 ? { set } : {}),
+    ...(effectiveWithhold.length > 0 ? { withhold: effectiveWithhold } : {}),
   }
 }
 
