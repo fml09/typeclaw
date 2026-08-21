@@ -1323,6 +1323,7 @@ export type ExecuteCommandResult =
 // happened to be live, bypassing role gating entirely.
 export type ExecuteCommandOptions = {
   invokerId: string
+  parentChat?: string
 }
 
 export type SendSource = 'tool' | 'system'
@@ -4009,6 +4010,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     workspace: event.workspace,
     chat: event.chat,
     thread: event.thread,
+    ...(event.room?.parentChat !== undefined ? { parentChat: event.room.parentChat } : {}),
     lastInboundAuthorId: event.authorId,
   })
 
@@ -6032,6 +6034,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         workspace: key.workspace,
         chat: key.chat,
         thread: key.thread,
+        ...(options.parentChat !== undefined ? { parentChat: options.parentChat } : {}),
         lastInboundAuthorId: options.invokerId,
       }
       if (!permissions.has(partial, requiredPermission)) {

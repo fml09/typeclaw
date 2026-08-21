@@ -393,7 +393,7 @@ function resolveOne(
 // kinds worth caching:
 //   - tui: verdict depends only on kind (matchesOrigin's tui rule ignores
 //     sessionId), so every tui origin shares one entry.
-//   - channel: verdict depends on adapter + workspace + chat + lastInboundAuthorId
+//   - channel: verdict depends on adapter + workspace + chat + parentChat + lastInboundAuthorId
 //     (the exact inputs matchesChannel/matchesBucket/matchesAuthor read).
 // The `c` prefix + NUL separators keep channel keys unambiguous even if a field
 // contained the delimiter of another.
@@ -402,7 +402,14 @@ function roleCacheKey(origin: SessionOrigin): string | null {
     case 'tui':
       return 'tui'
     case 'channel':
-      return ['c', origin.adapter, origin.workspace, origin.chat, origin.lastInboundAuthorId ?? ''].join('\u0000')
+      return [
+        'c',
+        origin.adapter,
+        origin.workspace,
+        origin.chat,
+        origin.parentChat ?? '',
+        origin.lastInboundAuthorId ?? '',
+      ].join('\u0000')
     default:
       return null
   }
@@ -418,6 +425,7 @@ function toMatchable(origin: SessionOrigin): Parameters<typeof matchesOrigin>[1]
         adapter: origin.adapter,
         workspace: origin.workspace,
         chat: origin.chat,
+        ...(origin.parentChat !== undefined ? { parentChat: origin.parentChat } : {}),
         ...(origin.lastInboundAuthorId !== undefined ? { lastInboundAuthorId: origin.lastInboundAuthorId } : {}),
       }
     default:

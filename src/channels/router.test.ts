@@ -8257,6 +8257,28 @@ describe('ChannelRouter commands', () => {
 })
 
 describe('ChannelRouter.executeCommand (native slash-command surface)', () => {
+  test('permission origin includes a Discord slash command thread parent', async () => {
+    const permissions: PermissionService = {
+      has: (origin) => origin?.kind === 'channel' && origin.parentChat === 'parent-c1',
+      resolveRole: () => 'member',
+      compareRoleSeverity: () => undefined,
+      permissionsForRole: () => undefined,
+      describe: () => ({ role: 'member', permissions: ['session.control'] }),
+      replaceRoles: () => {},
+    }
+    const dir = await tempDir()
+    const { router } = makeRouter(dir, { permissions })
+    const key: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'thread-c1', thread: null }
+
+    expect(await router.executeCommand(key, 'stop', { invokerId: 'alice' })).toEqual({ kind: 'permission-denied' })
+    expect(
+      await router.executeCommand(key, 'stop', {
+        invokerId: 'alice',
+        parentChat: 'parent-c1',
+      }),
+    ).toEqual({ kind: 'no-live-session' })
+  })
+
   test('stop on a live session aborts the in-flight turn', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
@@ -12290,6 +12312,31 @@ describe('ChannelRouter channel.respond gate', () => {
 
     expect(sessions).toHaveLength(1)
     expect(sessions[0]!.prompts).toHaveLength(1)
+  })
+
+  test('permission origin includes the resolved Discord parent channel', async () => {
+    const dir = await tempDir()
+    const checkedOrigins: SessionOrigin[] = []
+    const permissions: PermissionService = {
+      ...buildPermissions({}),
+      has: (origin, permission) => {
+        if (origin !== undefined) checkedOrigins.push(origin)
+        return permission === 'channel.respond' && origin?.kind === 'channel' && origin.parentChat === 'parent-c1'
+      },
+    }
+    const { router, sessions } = makeRouter(dir, { permissions })
+
+    await router.route(
+      inbound({
+        adapter: 'discord-bot',
+        chat: 'thread-c1',
+        room: { kind: 'thread', parentChat: 'parent-c1' },
+      }),
+    )
+    await router.__testing!.flushDebounce({ ...KEY, adapter: 'discord-bot', chat: 'thread-c1' })
+
+    expect(checkedOrigins.some((origin) => origin.kind === 'channel' && origin.parentChat === 'parent-c1')).toBe(true)
+    expect(sessions).toHaveLength(1)
   })
 
   test('author lacks channel.respond → inbound dropped, no session created', async () => {

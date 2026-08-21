@@ -64,7 +64,7 @@ discord:9999 author:U_MOD
 kakao:group/*
 ```
 
-Within one rule, tokens AND. Across rules on the same role, OR. Strict equality everywhere — no regex, no glob beyond listed `*` shapes. The parser owns precise typo errors, rejection of redundant forms (`slack:*/*` etc.), and rejection of legacy prefixes (`team:`, `guild:`, `tg:`) with a hint to use the canonical form (`slack:`, `discord:`, `telegram:`).
+Within one rule, tokens AND. Across rules on the same role, OR. Coordinates use strict equality — no regex, no glob beyond listed `*` shapes — with one Discord-specific inheritance rule: a resolved thread may also match its `parentChat`. Its own `chat` remains the thread ID, so a rule naming that ID is still exact; missing parent metadata fails closed. The parser owns precise typo errors, rejection of redundant forms (`slack:*/*` etc.), and rejection of legacy prefixes (`team:`, `guild:`, `tg:`) with a hint to use the canonical form (`slack:`, `discord:`, `telegram:`).
 
 ## Cron and subagent provenance
 

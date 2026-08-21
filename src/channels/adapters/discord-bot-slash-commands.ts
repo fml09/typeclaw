@@ -3,6 +3,8 @@ import type { DiscordGatewayInteractionEvent } from 'agent-messenger/discordbot'
 import type { ChannelKey } from '@/channels/types'
 
 import { describeError } from '../describe-error'
+import { discordThreadRoom } from './discord-bot-thread-room'
+import { isDiscordSnowflake } from './discord-id'
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10'
 
@@ -72,6 +74,7 @@ export async function registerCommands(args: RegisterCommandsArgs): Promise<Regi
 export type ParsedSlashCommand = {
   name: string
   key: ChannelKey
+  parentChat?: string
   invokerId: string
   interactionId: string
   interactionToken: string
@@ -108,16 +111,35 @@ export function parseInteractionAsCommand(
   // as channels; interaction.channel_id is the thread id when the user
   // invoked from a thread).
   const workspace = typeof event.guild_id === 'string' && event.guild_id !== '' ? event.guild_id : '@dm'
+  const parentChat = interactionParentChat(event)
   return {
     kind: 'parsed',
     command: {
       name,
       key: { adapter: 'discord-bot', workspace, chat: event.channel_id, thread: null },
+      ...(parentChat !== undefined ? { parentChat } : {}),
       invokerId,
       interactionId: event.id,
       interactionToken: event.token,
     },
   }
+}
+
+type RawDiscordInteractionEvent = DiscordGatewayInteractionEvent & {
+  channel?: { id?: string; type?: number; parent_id?: string | null }
+}
+
+function interactionParentChat(event: DiscordGatewayInteractionEvent): string | undefined {
+  const channel = (event as RawDiscordInteractionEvent).channel
+  if (
+    channel === undefined ||
+    !isDiscordSnowflake(event.guild_id ?? '') ||
+    !isDiscordSnowflake(event.channel_id ?? '') ||
+    channel.id !== event.channel_id
+  )
+    return undefined
+  const parentChat = discordThreadRoom(channel)?.parentChat
+  return parentChat !== undefined && isDiscordSnowflake(parentChat) ? parentChat : undefined
 }
 
 // Content is required even when there's nothing to stop, because Discord

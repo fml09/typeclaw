@@ -992,6 +992,7 @@ export function createInteractionHandler(
 
       const result = await deps.router.executeCommand(command.key, command.name, {
         invokerId: command.invokerId,
+        ...(command.parentChat !== undefined ? { parentChat: command.parentChat } : {}),
       })
       const replyContent =
         result.kind === 'handled'
