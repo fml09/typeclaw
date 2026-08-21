@@ -31,3 +31,5 @@ export { formatLocalDate, formatLocalDateTime, formatLocalWeekday, resolveLocalT
 export { detectWsl, isWindowsDriveMount, type WslInfo, type WslVersion } from './wsl'
 
 export { isMacOS, isWindows } from './platform'
+
+export { styled, type StyleFormat } from './style-text'

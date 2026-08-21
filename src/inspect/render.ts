@@ -1,4 +1,4 @@
-import { styleText } from 'node:util'
+import { styled } from '@/shared'
 
 import { originLabel, readableId } from './label'
 import type { InspectEvent } from './types'
@@ -226,5 +226,5 @@ type ColorName = 'dim' | 'magenta' | 'cyan' | 'green' | 'yellow' | 'red' | 'gray
 
 function tint(opts: RenderOptions, color: ColorName, text: string): string {
   if (!opts.color) return text
-  return styleText(color, text)
+  return styled(color, text)
 }

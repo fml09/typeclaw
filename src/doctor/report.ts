@@ -1,4 +1,4 @@
-import { styleText } from 'node:util'
+import { styled } from '@/shared'
 
 import type { DoctorReport, ReportEntry, Severity } from './types'
 
@@ -27,13 +27,13 @@ const NO_PALETTE: Palette = {
 }
 
 const COLOR_PALETTE: Palette = {
-  bold: (s) => styleText('bold', s),
-  dim: (s) => styleText('dim', s),
-  green: (s) => styleText('green', s),
-  yellow: (s) => styleText('yellow', s),
-  red: (s) => styleText('red', s),
-  cyan: (s) => styleText('cyan', s),
-  gray: (s) => styleText('gray', s),
+  bold: (s) => styled('bold', s),
+  dim: (s) => styled('dim', s),
+  green: (s) => styled('green', s),
+  yellow: (s) => styled('yellow', s),
+  red: (s) => styled('red', s),
+  cyan: (s) => styled('cyan', s),
+  gray: (s) => styled('gray', s),
 }
 
 export function formatReport(report: DoctorReport, opts: FormatOptions = {}): string {
