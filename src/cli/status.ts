@@ -1,11 +1,10 @@
-import { styleText } from 'node:util'
-
 import { defineCommand } from 'citty'
 
 import { type ContainerStatus, type DockerExec, resolveController } from '@/container'
 import { isDaemonReachable, send } from '@/hostd'
 import type { StatusResult } from '@/hostd'
 import { findAgentDir } from '@/init'
+import { styled } from '@/shared'
 
 import { type DockerPreflightResult, preflightDocker, printDockerGuidance } from './docker-preflight'
 
@@ -113,12 +112,12 @@ const NO_PALETTE: Palette = {
 }
 
 const COLOR_PALETTE: Palette = {
-  bold: (s) => styleText('bold', s),
-  dim: (s) => styleText('dim', s),
-  green: (s) => styleText('green', s),
-  yellow: (s) => styleText('yellow', s),
-  red: (s) => styleText('red', s),
-  cyan: (s) => styleText('cyan', s),
+  bold: (s) => styled('bold', s),
+  dim: (s) => styled('dim', s),
+  green: (s) => styled('green', s),
+  yellow: (s) => styled('yellow', s),
+  red: (s) => styled('red', s),
+  cyan: (s) => styled('cyan', s),
 }
 
 export function formatStatus(report: StatusReport, opts: FormatOptions = {}): string {

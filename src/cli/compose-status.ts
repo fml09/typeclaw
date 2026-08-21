@@ -1,6 +1,5 @@
-import { styleText } from 'node:util'
-
 import type { AgentRuntimeState, ComposeStatusResult } from '@/compose'
+import { styled } from '@/shared'
 
 export type FormatComposeStatusOptions = { useColor?: boolean }
 
@@ -23,11 +22,11 @@ const NO_PALETTE: Palette = {
 }
 
 const COLOR_PALETTE: Palette = {
-  bold: (s) => styleText('bold', s),
-  dim: (s) => styleText('dim', s),
-  green: (s) => styleText('green', s),
-  yellow: (s) => styleText('yellow', s),
-  cyan: (s) => styleText('cyan', s),
+  bold: (s) => styled('bold', s),
+  dim: (s) => styled('dim', s),
+  green: (s) => styled('green', s),
+  yellow: (s) => styled('yellow', s),
+  cyan: (s) => styled('cyan', s),
 }
 
 const STATE_LABELS: Record<AgentRuntimeState, string> = {

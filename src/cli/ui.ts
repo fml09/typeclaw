@@ -1,10 +1,10 @@
 import { emitKeypressEvents as nodeEmitKeypressEvents } from 'node:readline'
-import { styleText } from 'node:util'
 
 import { cancel, intro, isCancel, log, note, outro, spinner as clackSpinner } from '@clack/prompts'
 
 import { buildDiscordInviteUrl, deriveAppIdFromBotToken } from '@/channels/adapters/discord-bot-invite'
 import { type AutoUpgradeOutcome, describeAutoUpgrade } from '@/init/auto-upgrade'
+import { styled, type StyleFormat } from '@/shared'
 import { COMPACT_WORDMARK, WORDMARK_LINES, WORDMARK_WIDTH } from '@/shared/wordmark'
 
 export { cancel, intro, isCancel, log, note, outro }
@@ -44,9 +44,9 @@ export function prepareStdinForClack(input: ClackInput = process.stdin, deps: Pr
   input.resume()
 }
 
-function colorize(modifier: Parameters<typeof styleText>[0], s: string): string {
+function colorize(modifier: StyleFormat, s: string): string {
   if (!colorsEnabled()) return s
-  return styleText(modifier, s)
+  return styled(modifier, s)
 }
 
 // Re-evaluated per call so tests can mutate NO_COLOR / FORCE_COLOR between
@@ -77,7 +77,7 @@ export function link(text: string, url: string): string {
 }
 
 // Brand truecolor sampled from the typeey mascot, matching src/tui/theme.ts.
-// `c`/styleText only carry the 16 named colors, so the cornflower/amber accents
+// `c`/styled only carry the 16 named colors, so the cornflower/amber accents
 // are emitted as raw 24-bit SGR — gated on colorsEnabled() so NO_COLOR and
 // piped output never see an escape.
 const CORNFLOWER_FG = '\x1b[38;2;91;127;212m'

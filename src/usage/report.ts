@@ -1,4 +1,4 @@
-import { styleText } from 'node:util'
+import { styled, type StyleFormat } from '@/shared'
 
 import type { ModelUsage, OriginUsage, UsageTotals } from './aggregate'
 import { formatCacheHitRate, formatCost, formatTokens, isoDay } from './format'
@@ -448,9 +448,9 @@ function dim(text: string, ctx: RenderCtx): string {
   return color('dim', text, ctx)
 }
 
-function color(modifier: Parameters<typeof styleText>[0], text: string, ctx: RenderCtx): string {
+function color(modifier: StyleFormat, text: string, ctx: RenderCtx): string {
   if (!ctx.useColor) return text
-  return styleText(modifier, text)
+  return styled(modifier, text)
 }
 
 // ANSI escape sequences would inflate column widths and break alignment under

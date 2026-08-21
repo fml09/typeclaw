@@ -1,6 +1,5 @@
-import { styleText } from 'node:util'
-
 import type { ComposeUsageResult } from '@/compose'
+import { styled } from '@/shared'
 import type { UsageReport, UsageTotals } from '@/usage'
 import { formatCacheHitRate, formatCost, formatTokens } from '@/usage/format'
 
@@ -20,11 +19,11 @@ type Palette = {
 const identity: ColorFn = (s) => s
 const NO_PALETTE: Palette = { bold: identity, dim: identity, cyan: identity, yellow: identity, red: identity }
 const COLOR_PALETTE: Palette = {
-  bold: (s) => styleText('bold', s),
-  dim: (s) => styleText('dim', s),
-  cyan: (s) => styleText('cyan', s),
-  yellow: (s) => styleText('yellow', s),
-  red: (s) => styleText('red', s),
+  bold: (s) => styled('bold', s),
+  dim: (s) => styled('dim', s),
+  cyan: (s) => styled('cyan', s),
+  yellow: (s) => styled('yellow', s),
+  red: (s) => styled('red', s),
 }
 
 export function formatComposeUsage(result: ComposeUsageResult, opts: FormatComposeUsageOptions = {}): string {
