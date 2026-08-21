@@ -19,7 +19,15 @@ describe('resolveBackupPushAuthEnv', () => {
       GIT_ASKPASS: '/usr/local/bin/typeclaw-git-askpass',
       TYPECLAW_GIT_TOKEN: 'ghs_minted',
       GIT_TERMINAL_PROMPT: '0',
+      GIT_ALLOW_PROTOCOL: 'https',
     })
+
+    const count = Number(env?.GIT_CONFIG_COUNT ?? '0')
+    const pairs = Array.from({ length: count }, (_, i) => [
+      env?.[`GIT_CONFIG_KEY_${i}`],
+      env?.[`GIT_CONFIG_VALUE_${i}`],
+    ])
+    expect(pairs).toContainEqual(['credential.helper', ''])
   })
 
   test('live App resolver takes precedence over an ambient classic PAT', async () => {
@@ -105,6 +113,6 @@ describe('resolveBackupPushAuthEnv', () => {
       resolveOriginPushUrl: async () => 'git@github.com:acme/widgets.git',
     })
     expect(env).not.toBeNull()
-    expect(env?.GIT_CONFIG_COUNT).toBe('2')
+    expect(env?.GIT_CONFIG_COUNT).toBe('3')
   })
 })

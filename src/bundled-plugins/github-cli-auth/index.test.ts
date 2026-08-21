@@ -9,6 +9,7 @@ import {
   defaultBuiltinPiToolDefinitions,
   sanitizeBashSpawnEnvironment,
   TYPECLAW_INTERNAL_BASH_ENV,
+  TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV,
   wrapBuiltinToolDefinition,
 } from '@/agent/plugin-tools'
 import { __resetReviewVerdictGuardForTest } from '@/channels/github-review-verdict-coordinator'
@@ -1320,7 +1321,7 @@ describe('github-cli-auth plugin — git path', () => {
 
     expect(result).toMatchObject({ block: true })
     const reason = (result as { reason: string }).reason
-    // The operator remedy, and the two wrong turns this failure historically caused.
+    // The operator remedy, plus the two blocked retries the reason must steer off.
     expect(reason).toContain('channels.github')
     expect(reason).toContain('gh auth setup-git')
     expect(reason).toContain('not a stale')
@@ -1343,6 +1344,144 @@ describe('github-cli-auth plugin — git path', () => {
 
       expect(result).toBeUndefined()
       expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    }
+  })
+
+  test('.env PAT + no App minter: brokers a github push through askpass and suppresses ambient aliases', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-'))
+    const pat = 'ghp_declared_push'
+    try {
+      writeFileSync(join(agentDir, '.env'), `GH_TOKEN=${pat}\n`)
+      process.env.GH_TOKEN = pat
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toBeUndefined()
+      const env = gitEnv(event)
+      expect(env.TYPECLAW_GIT_TOKEN).toBe(pat)
+      expect(env.GIT_ASKPASS).toBe(askpassPath)
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toEqual(['GH_TOKEN', 'GITHUB_TOKEN'])
+      expect(String(event.args.command)).not.toContain(pat)
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('declared name, runtime-replaced value: blocks — a name does not authenticate a value', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-mismatch-'))
+    try {
+      // given `.env` declares one PAT but something at runtime (PAT-mode channel
+      // auth seeds process.env.GH_TOKEN) replaced the live value with another
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared_value\n')
+      process.env.GH_TOKEN = 'ghp_runtime_only_value'
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toMatchObject({ block: true })
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+      expect(JSON.stringify(result)).not.toContain('ghp_runtime_only_value')
+      expect(JSON.stringify(result)).not.toContain('ghp_declared_value')
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('declared GITHUB_TOKEN with a runtime-replaced value also blocks', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-mismatch-alias-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GITHUB_TOKEN=ghp_declared_alias\n')
+      delete process.env.GH_TOKEN
+      process.env.GITHUB_TOKEN = 'ghp_runtime_alias'
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toMatchObject({ block: true })
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('.env PAT + no App minter: github reads remain unbrokered pass-through', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-read-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared_read\n')
+      process.env.GH_TOKEN = 'ghp_declared_read'
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+
+      for (const command of [
+        'git clone https://github.com/acme/widgets.git',
+        'git fetch https://github.com/acme/widgets.git main',
+      ]) {
+        const event = bashEvent(command)
+        const result = await hook(event, { ...hookCtx, agentDir })
+
+        expect(result).toBeUndefined()
+        expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+        expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+      }
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('.env PAT + no App minter: a role without PAT permission still blocks push', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-denied-'))
+    const pat = 'ghp_declared_denied'
+    try {
+      writeFileSync(join(agentDir, '.env'), `GH_TOKEN=${pat}\n`)
+      process.env.GH_TOKEN = pat
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, { agentDir })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toMatchObject({ block: true })
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('.env token with an unrecognized class is never brokered to git push', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-token-unknown-'))
+    const token = 'unrecognized_declared_token'
+    try {
+      writeFileSync(join(agentDir, '.env'), `GH_TOKEN=${token}\n`)
+      process.env.GH_TOKEN = token
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toMatchObject({ block: true })
+      expect(JSON.stringify(event.args[TYPECLAW_INTERNAL_BASH_ENV] ?? {})).not.toContain(token)
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
     }
   })
 
@@ -1381,17 +1520,27 @@ describe('github-cli-auth plugin — git path', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
-  test('classic PAT is never brokered to git; an App token is minted instead', async () => {
-    process.env.GH_TOKEN = 'ghp_classic'
-    const hook = await hookFor(tokenResolver('ghs_minted'), true, { permissions: privilegedPermissions })
-    const event = bashEvent('git clone https://github.com/acme/widgets.git')
+  test('.env PAT + App minter: a github push uses the App token instead', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-app-wins-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared\n')
+      process.env.GH_TOKEN = 'ghp_declared'
+      const hook = await hookFor(tokenResolver('ghs_minted'), true, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
 
-    const result = await hook(event, hookCtx)
+      const result = await hook(event, { ...hookCtx, agentDir })
 
-    expect(result).toBeUndefined()
-    const env = gitEnv(event)
-    expect(env.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
-    expect(JSON.stringify(env)).not.toContain('ghp_classic')
+      expect(result).toBeUndefined()
+      const env = gitEnv(event)
+      expect(env.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
+      expect(JSON.stringify(env)).not.toContain('ghp_declared')
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
   })
 
   test('PAT with no App minter: authenticated git passes through, PAT never reaches git', async () => {

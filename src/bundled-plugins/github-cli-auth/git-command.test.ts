@@ -6,6 +6,7 @@ import {
   type GitResolvers,
   parseGithubRepoFromGitUrl,
 } from './git-command'
+import { buildGitCredentialEnv } from './git-credential-env'
 
 const CWD = '/agent'
 
@@ -718,7 +719,7 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
   // forced git config), so the fresh shell inherits none of them.
   const STRIP =
     'exec /usr/bin/env -u TYPECLAW_GIT_TOKEN -u GIT_ASKPASS -u GH_TOKEN -u GITHUB_TOKEN ' +
-    '-u GIT_TERMINAL_PROMPT -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 ' +
+    '-u GIT_TERMINAL_PROMPT -u GIT_ALLOW_PROTOCOL -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 ' +
     '-u GIT_CONFIG_KEY_1 -u GIT_CONFIG_VALUE_1 -u GIT_CONFIG_KEY_2 -u GIT_CONFIG_VALUE_2 ' +
     '-u GIT_CONFIG_KEY_3 -u GIT_CONFIG_VALUE_3 /bin/bash -c'
 
@@ -726,6 +727,16 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
   // an absolute /usr/bin/git and separately single-quoted url + destination, so
   // nothing attacker-controlled reaches the appended `&& exec` boundary.
   const HEAD = "/usr/bin/git clone 'https://github.com/acme/widgets.git' '/tmp/x'"
+
+  test('the sanitized tail unsets every injected credential env key', async () => {
+    const result = await analyze('git clone https://github.com/acme/widgets.git /tmp/x && cat /tmp/x/README.md')
+    expect(result.kind).toBe('inject')
+    const command = (result as { rewrittenCommand: string }).rewrittenCommand
+
+    for (const key of Object.keys(buildGitCredentialEnv('', ''))) {
+      expect(command).toContain(`-u ${key}`)
+    }
+  })
 
   test('clone && grep is injected with a canonical head and the tail re-exec under a token-stripped shell', async () => {
     const result = await analyze('git clone https://github.com/acme/widgets.git /tmp/x && cd /tmp/x && grep -r foo .')
