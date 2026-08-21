@@ -20,6 +20,38 @@ bun run format
 
 No exceptions. No `--no-verify`. No partial fixes.
 
+## Security serves the product, not the other way around
+
+TypeClaw is a **productivity product**. It is not a security-guard product. Nobody adopts an agent because its sandbox is elegant — they adopt it because it does their work, and they drop it the first time it refuses to. So a security control that breaks a legitimate workflow is a **defect, in the same sense a crash is a defect**. "But it's hardening" is not a defense. A `feat(sandbox):` prefix is not a justification.
+
+**Design outward from the workflow that has to keep working.** Establish what an authorized agent must still be able to do, then constrain the actual threat with the narrowest control that stops it. Security does not get to go first and hand the UX whatever is left over. That ordering is about sequence of design, not about importance — you still ship the guard, you just don't get to bill its collateral damage to the user.
+
+**This is a demand for precision, not for permissiveness.** It is not license to expose a secret, skip an authorization check, or drop a sandbox boundary because a guard is inconvenient. Those two failure modes are not symmetric and this section does not pretend they are. When the only options genuinely are "leak protected data" or "block the work", block the work — but block it _loudly_, name the cause, and escalate the design instead of quietly picking either failure.
+
+**This section does not repeal load-bearing invariants.** A documented `MUST`, a `fail closed`, a secret boundary, a permission boundary, or anything this file marks "do not harden this back" cannot be removed by citing productivity alone. Replacing one requires naming the threat it covered, showing why its _scope_ was wrong, preserving the guarantee through a narrower control, and adding regression tests for both directions — threat still blocked, authorized workflow restored.
+
+### The scars
+
+Every one of these was an over-broad guard, not a guard that was too strict at its real threat. They are the reason this section exists.
+
+- **`69401ed4` → `79bd56bf`/`7a6f5266`/`e581896f` (2026-07-14 → 07-16).** The canonical-secret Git guard "failed closed on any unreachable or dangling object, disabling all model-driven Git/bash." Unreachable objects are normal debris from every amend/rebase/reset — and from the agent's own self-backup and dreaming rewrites — so "real agent repos accumulate dozens of them and got fully blocked without any actual secret exposure."
+- **`035da123` → `7b12232e` (2026-07-14 → 07-21).** A root `.env` reachable in Git history hard-blocked the entire bash surface, even though every declared `.env` var is already inherited into model bash — so "blocking the entire bash surface over it is pure disruption with no confidentiality gain." Worse, it was unrecoverable by design: "the guard's prescribed remediation (`git reflog expire`/`gc`) itself runs through the blocked bash, so the agent could not self-recover." A real agent reviewing an unrelated repo was bricked by its own committed `SENTRY_DSN`.
+- **`d770026d` → `9c95b981` (2026-07-14 → 07-21).** Blocking all authenticated network Git in model bash left bind-mounted reference clones to go stale "with no in-band way to refresh." The superseded attempt "tried to harden the in-bash path against hostile repo config and became an unwinnable key/flag arms race." Git is a config-driven process launcher; enumerating its dangerous keys is not a winnable game, and pretending otherwise cost a core workflow for a week.
+- **`d477c8b6` → `a8407cc5` (2026-07-28 → 08-03).** A refusal built on an untrue assumption about credential resolution "generalized a single uncredentialed agent into a universal law and refused every one of them, breaking the workflows built on the eighteen `agent-*` skills this package ships." It also pointed the model at a replacement that does not exist. Verify the real dev/host/container/bwrap credential flow before you enforce against it.
+
+Two live examples of the _diagnosability_ half of the same failure: issue **#1377**, where "`gh auth status` succeeds while `git push` fails, and nothing in git's error names the cause"; and the `guest`-role inbound drop (`src/skills/typeclaw-permissions/SKILL.md`), still "the most common cause of 'the agent stopped responding'" because the denial is invisible in-session.
+
+### Rules for adding or widening a guard
+
+- **Name both sides before you write it.** The exact threat, and the authorized workflow that must keep working. If you can't state the workflow, you don't understand the blast radius yet.
+- **Scope the denial to the offending operand** — the specific command, path, credential, principal, repo, or request. Never block a broader tool surface because narrower enforcement is more work.
+- **Ship the authorized path in the same change.** Don't remove a working capability and leave "we'll broker it later" for a follow-up. `#1377` is what that IOU looks like from the user's side. _Emergency containment is the one exception:_ when a boundary is actively being crossed and no safe authorized path exists yet, a fail-closed stopgap may land on its own — but only if it is scoped to the violating operation, visible to the operator, marked temporary at the code site, and filed with a tracked restoration issue. Miss any of those four and it isn't containment, it's the IOU again with better branding.
+- **A guard that can disable a whole tool, adapter, or the bash surface must prove every operation on that surface necessarily crosses the boundary.** Otherwise move the guard down to the operand. Whole-surface denial is the single most repeated mistake in the list above.
+- **Never fail silently to the operator.** Say what was blocked, which policy blocked it, and how to recover. This means the operator and the diagnostic surface — not that an unauthorized channel user gets told why, which would just build an authorization oracle.
+- **Leave a recovery path that isn't behind the gate.** A guard whose own prescribed remediation runs through the surface it blocks is unrecoverable — that is `7b12232e`. Recovery may be agent-accessible **only where existing runtime authorization already permits that remediation on its own**; otherwise it is an operator path outside the denied surface. It is a recovery path, never a bypass: prompt intent, a stated reason, and model-authored acknowledgements cannot open a boundary, and a guard must not grow an agent-controlled switch that turns it off (`src/bundled-plugins/security/` — "model-authored acknowledgements cannot bypass this guard").
+- **Test both directions.** The threat must fail, and representative legitimate operations must still pass. A guard test that only asserts the block is half a test.
+- **Verify the actual credential/runtime flow first.** Across dev, host, container, and bwrap. Don't generalize from one adapter, one auth mode, or one deployment state — `d477c8b6` did exactly that.
+
 ## Debugging the system prompt
 
 `bun run debug:prompt` dumps the rendered system prompt for each session-origin kind (`tui`, `cron`, `channel`, `subagent`) with placeholder values, plus a per-section token/char/byte breakdown.
