@@ -12,6 +12,7 @@ import {
   buildBaseDockerfile,
   buildDockerfile,
   buildEntrypointShim,
+  BUN_BASE_IMAGE,
   classifyDockerfileAppend,
   CHROME_RUNTIME_APT_PACKAGES_AMD64,
   CLOUDFLARED_RELEASE_URL_BASE,
@@ -1261,7 +1262,7 @@ describe('base ↔ per-agent Dockerfile drift guard', () => {
   test('base Dockerfile uses the same BuildKit syntax pragma and base image as the per-agent Dockerfile so layer caching across the two is possible', () => {
     const base = buildBaseDockerfile()
     expect(base).toContain('# syntax=docker/dockerfile:1.7')
-    expect(base).toContain('FROM oven/bun:1-slim')
+    expect(base).toContain(`FROM ${BUN_BASE_IMAGE}`)
     expect(base).toContain('WORKDIR /agent')
   })
 
@@ -1286,7 +1287,7 @@ describe('versioned per-agent Dockerfile (base-image-pinning)', () => {
 
     // then: the FROM line pins the GHCR base image, not oven/bun
     expect(out).toContain(`FROM ${GHCR_BASE_IMAGE_REPO}:0.1.1`)
-    expect(out).not.toContain('FROM oven/bun:1-slim')
+    expect(out).not.toContain(`FROM ${BUN_BASE_IMAGE}`)
   })
 
   test('FROM tag is interpolated verbatim with no coercion', () => {
@@ -1417,7 +1418,7 @@ describe('versioned per-agent Dockerfile (base-image-pinning)', () => {
 
     // then: outputs are byte-identical and use oven/bun (not GHCR base)
     expect(inlineExplicit).toBe(inlineDefault)
-    expect(inlineExplicit).toContain('FROM oven/bun:1-slim')
+    expect(inlineExplicit).toContain(`FROM ${BUN_BASE_IMAGE}`)
     expect(inlineExplicit).not.toContain(GHCR_BASE_IMAGE_REPO)
   })
 })

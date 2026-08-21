@@ -44,7 +44,7 @@ jobs:
           # to resolve the version, which intermittently 401s under GHA
           # token contention; a pinned version skips that lookup and goes
           # straight to the release download URL.
-          bun-version: 1.3.14
+          bun-version: 1.4.0
 
       - name: Cache Bun install cache
         # setup-bun caches only the Bun BINARY, not downloaded packages, so a
@@ -61,9 +61,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-1.3.14-${{ hashFiles('bun.lock') }}
+          key: ${{ runner.os }}-bun-1.4.0-${{ hashFiles('bun.lock') }}
           restore-keys: |
-            ${{ runner.os }}-bun-1.3.14-
+            ${{ runner.os }}-bun-1.4.0-
 
       - name: Install dependencies
         # GitHub tarball deps (e.g. libsignal-node, pinned via @whiskeysockets/baileys)
@@ -134,15 +134,15 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.0
 
       - name: Cache Bun install cache
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-1.3.14-${{ hashFiles('bun.lock') }}
+          key: ${{ runner.os }}-bun-1.4.0-${{ hashFiles('bun.lock') }}
           restore-keys: |
-            ${{ runner.os }}-bun-1.3.14-
+            ${{ runner.os }}-bun-1.4.0-
 
       - name: Install dependencies
         shell: bash
@@ -221,7 +221,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.0
 
       - name: Cache Bun install cache
         # Same rationale as the `ci` job's cache step. The ${{ runner.os }} key
@@ -230,9 +230,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-1.3.14-${{ hashFiles('bun.lock') }}
+          key: ${{ runner.os }}-bun-1.4.0-${{ hashFiles('bun.lock') }}
           restore-keys: |
-            ${{ runner.os }}-bun-1.3.14-
+            ${{ runner.os }}-bun-1.4.0-
 
       - name: Install dependencies
         # GitHub tarball deps (e.g. libsignal-node, pinned via @whiskeysockets/baileys)

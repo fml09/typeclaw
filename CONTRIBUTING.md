@@ -4,7 +4,7 @@ Thanks for considering a contribution. This file covers the mechanics of working
 
 ## Requirements
 
-- **Bun** ≥ 1.1 (CI pins 1.3.14; any 1.3.x works locally)
+- **Bun** ≥ 1.1 (CI pins 1.4.0; 1.3.x and 1.4.x both work locally)
 - **Docker** or **OrbStack** — TypeClaw runs every agent in a container, so you need a working Docker daemon to exercise `typeclaw start`, `tui`, `logs`, `reload`, etc.
 - **Git** ≥ 2.40 — worktrees are how most maintainers juggle branches here
 
@@ -46,7 +46,7 @@ The `typeclaw` you just ran is the one from your repo. When `init` runs from a l
 **3. Start the agent and iterate:**
 
 ```sh
-typeclaw start    # builds the dev image (oven/bun:1-slim base) and runs the container
+typeclaw start    # builds the dev image (oven/bun:1.4.0-slim base) and runs the container
 typeclaw tui      # attach a TUI to the running agent
 ```
 

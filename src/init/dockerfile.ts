@@ -1596,7 +1596,14 @@ const BUN_CACHE_MOUNT = '--mount=type=cache,target=/root/.bun/install/cache,shar
 const aptCacheMount = (buildKit: boolean): string => (buildKit ? APT_CACHE_MOUNT : '')
 const bunCacheMount = (buildKit: boolean): string => (buildKit ? BUN_CACHE_MOUNT : '')
 
-const FROM_AND_WORKDIR = `FROM oven/bun:1-slim
+// Pinned rather than the floating `oven/bun:1-slim`, which silently started
+// resolving to Bun 1.4.0 the day it shipped — that would put an unvalidated
+// runtime in every container while CI still tested 1.3.14. Bump this in the
+// same change as the `bun-version:` pins in .github/workflows/*.yml so the
+// host-stage checks and the container-stage runtime never disagree.
+export const BUN_BASE_IMAGE = 'oven/bun:1.4.0-slim'
+
+const FROM_AND_WORKDIR = `FROM ${BUN_BASE_IMAGE}
 
 WORKDIR /agent
 
