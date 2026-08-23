@@ -3,7 +3,6 @@ import { describe, expect, test } from 'bun:test'
 import { createGithubReviewThreadResolver } from '@/channels/adapters/github/review-thread-resolver'
 import {
   __resetReviewVerdictGuardForTest,
-  completeGithubReviewRound,
   registerGithubReviewRound,
 } from '@/channels/github-review-verdict-coordinator'
 import { OUTBOUND_FLOOD_ERROR, type ChannelRouter } from '@/channels/router'
@@ -1267,7 +1266,7 @@ describe('channel_reply re-review stranding guard', () => {
     expect(calls).toHaveLength(1)
   })
 
-  test('resolves and acknowledges an addressed sibling after a verified REQUEST_CHANGES completes its round', async () => {
+  test('resolves and acknowledges a non-carrier sibling once GitHub says the block is gone', async () => {
     const round = {
       workspace: 'acme/widgets',
       prNumber: 644,
@@ -1275,7 +1274,6 @@ describe('channel_reply re-review stranding guard', () => {
       carrierThread: '111',
     } as const
     registerGithubReviewRound(round)
-    completeGithubReviewRound(round)
     const order: string[] = []
     const tool = createChannelReplyTool({
       router: fakeRouter(
@@ -1284,7 +1282,7 @@ describe('channel_reply re-review stranding guard', () => {
           return { ok: true }
         },
         {
-          getReviewState: async () => ({ ok: true, selfBlocking: true, approve: true }),
+          getReviewState: async () => ({ ok: true, selfBlocking: false, approve: true }),
           resolveReviewThread: async () => {
             order.push('resolve')
             return { ok: true }

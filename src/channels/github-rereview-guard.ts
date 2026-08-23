@@ -1,4 +1,6 @@
 import { classifyReviewClaim, isPositiveWarnCloseout } from './github-review-claim'
+import { isGithubReviewRoundComplete } from './github-review-verdict-coordinator'
+import type { GithubReviewFollowupRound } from './types'
 import type { ReviewStateResult } from './types'
 
 // The re-review stranding guard. A bot that resolves a review thread (or posts a
@@ -23,6 +25,7 @@ export type RereviewGuardInput = {
   moreWorkThisTurn: boolean
   getReviewState: (req: { adapter: 'github'; workspace: string; chat: string }) => Promise<ReviewStateResult>
   workspace: string
+  round?: GithubReviewFollowupRound
 }
 
 export type RereviewGuardDecision = { block: false } | { block: true; reason: string }
@@ -38,6 +41,7 @@ export async function evaluateRereviewGuard(input: RereviewGuardInput): Promise<
   // text-claim path fires regardless (caught by isCloseoutAttempt below).
   if (!isCloseoutAttempt(input)) return ALLOW
 
+  const round = matchingRound(input)
   const state = await input.getReviewState({ adapter: 'github', workspace: input.workspace, chat: input.chat })
 
   // Fail closed: an unverifiable review state is treated as a live block, so the
@@ -50,7 +54,23 @@ export async function evaluateRereviewGuard(input: RereviewGuardInput): Promise<
     return ALLOW
   }
 
+  // Resolving a thread cannot create a conflicting formal verdict, so carrier
+  // eligibility is the wrong operand to deny here. The sticky-block check below
+  // covers the real stranding risk from authoritative GitHub state and therefore
+  // self-corrects when an external actor clears the block; local round state does not.
+  if (round !== null && isGithubReviewRoundComplete(round) && input.wantsResolve && input.thread !== null) {
+    return ALLOW
+  }
+
   return { block: true, reason: state.approve ? STICKY_BLOCK_APPROVE_ENABLED : STICKY_BLOCK_APPROVE_DISABLED }
+}
+
+function matchingRound(input: RereviewGuardInput): GithubReviewFollowupRound | null {
+  const round = input.round
+  if (round === undefined) return null
+  const match = /^pr:(\d+)$/.exec(input.chat)
+  if (match === null || Number(match[1]) !== round.prNumber || input.workspace !== round.workspace) return null
+  return round
 }
 
 // Trigger when the model asks to resolve a thread (only meaningful with a
