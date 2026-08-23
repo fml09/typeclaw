@@ -53,7 +53,7 @@ import {
 } from './engagement'
 import { checkFalseReceipt } from './github-false-receipt'
 import { evaluateRereviewGuard } from './github-rereview-guard'
-import { resetReviewTurn, type ReviewOutputState } from './github-review-turn-ledger'
+import { resetReviewTurn, type ReviewOutputState, type ReviewRoundOutcome } from './github-review-turn-ledger'
 import { renderPrVerdictStandDownReminder } from './github-verdict-activity'
 import {
   MEMBERSHIP_COLD_FETCH_TIMEOUT_MS,
@@ -1519,7 +1519,7 @@ export type ChannelRouter = {
   injectPrVerdictActivity: (args: {
     workspace: string
     prNumber: number
-    verdict: 'APPROVE' | 'REQUEST_CHANGES'
+    verdict: ReviewRoundOutcome
     sessionId: string
   }) => { kind: 'delivered'; count: number }
   finishGithubReviewRoundCloseout?: (args: {
@@ -6157,7 +6157,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const injectPrVerdictActivity = (args: {
     workspace: string
     prNumber: number
-    verdict: 'APPROVE' | 'REQUEST_CHANGES'
+    verdict: ReviewRoundOutcome
     sessionId: string
   }): { kind: 'delivered'; count: number } => {
     const chat = `pr:${args.prNumber}`
