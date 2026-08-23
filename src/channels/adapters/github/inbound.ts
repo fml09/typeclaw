@@ -7,7 +7,7 @@ import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import { removeRequestedReviewer } from './decoy-reviewer'
-import type { DeliveryDedup } from './dedup'
+import { createBoundedMap, type BoundedMap, type DeliveryDedup } from './dedup'
 import { isGithubEventAllowed } from './event-allowlist'
 import { encodeGithubReactionRef, type GithubReactionTarget } from './reactions'
 import { fetchSelfReviewBlocking } from './review-state'
@@ -48,6 +48,7 @@ export type GithubWebhookHandlerOptions = {
   // Schedules the decoy-drop off the webhook ACK path so the 200 stays fast.
   // Defaults to fire-and-forget; tests inject a recorder to await the task.
   scheduleBackgroundTask?: (task: () => Promise<void>) => void
+  sleepImpl?: (ms: number) => Promise<void>
   fetchImpl?: typeof fetch
 }
 
@@ -85,21 +86,23 @@ export async function processVerifiedGithubDelivery(
   input: { event: string; delivery: string; payload: Record<string, unknown> },
 ): Promise<void> {
   const { event, delivery, payload } = input
-  if (delivery !== '') {
+  const action = readString(payload, 'action')
+  const isSynchronize = event === 'pull_request' && action === 'synchronize'
+  if (!isSynchronize && delivery !== '') {
     if (options.dedup.has(delivery)) {
       options.logger.info(`[github] duplicate delivery ignored id=${delivery}`)
       return
     }
     // Reserve the delivery id synchronously, BEFORE the awaits below, so a live
     // webhook and the recovery sweep can never both clear the dedup gate for the
-    // same event and route it twice. JS is single-threaded: nothing else runs
-    // between this has-check and add, so the reservation is atomic. The awaits
-    // and classify that follow are all throw-safe, so reserving early cannot
-    // strand a routable event.
+    // same event and route it twice. Synchronize uses its own synchronous,
+    // releasable head-SHA reservation so a failed redelivery can retry. JS is
+    // single-threaded: nothing else runs between this has-check and add, so the
+    // reservation is atomic. The awaits and classify that follow are all
+    // throw-safe, so reserving early cannot strand a routable event.
     options.dedup.add(delivery)
   }
 
-  const action = readString(payload, 'action')
   if (!isGithubEventAllowed(options.allowlist(), event, action)) return
 
   const selfId = options.selfId()
@@ -121,7 +124,7 @@ export async function processVerifiedGithubDelivery(
   // so it runs OFF the ACK path (like the decoy-reviewer drop) and only wakes a
   // session when an obligation is outstanding. Returning here also keeps
   // synchronize out of the generic awareness-only fallthrough below.
-  if (event === 'pull_request' && action === 'synchronize') {
+  if (isSynchronize) {
     scheduleReviewFollowup({ payload, selfLogin, options })
     return
   }
@@ -214,6 +217,38 @@ function defaultScheduleBackgroundTask(task: () => Promise<void>): void {
   void task().catch(() => {})
 }
 
+const MAX_REVIEW_FOLLOWUP_ATTEMPTS = 3
+const REVIEW_FOLLOWUP_RETRY_BASE_MS = 1000
+const REVIEW_FOLLOWUP_DEDUP_LIMIT = 1000
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+type ReviewFollowupDedupState = {
+  reservations: BoundedMap<string, 'pending' | 'completed'>
+  failures: BoundedMap<string, number>
+}
+
+// This state cannot live in createGithubWebhookHandler's closure because the
+// exported processVerifiedGithubDelivery core is also called directly by the
+// recovery sweep. Keying by the shared options identity gives both paths one
+// handler-scoped state while allowing it to be garbage-collected. It stays
+// separate from options.dedup because that add-only delivery cache has no
+// release path, which would recreate the transient-failure retry hole here.
+const reviewFollowupDedupByHandler = new WeakMap<GithubWebhookHandlerOptions, ReviewFollowupDedupState>()
+
+function reviewFollowupDedup(options: GithubWebhookHandlerOptions): ReviewFollowupDedupState {
+  const existing = reviewFollowupDedupByHandler.get(options)
+  if (existing !== undefined) return existing
+  const created: ReviewFollowupDedupState = {
+    reservations: createBoundedMap(REVIEW_FOLLOWUP_DEDUP_LIMIT),
+    failures: createBoundedMap(REVIEW_FOLLOWUP_DEDUP_LIMIT),
+  }
+  reviewFollowupDedupByHandler.set(options, created)
+  return created
+}
+
 function scheduleReviewFollowup(input: {
   payload: Record<string, unknown>
   selfLogin: string | null
@@ -239,15 +274,19 @@ function scheduleReviewFollowup(input: {
     options.logger.warn(`[github] synchronize for ${repository.owner}/${repository.name}#${pullNumber} has no head sha`)
     return
   }
-  const followupKey = `synchronize-followup:${repository.owner}/${repository.name}#${pullNumber}:${headSha}`
-  if (options.dedup.has(followupKey)) return
-  options.dedup.add(followupKey)
+  const followupKey = `${repository.owner}/${repository.name}#${pullNumber}:${headSha}`
+  const followupDedup = reviewFollowupDedup(options)
+  if (followupDedup.reservations.has(followupKey)) return
+  if ((followupDedup.failures.get(followupKey) ?? 0) >= MAX_REVIEW_FOLLOWUP_ATTEMPTS) return
+  followupDedup.reservations.set(followupKey, 'pending')
 
   const reviewOn = options.reviewOn?.() ?? 'review_requested'
   const fetchImpl = options.fetchImpl ?? fetch
   const schedule = options.scheduleBackgroundTask ?? defaultScheduleBackgroundTask
+  const sleepImpl = options.sleepImpl ?? defaultSleep
   const target = `${repository.owner}/${repository.name}#${pullNumber}`
-  schedule(async () => {
+
+  const runFollowupAttempt = async (): Promise<'completed' | 'retry'> => {
     try {
       const token = await authToken({ repoSlug: `${repository.owner}/${repository.name}` })
       const threads = await listUnresolvedSelfReviewThreads({
@@ -260,7 +299,7 @@ function scheduleReviewFollowup(input: {
       })
       if (!threads.ok) {
         options.logger.warn(`[github] review-thread recheck failed for ${target}: ${threads.error}`)
-        return
+        return 'retry'
       }
 
       // A held CHANGES_REQUESTED is the bot's own obligation regardless of how
@@ -276,10 +315,19 @@ function scheduleReviewFollowup(input: {
           fetchImpl,
         })
         if (blocking.ok) selfBlocking = blocking.selfBlocking
-        else options.logger.warn(`[github] review-state recheck failed for ${target}: ${blocking.error}`)
+        else {
+          options.logger.warn(`[github] review-state recheck failed for ${target}: ${blocking.error}`)
+          // Thread and verdict obligations form one follow-up attempt. Routing
+          // only the known threads would mark this SHA complete and permanently
+          // lose a blocking-review obligation, so fail the whole attempt and let
+          // the scheduled job retry both lookups before anything is routed.
+          return 'retry'
+        }
       }
 
-      if (threads.threads.length === 0 && !selfBlocking) return
+      if (threads.threads.length === 0 && !selfBlocking) {
+        return 'completed'
+      }
       options.route(
         withApprovalPolicy(
           buildReviewFollowupInbound({
@@ -293,9 +341,31 @@ function scheduleReviewFollowup(input: {
           options.allowApprove?.() ?? true,
         ),
       )
+      return 'completed'
     } catch (err) {
       options.logger.warn(`[github] review followup failed for ${target}: ${describeError(err)}`)
+      return 'retry'
     }
+  }
+
+  schedule(async () => {
+    for (let attempt = 1; attempt <= MAX_REVIEW_FOLLOWUP_ATTEMPTS; attempt += 1) {
+      if ((await runFollowupAttempt()) === 'completed') {
+        followupDedup.reservations.set(followupKey, 'completed')
+        followupDedup.failures.delete(followupKey)
+        return
+      }
+      if (attempt < MAX_REVIEW_FOLLOWUP_ATTEMPTS) {
+        await sleepImpl(REVIEW_FOLLOWUP_RETRY_BASE_MS * 2 ** (attempt - 1))
+      }
+    }
+
+    followupDedup.reservations.delete(followupKey)
+    const failures = (followupDedup.failures.get(followupKey) ?? 0) + MAX_REVIEW_FOLLOWUP_ATTEMPTS
+    followupDedup.failures.set(followupKey, failures)
+    options.logger.warn(
+      `[github] review followup retry cap exhausted for ${target} head=${headSha} attempts=${failures}; a new head or adapter restart is required to retry`,
+    )
   })
 }
 
