@@ -1522,6 +1522,12 @@ export type ChannelRouter = {
     verdict: 'APPROVE' | 'REQUEST_CHANGES'
     sessionId: string
   }) => { kind: 'delivered'; count: number }
+  finishGithubReviewRoundCloseout?: (args: {
+    sessionId: string
+    workspace: string
+    prNumber: number
+    thread: string | null
+  }) => void
   noteGithubReviewOutput: (args: {
     sessionId: string
     workspace: string

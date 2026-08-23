@@ -287,6 +287,9 @@ export default definePlugin({
           workspace: review.detected.workspace,
           prNumber: review.detected.prNumber,
           verdict: review.detected.verdict,
+          ...(event.origin?.kind === 'channel' && event.origin.githubReviewRound !== undefined
+            ? { round: event.origin.githubReviewRound, thread: event.origin.thread }
+            : {}),
         })
         if (block !== null) return block
         leaseClaimed = true
