@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
 import { createGithubReviewThreadResolver } from '@/channels/adapters/github/review-thread-resolver'
+import {
+  __resetReviewVerdictGuardForTest,
+  registerGithubReviewRound,
+} from '@/channels/github-review-verdict-coordinator'
 import { OUTBOUND_FLOOD_ERROR, type ChannelRouter } from '@/channels/router'
 import type { OutboundMessage, SendResult } from '@/channels/types'
 
@@ -20,6 +24,7 @@ function fakeRouter(
     qualifyingWorkObserved?: boolean
     resolveReviewThread?: ChannelRouter['resolveReviewThread']
     getReviewState?: ChannelRouter['getReviewState']
+    finishGithubReviewRoundCloseout?: ChannelRouter['finishGithubReviewRoundCloseout']
   } = {},
 ): ChannelRouter {
   return {
@@ -84,6 +89,9 @@ function fakeRouter(
     executeCommand: async () => ({ kind: 'no-live-session' }),
     injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
     injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
+    ...(options.finishGithubReviewRoundCloseout !== undefined
+      ? { finishGithubReviewRoundCloseout: options.finishGithubReviewRoundCloseout }
+      : {}),
     noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
     markTurnSkipped: () => ({ kind: 'no-live-session' }),
     clearSticky: () => ({ keyId: '', cleared: 0 }),
@@ -1256,6 +1264,51 @@ describe('channel_reply re-review stranding guard', () => {
 
     expect(result.details.ok).toBe(true)
     expect(calls).toHaveLength(1)
+  })
+
+  test('resolves and acknowledges a non-carrier sibling once GitHub says the block is gone', async () => {
+    const round = {
+      workspace: 'acme/widgets',
+      prNumber: 644,
+      headSha: 'sha-round',
+      carrierThread: '111',
+    } as const
+    registerGithubReviewRound(round)
+    const order: string[] = []
+    const tool = createChannelReplyTool({
+      router: fakeRouter(
+        async () => {
+          order.push('ack')
+          return { ok: true }
+        },
+        {
+          getReviewState: async () => ({ ok: true, selfBlocking: false, approve: true }),
+          resolveReviewThread: async () => {
+            order.push('resolve')
+            return { ok: true }
+          },
+          finishGithubReviewRoundCloseout: () => {
+            order.push('finish')
+          },
+        },
+      ),
+      origin: {
+        adapter: 'github',
+        workspace: 'acme/widgets',
+        chat: 'pr:644',
+        thread: '222',
+        githubReviewRound: round,
+      },
+    })
+
+    const result = await runTool(tool, {
+      text: 'This thread concern is addressed.',
+      resolve_review_thread: true,
+    })
+
+    expect(result.details.ok).toBe(true)
+    expect(order).toEqual(['resolve', 'finish', 'ack'])
+    __resetReviewVerdictGuardForTest()
   })
 
   test('fails closed when review state cannot be verified', async () => {

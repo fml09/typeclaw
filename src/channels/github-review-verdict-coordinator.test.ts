@@ -2,12 +2,22 @@ import { afterEach, describe, expect, test } from 'bun:test'
 
 import {
   __resetReviewVerdictGuardForTest,
+  configureReviewVerdictCoordinator,
+  completeGithubReviewRound,
+  canPromoteGithubReviewRoundTo,
   createApproveIdempotencyGuard,
+  guardGithubReviewRoundDismissal,
+  isGithubReviewRoundComplete,
+  releaseGithubReviewRoundDismissal,
+  registerGithubReviewRound,
+  REVIEW_ROUND_TTL_MS,
+  restoreGithubReviewRound,
   type EffectiveApprovalResolver,
   type EffectiveVerdict,
 } from './github-review-verdict-coordinator'
 
 const WS = 'acme/widgets'
+const ROUND = { workspace: WS, prNumber: 60, headSha: 'sha-round', carrierThread: '101' } as const
 
 function resolver(map: Record<string, EffectiveVerdict | 'error'>): EffectiveApprovalResolver {
   return async ({ workspace, prNumber }) => {
@@ -22,13 +32,222 @@ describe('review verdict idempotency guard', () => {
     __resetReviewVerdictGuardForTest()
   })
   function makeGuard(map: Record<string, EffectiveVerdict | 'error'> = {}, now?: () => number) {
-    return createApproveIdempotencyGuard({ resolveEffectiveApproval: resolver(map), now })
+    return createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver(map),
+      resolveHeadSha: async ({ prNumber }) => (prNumber === ROUND.prNumber ? ROUND.headSha : null),
+      now,
+    })
   }
 
   test('allows the first APPROVE when the bot has no prior verdict', async () => {
     const g = makeGuard()
     const decision = await g.guard({ callId: 'a1', workspace: WS, prNumber: 5, verdict: 'APPROVE' })
     expect(decision).toBeNull()
+  })
+
+  test('rejects a non-carrier round verdict before any authoritative read', async () => {
+    let reads = 0
+    let headReads = 0
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+      resolveHeadSha: async () => {
+        headReads += 1
+        return ROUND.headSha
+      },
+    })
+
+    const decision = await g.guard({
+      callId: 'round-non-carrier',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '202',
+    })
+
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(reads).toBe(0)
+    expect(headReads).toBe(0)
+  })
+
+  test('rejects a non-carrier dismissal before the authoritative head read', async () => {
+    let headReads = 0
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => {
+        headReads += 1
+        return ROUND.headSha
+      },
+    })
+    registerGithubReviewRound(ROUND)
+
+    const decision = await guardGithubReviewRoundDismissal({
+      callId: 'dismiss-non-carrier',
+      workspace: WS,
+      prNumber: 60,
+      round: ROUND,
+      thread: '202',
+    })
+
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(headReads).toBe(0)
+  })
+
+  test('allows only one carrier dismissal attempt per round', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => ROUND.headSha,
+    })
+    registerGithubReviewRound(ROUND)
+    const first = await guardGithubReviewRoundDismissal({
+      callId: 'dismiss-first',
+      workspace: WS,
+      prNumber: 60,
+      round: ROUND,
+      thread: '101',
+    })
+    expect(first).toBeNull()
+    releaseGithubReviewRoundDismissal('dismiss-first')
+
+    const second = await guardGithubReviewRoundDismissal({
+      callId: 'dismiss-second',
+      workspace: WS,
+      prNumber: 60,
+      round: ROUND,
+      thread: '101',
+    })
+    expect(second).toMatchObject({ block: true, kind: 'round-ineligible' })
+  })
+
+  test('rejects a verdict with missing metadata while a round is pending for the PR', async () => {
+    let reads = 0
+    registerGithubReviewRound(ROUND)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+    })
+    const decision = await g.guard({
+      callId: 'round-missing',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+    })
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(reads).toBe(0)
+  })
+
+  test('expires a pending round before it can deny a verdict with missing round metadata', async () => {
+    let reads = 0
+    let clock = Date.now()
+    restoreGithubReviewRound(ROUND, 'pending', ['101'], false, false, clock)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+      now: () => clock,
+    })
+    clock += REVIEW_ROUND_TTL_MS + 1
+
+    const decision = await g.guard({
+      callId: 'expired-round-missing',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+    })
+
+    expect(decision).toBeNull()
+    expect(reads).toBe(1)
+  })
+
+  test('restores attempted carriers so failover does not retry them after restart', () => {
+    restoreGithubReviewRound({ ...ROUND, carrierThread: '202' }, 'pending', ['101', '202'])
+    expect(canPromoteGithubReviewRoundTo(ROUND, '101')).toBe(false)
+    expect(canPromoteGithubReviewRoundTo(ROUND, '202')).toBe(false)
+    expect(canPromoteGithubReviewRoundTo(ROUND, '303')).toBe(true)
+  })
+
+  test('allows only the designated carrier to acquire the ordinary verdict lease', async () => {
+    const g = makeGuard()
+    const decision = await g.guard({
+      callId: 'round-carrier',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(decision).toBeNull()
+  })
+
+  test('allows one carrier REQUEST_CHANGES against a standing same-state verdict for the round', async () => {
+    const g = makeGuard({ [`${WS}#60`]: 'CHANGES_REQUESTED' })
+    const first = await g.guard({
+      callId: 'round-same-state-first',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(first).toBeNull()
+    await g.release({ callId: 'round-same-state-first', succeeded: true })
+
+    const second = await g.guard({
+      callId: 'round-same-state-second',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(second).toMatchObject({ block: true, kind: 'round-ineligible' })
+  })
+
+  test('still deduplicates a standing same-state REQUEST_CHANGES outside a round', async () => {
+    const g = makeGuard({ [`${WS}#60`]: 'CHANGES_REQUESTED' })
+    const decision = await g.guard({
+      callId: 'same-state-no-round',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+    })
+    expect(decision).toMatchObject({ block: true, kind: 'duplicate', duplicateSource: 'standing' })
+  })
+
+  test('rejects a designated carrier when the round head is no longer current', async () => {
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => 'sha-new',
+    })
+    const decision = await g.guard({
+      callId: 'round-stale-carrier',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+  })
+
+  test('a completed round remains ineligible for another formal verdict', async () => {
+    completeGithubReviewRound(ROUND)
+    const g = makeGuard()
+    const decision = await g.guard({
+      callId: 'round-completed',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
   })
 
   test('blocks a second verdict while the first is still in flight (concurrent sessions, same container)', async () => {
@@ -536,5 +755,46 @@ describe('review verdict idempotency guard', () => {
     effective = 'APPROVED'
     const flip = await g.guard({ callId: 'a2', workspace: WS, prNumber: 38, verdict: 'REQUEST_CHANGES' })
     expect(flip).toBeNull()
+  })
+})
+
+describe('review round restoration is monotonic', () => {
+  afterEach(() => {
+    __resetReviewVerdictGuardForTest()
+  })
+
+  const LATE_ROUND = { workspace: WS, prNumber: 90, headSha: 'sha-90', carrierThread: '101' }
+
+  test('a stale pending record cannot reopen a round this process already completed', () => {
+    // given: a registered round that was completed while a sibling sat idle
+    registerGithubReviewRound(LATE_ROUND)
+    completeGithubReviewRound(LATE_ROUND)
+    expect(isGithubReviewRoundComplete(LATE_ROUND)).toBe(true)
+
+    // when: the idle sibling is reopened and restores its stale pending record
+    restoreGithubReviewRound(LATE_ROUND, 'pending', ['101'], false, false)
+
+    // then: the round stays completed, so failover stays disarmed and the
+    // carrier cannot land a second blocking review
+    expect(isGithubReviewRoundComplete(LATE_ROUND)).toBe(true)
+  })
+
+  test('restoring completed over pending still upgrades', () => {
+    registerGithubReviewRound(LATE_ROUND)
+    expect(isGithubReviewRoundComplete(LATE_ROUND)).toBe(false)
+
+    restoreGithubReviewRound(LATE_ROUND, 'completed', ['101'], false, false)
+
+    expect(isGithubReviewRoundComplete(LATE_ROUND)).toBe(true)
+  })
+
+  test('expiry still wins: a completed round past its TTL is not resurrected', () => {
+    const stale = Date.now() - (REVIEW_ROUND_TTL_MS + 1)
+
+    // given/when: the round was created outside the TTL window
+    const restored = restoreGithubReviewRound(LATE_ROUND, 'completed', ['101'], false, false, stale)
+
+    // then: monotonicity never overrides expiry
+    expect(restored).toBeNull()
   })
 })

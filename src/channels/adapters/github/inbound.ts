@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
 import type { GithubReviewOn } from '@/channels/schema'
-import type { InboundMessage } from '@/channels/types'
+import type { GithubReviewFollowupRound, InboundMessage } from '@/channels/types'
 
 import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
@@ -148,15 +148,28 @@ export const PR_APPROVAL_DISABLED_NOTE =
   'verdict is `approve`, submit a `COMMENT` review instead of `APPROVE` — post ' +
   'the findings, but never formally approve.'
 
+// The generic note's "submit a COMMENT instead of APPROVE" advice is wrong for a
+// blocking re-review round: a COMMENT does not supersede a standing
+// CHANGES_REQUESTED, so following it posts a non-decisive comment, never trips
+// the dismissal guard, and strands the round with every sibling gated. This note
+// is appended AFTER followupInstruction, so the generic wording would also be the
+// last instruction the model reads and would win over the dismissal directive.
+export const PR_APPROVAL_DISABLED_BLOCKING_NOTE =
+  'Operator policy: PR approval is disabled for this agent ' +
+  '(`channels.github.review.approve: false`). Never submit an `APPROVE` review. ' +
+  'To clear your standing `CHANGES_REQUESTED` on this re-review, DISMISS it — a ' +
+  '`COMMENT` review does not clear the block and leaves this follow-up round stranded.'
+
 // Gating PR approval lives here (inbound text), not at the bash layer: the
 // review is posted via `gh api --input <file>`, so the `event: APPROVE` value
 // sits in a temp file the gh-cli-auth command interceptor never inspects. The
 // note rides on every inbound (cheap: one line, only when an operator has
 // opted out) so it reaches the agent for both webhook review requests and
 // plain-language "@bot review this" asks, which arrive on arbitrary inbounds.
-function withApprovalPolicy(message: InboundMessage, allowApprove: boolean): InboundMessage {
+function withApprovalPolicy(message: InboundMessage, allowApprove: boolean, carriesBlocking = false): InboundMessage {
   if (allowApprove) return message
-  const text = message.text === '' ? PR_APPROVAL_DISABLED_NOTE : `${message.text}\n\n${PR_APPROVAL_DISABLED_NOTE}`
+  const note = carriesBlocking ? PR_APPROVAL_DISABLED_BLOCKING_NOTE : PR_APPROVAL_DISABLED_NOTE
+  const text = message.text === '' ? note : `${message.text}\n\n${note}`
   return { ...message, text }
 }
 
@@ -325,22 +338,53 @@ function scheduleReviewFollowup(input: {
         }
       }
 
-      if (threads.threads.length === 0 && !selfBlocking) {
+      if (threads.threads.length === 0) {
+        if (selfBlocking) {
+          const round = buildReviewRound(repository, pullNumber, headSha, null)
+          options.route(
+            withApprovalPolicy(
+              buildReviewFollowupInbound({
+                repository,
+                pullNumber,
+                headSha,
+                thread: null,
+                selfBlocking: true,
+                round,
+                title: readString(pr, 'title'),
+              }),
+              options.allowApprove?.() ?? true,
+              true,
+            ),
+          )
+        }
         return 'completed'
       }
-      options.route(
-        withApprovalPolicy(
-          buildReviewFollowupInbound({
-            repository,
-            pullNumber,
-            headSha,
-            threads: threads.threads,
-            selfBlocking,
-            title: readString(pr, 'title'),
-          }),
-          options.allowApprove?.() ?? true,
-        ),
-      )
+
+      const round = selfBlocking
+        ? buildReviewRound(repository, pullNumber, headSha, String(threads.threads[0]!.rootCommentId))
+        : undefined
+      for (const [index, thread] of threads.threads.entries()) {
+        // Deliver the PR-level blocking obligation through exactly one sibling
+        // thread session. A landed verdict is already fanned across every live
+        // sibling PR session by injectPrVerdictActivity, while asking all of them
+        // to submit it would recreate a cross-session verdict race.
+        const carriesBlockingObligation = selfBlocking && index === 0
+        options.route(
+          withApprovalPolicy(
+            buildReviewFollowupInbound({
+              repository,
+              pullNumber,
+              headSha,
+              thread,
+              selfBlocking: carriesBlockingObligation,
+              ...(round !== undefined ? { round } : {}),
+              title: readString(pr, 'title'),
+            }),
+            options.allowApprove?.() ?? true,
+            carriesBlockingObligation,
+          ),
+        )
+      }
       return 'completed'
     } catch (err) {
       options.logger.warn(`[github] review followup failed for ${target}: ${describeError(err)}`)
@@ -373,23 +417,25 @@ function buildReviewFollowupInbound(input: {
   repository: { owner: string; name: string }
   pullNumber: number
   headSha: string
-  threads: readonly UnresolvedSelfReviewThread[]
+  thread: UnresolvedSelfReviewThread | null
   selfBlocking: boolean
+  round?: GithubReviewFollowupRound
   title: string | null
 }): InboundMessage {
-  const { repository, pullNumber, headSha, threads, selfBlocking, title } = input
+  const { repository, pullNumber, headSha, thread, selfBlocking, round, title } = input
   const titleSegment = title !== null && title.trim() !== '' ? `: "${title}"` : ''
   const text =
     `PR #${pullNumber}${titleSegment} received new commits (now at ${headSha.slice(0, 7)}). ` +
-    followupInstruction(threads, selfBlocking)
+    followupInstruction(thread, selfBlocking)
 
   return {
     adapter: 'github',
     workspace: `${repository.owner}/${repository.name}`,
     chat: `pr:${pullNumber}`,
-    thread: null,
+    thread: thread === null ? null : String(thread.rootCommentId),
+    ...(round !== undefined ? { githubReviewRound: round } : {}),
     text,
-    externalMessageId: `pr-${pullNumber}-recheck-${headSha}`,
+    externalMessageId: `pr-${pullNumber}-recheck-${headSha}${thread === null ? '' : `-thread-${thread.rootCommentId}`}`,
     authorId: 'github-system',
     authorName: 'github',
     authorIsBot: false,
@@ -402,25 +448,38 @@ function buildReviewFollowupInbound(input: {
   }
 }
 
-function followupInstruction(threads: readonly UnresolvedSelfReviewThread[], selfBlocking: boolean): string {
+function buildReviewRound(
+  repository: { owner: string; name: string },
+  prNumber: number,
+  headSha: string,
+  carrierThread: string | null,
+): GithubReviewFollowupRound {
+  return {
+    workspace: `${repository.owner}/${repository.name}`,
+    prNumber,
+    headSha,
+    carrierThread,
+  }
+}
+
+function followupInstruction(thread: UnresolvedSelfReviewThread | null, selfBlocking: boolean): string {
   const threadPart =
-    threads.length > 0
-      ? `You have ${threads.length} unresolved review thread(s) you authored on this PR. ` +
-        `For each, check whether the new commits addressed your concern, then act on THAT thread ` +
-        `by passing its root comment id as \`thread\` to channel_send: if addressed, reply with a short ` +
-        `acknowledgement and resolve_review_thread: true; if not, reply with resolve_review_thread: false ` +
-        `(or leave it). Use the id — not the file/line — as \`thread\`; the file/line is only to tell the ` +
-        `threads apart:\n${threads.map(renderThreadLine).join('\n')}\n`
+    thread !== null
+      ? `This session is scoped to one unresolved review thread you authored. Check whether the new commits ` +
+        `addressed its concern. If addressed, use channel_reply with a short acknowledgement and ` +
+        `resolve_review_thread: true; if not, reply with resolve_review_thread: false (or leave it):\n` +
+        `${renderThreadLine(thread)}\n`
       : ''
   // A held CHANGES_REQUESTED never clears itself: GitHub keeps the block until a
-  // fresh APPROVE/COMMENT/dismiss, so a blocking follow-up must always end with a
+  // fresh APPROVE or dismissal, so a blocking follow-up must always end with a
   // submitted verdict — the "end without replying" escape hatch is reserved for
   // the thread-only path, where leaving every thread open is a valid no-op.
   const blockingPart = selfBlocking
     ? `Your latest review on this PR is still CHANGES_REQUESTED, which keeps the PR blocked until you ` +
       `submit a fresh review. Re-review the current head against the concerns from that blocking review ` +
-      `and always end with a new verdict: if the commits resolve your concerns, submit an APPROVE ` +
-      `(or COMMENT if approval is disabled) to clear the block; if concerns remain, submit a new ` +
+      `and always end with a new verdict: if the commits resolve your concerns, submit an APPROVE when ` +
+      `approval is enabled, or DISMISS your prior CHANGES_REQUESTED when approval is disabled; if concerns ` +
+      `remain, submit a new ` +
       `CHANGES_REQUESTED explaining what is still blocking. `
     : ''
   const tail = selfBlocking ? '' : 'If none are addressed, end your turn without replying.'

@@ -6,9 +6,9 @@ import type { ChannelParticipant } from '@/agent/session-origin'
 import { toRef } from './adapters/webex-id-ref'
 import { describeError } from './describe-error'
 import type { AdapterId } from './schema'
-import type { ChannelKey } from './types'
+import type { ChannelKey, GithubReviewFollowupRound } from './types'
 
-const FILE_VERSION = 5
+const FILE_VERSION = 7
 
 // `sessionFile` is the basename (not the full path) of the JSONL transcript
 // for this (adapter, workspace, chat, thread) tuple. pi-coding-agent writes
@@ -29,6 +29,13 @@ export type ChannelSessionRecord = {
   sessionFile?: string
   lastInboundAt?: number
   participants: ChannelParticipant[]
+  githubReviewRound?: GithubReviewFollowupRound & {
+    status: 'pending' | 'completed'
+    createdAt: number
+    attemptedCarriers: (string | null)[]
+    dismissalAttempted?: true
+    requestChangesAttempted?: true
+  }
 }
 
 type FileV4 = {
@@ -38,6 +45,16 @@ type FileV4 = {
 
 type FileV5 = {
   version: 5
+  sessions: ChannelSessionRecord[]
+}
+
+type FileV6 = {
+  version: 6
+  sessions: ChannelSessionRecord[]
+}
+
+type FileV7 = {
+  version: 7
   sessions: ChannelSessionRecord[]
 }
 
@@ -81,9 +98,19 @@ export async function loadChannelSessions(
   }
   const version = (parsed as { version?: unknown }).version
   if (version === FILE_VERSION) {
+    const file = parsed as FileV7
+    if (!Array.isArray(file.sessions)) return []
+    return dedupe(file.sessions.filter(isValidRecord))
+  }
+  if (version === 5) {
     const file = parsed as FileV5
     if (!Array.isArray(file.sessions)) return []
     return dedupe(file.sessions.filter(isValidRecord))
+  }
+  if (version === 6) {
+    const file = parsed as FileV6
+    if (!Array.isArray(file.sessions)) return []
+    return dedupe(file.sessions.filter(isValidV6Record).map(dropLegacyGithubReviewRound))
   }
   if (version === 4) {
     const file = parsed as FileV4
@@ -100,7 +127,7 @@ export async function saveChannelSessions(
   logger: ChannelSessionsLogger = consoleLogger,
 ): Promise<void> {
   const path = channelsSessionsPath(agentDir)
-  const payload: FileV5 = { version: FILE_VERSION, sessions: dedupe(sessions) }
+  const payload: FileV7 = { version: FILE_VERSION, sessions: dedupe(sessions) }
   try {
     await mkdir(dirname(path), { recursive: true })
     const tmp = `${path}.tmp`
@@ -165,6 +192,12 @@ function migrateV4Record(record: ChannelSessionRecord): ChannelSessionRecord {
   }
 }
 
+function dropLegacyGithubReviewRound(record: ChannelSessionRecord): ChannelSessionRecord {
+  const { githubReviewRound: _expiredLegacyRound, ...rest } = record
+  void _expiredLegacyRound
+  return rest
+}
+
 function recordKey(record: ChannelSessionRecord): string {
   return `${record.adapter}:${record.workspace}:${record.chat}:${record.thread ?? ''}`
 }
@@ -199,6 +232,40 @@ function isValidRecord(v: unknown): v is ChannelSessionRecord {
     (r.sessionId === undefined || typeof r.sessionId === 'string') &&
     (r.sessionFile === undefined || typeof r.sessionFile === 'string') &&
     (r.lastInboundAt === undefined || typeof r.lastInboundAt === 'number') &&
-    Array.isArray(r.participants)
+    Array.isArray(r.participants) &&
+    (r.githubReviewRound === undefined || isValidGithubReviewRound(r.githubReviewRound, r))
+  )
+}
+
+function isValidV6Record(v: unknown): v is ChannelSessionRecord {
+  if (!isObject(v)) return false
+  const { githubReviewRound: _legacyRound, ...record } = v
+  void _legacyRound
+  return isValidRecord(record)
+}
+
+function isValidGithubReviewRound(value: unknown, record: Record<string, unknown>): boolean {
+  if (!isObject(value)) return false
+  return (
+    (value.status === 'pending' || value.status === 'completed') &&
+    record.adapter === 'github' &&
+    typeof value.workspace === 'string' &&
+    value.workspace === record.workspace &&
+    typeof value.prNumber === 'number' &&
+    Number.isInteger(value.prNumber) &&
+    value.prNumber > 0 &&
+    record.chat === `pr:${value.prNumber}` &&
+    typeof value.headSha === 'string' &&
+    value.headSha.length > 0 &&
+    typeof value.createdAt === 'number' &&
+    Number.isFinite(value.createdAt) &&
+    value.createdAt >= 0 &&
+    (value.carrierThread === null || typeof value.carrierThread === 'string') &&
+    Array.isArray(value.attemptedCarriers) &&
+    value.attemptedCarriers.length > 0 &&
+    value.attemptedCarriers.every((thread) => thread === null || typeof thread === 'string') &&
+    value.attemptedCarriers.some((thread) => thread === value.carrierThread) &&
+    (value.dismissalAttempted === undefined || value.dismissalAttempted === true) &&
+    (value.requestChangesAttempted === undefined || value.requestChangesAttempted === true)
   )
 }

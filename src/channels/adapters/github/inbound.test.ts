@@ -1659,6 +1659,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     authToken?: GithubWebhookHandlerOptions['authToken']
     reviewOn?: 'review_requested' | 'opened' | 'off'
     sleepImpl?: GithubWebhookHandlerOptions['sleepImpl']
+    allowApprove?: boolean
   }) {
     return createGithubWebhookHandler({
       webhookSecret: 'secret',
@@ -1667,6 +1668,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
       selfId: () => '99',
       selfLogin: () => 'typeclaw-bot[bot]',
       authType: () => 'app',
+      ...(input.allowApprove !== undefined ? { allowApprove: () => input.allowApprove! } : {}),
       ...(input.reviewOn !== undefined ? { reviewOn: () => input.reviewOn! } : {}),
       authToken: input.authToken ?? (async () => 'tok'),
       fetchImpl: input.fetchImpl,
@@ -1714,7 +1716,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(routed).toHaveLength(0)
   })
 
-  it('routes one engaging inbound listing the unresolved bot threads', async () => {
+  it('routes one thread-keyed inbound per unresolved bot thread', async () => {
     const routed: InboundMessage[] = []
     const tasks: Array<() => Promise<void>> = []
     const handler = recheckHandler({
@@ -1738,20 +1740,26 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     await handler(signedRequest(JSON.stringify(synchronizePayload('deadbeef999')), 'pull_request', 'sync-some'))
     await tasks[0]?.()
 
-    expect(routed).toHaveLength(1)
-    const msg = routed[0]!
-    expect(msg.chat).toBe('pr:7')
-    expect(msg.thread).toBe(null)
-    expect(msg.isBotMention).toBe(true)
-    expect(msg.workspace).toBe('acme/project')
-    expect(msg.text).toContain('PR #7')
-    expect(msg.text).toContain('deadbee')
-    expect(msg.text).toContain('thread 100 on src/api/auth.ts:42')
-    expect(msg.text).toContain('This token never expires — set a TTL.')
-    expect(msg.text).toContain('thread 200')
-    expect(msg.text).not.toContain('second line ignored')
-    expect(msg.externalMessageId).toBe('pr-7-recheck-deadbeef999')
-    expect(msg.text).toContain('end your turn without replying')
+    expect(routed).toHaveLength(2)
+    expect(routed.map((msg) => msg.thread)).toEqual(['100', '200'])
+    expect(routed.every((msg) => msg.chat === 'pr:7')).toBe(true)
+    expect(routed.every((msg) => msg.isBotMention)).toBe(true)
+    expect(routed.every((msg) => msg.workspace === 'acme/project')).toBe(true)
+
+    const first = routed[0]!
+    expect(first.text).toContain('PR #7')
+    expect(first.text).toContain('deadbee')
+    expect(first.text).toContain('thread 100 on src/api/auth.ts:42')
+    expect(first.text).toContain('This token never expires — set a TTL.')
+    expect(first.text).not.toContain('thread 200')
+    expect(first.text).not.toContain('second line ignored')
+    expect(first.externalMessageId).toBe('pr-7-recheck-deadbeef999-thread-100')
+    expect(first.text).toContain('end your turn without replying')
+
+    const second = routed[1]!
+    expect(second.text).toContain('thread 200')
+    expect(second.text).not.toContain('thread 100')
+    expect(second.externalMessageId).toBe('pr-7-recheck-deadbeef999-thread-200')
   })
 
   it('does not route a self-authored synchronize (bot pushed its own PR)', async () => {
@@ -1871,8 +1879,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(calls).toBe(2)
     expect(sleeps).toEqual([1000])
     expect(routed).toHaveLength(1)
-    expect(routed[0]?.thread).toBe(null)
-    expect(routed[0]?.externalMessageId).toBe('pr-7-recheck-retry-sha')
+    expect(routed[0]?.thread).toBe('100')
   })
 
   it('bounds failed followup retries for a persistently failing repo', async () => {
@@ -1930,7 +1937,32 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     // A held block never self-clears, so the inbound must demand a fresh verdict
     // and must NOT offer the silent-exit escape hatch that would strand the block.
     expect(msg.text).toContain('always end with a new verdict')
+    expect(msg.text).toContain('DISMISS')
+    expect(msg.text).not.toContain('COMMENT if approval is disabled')
     expect(msg.text).not.toContain('end your turn without replying')
+  })
+
+  it('does not append COMMENT-instead-of-APPROVE guidance to a blocking round when approval is disabled', async () => {
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = recheckHandler({
+      fetchImpl: followupFetch({ threads: [], reviews: [{ state: 'CHANGES_REQUESTED' }] }),
+      routed,
+      tasks,
+      allowApprove: false,
+    })
+
+    await handler(signedRequest(JSON.stringify(synchronizePayload('beef222')), 'pull_request', 'sync-cr-noapprove'))
+    await tasks[0]?.()
+
+    expect(routed).toHaveLength(1)
+    // The policy note is appended AFTER the follow-up instruction, so the generic
+    // wording would be the LAST directive the model reads and would override the
+    // dismissal. Assert the whole routed text, not just the instruction fragment.
+    const text = routed[0]!.text
+    expect(text).toContain('DISMISS')
+    expect(text).not.toContain('submit a `COMMENT` review instead of `APPROVE`')
+    expect(text).toContain('does not clear the block')
   })
 
   it('does not route when the latest self review is APPROVED and no threads remain', async () => {
@@ -1951,7 +1983,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(routed).toHaveLength(0)
   })
 
-  it('combines unresolved threads and a held CHANGES_REQUESTED into one inbound', async () => {
+  it('delivers a held CHANGES_REQUESTED obligation through one sibling thread inbound', async () => {
     const routed: InboundMessage[] = []
     const tasks: Array<() => Promise<void>> = []
     const handler = recheckHandler({
@@ -1967,11 +1999,40 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     await tasks[0]?.()
 
     expect(routed).toHaveLength(1)
-    expect(routed[0]!.thread).toBe(null)
+    expect(routed[0]!.thread).toBe('100')
     expect(routed[0]!.text).toContain('100')
     expect(routed[0]!.text).toContain('CHANGES_REQUESTED')
     expect(routed[0]!.text).not.toContain('end your turn without replying')
-    expect(routed[0]!.externalMessageId).toBe('pr-7-recheck-abc1234def')
+    expect(routed[0]!.githubReviewRound).toEqual({
+      workspace: 'acme/project',
+      prNumber: 7,
+      headSha: 'abc1234def',
+      carrierThread: '100',
+    })
+  })
+
+  it('stamps every sibling inbound with one carrier-scoped round identity', async () => {
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = recheckHandler({
+      fetchImpl: followupFetch({
+        threads: [
+          { id: 'T1', isResolved: false, rootCommentId: 100, login: 'typeclaw-bot' },
+          { id: 'T2', isResolved: false, rootCommentId: 200, login: 'typeclaw-bot' },
+        ],
+        reviews: [{ state: 'CHANGES_REQUESTED' }],
+      }),
+      routed,
+      tasks,
+    })
+
+    await handler(signedRequest(JSON.stringify(synchronizePayload('round-sha')), 'pull_request', 'sync-round'))
+    await tasks[0]?.()
+
+    expect(routed.map((message) => message.githubReviewRound)).toEqual([
+      { workspace: 'acme/project', prNumber: 7, headSha: 'round-sha', carrierThread: '100' },
+      { workspace: 'acme/project', prNumber: 7, headSha: 'round-sha', carrierThread: '100' },
+    ])
   })
 
   it('skips the CHANGES_REQUESTED re-review when review.on is off', async () => {
@@ -2000,6 +2061,26 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     await tasks[0]?.()
 
     expect(routed).toHaveLength(0)
+  })
+
+  it('keeps thread-only followups round-free when review.on is off', async () => {
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = recheckHandler({
+      reviewOn: 'off',
+      fetchImpl: followupFetch({
+        threads: [{ id: 'T1', isResolved: false, rootCommentId: 100, login: 'typeclaw-bot' }],
+        reviews: [{ state: 'CHANGES_REQUESTED' }],
+      }),
+      routed,
+      tasks,
+    })
+
+    await handler(signedRequest(JSON.stringify(synchronizePayload('off-sha')), 'pull_request', 'sync-off-thread'))
+    await tasks[0]?.()
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]!.githubReviewRound).toBeUndefined()
   })
 
   it('reserves a same-sha followup synchronously across concurrent deliveries', async () => {
@@ -2142,8 +2223,6 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(reviewCalls).toBe(2)
     expect(sleeps).toEqual([1000])
     expect(routed).toHaveLength(1)
-    expect(routed[0]!.thread).toBe(null)
-    expect(routed[0]!.externalMessageId).toBe('pr-7-recheck-state-retry-sha')
     expect(routed[0]!.text).toContain('CHANGES_REQUESTED')
   })
 })
