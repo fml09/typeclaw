@@ -93,7 +93,7 @@ describe('agent folder vs project repo', () => {
   ])('states the agent folder is a backup repo, not a project checkout, in the %s', (_name, prompt) => {
     expect(prompt).toMatch(/no (github )?remote/i)
     expect(prompt).toContain('`workspace/<repo>`')
-    expect(prompt).toMatch(/\/tmp[\s\S]*?per-session[\s\S]*?dies with the container/i)
+    expect(prompt).toMatch(/(?:\/tmp[\s\S]*?per-session|per-session[\s\S]*?\/tmp)/i)
     expect(prompt).not.toMatch(/clone[\s\S]{0,80}?\/tmp\/<repo>/i)
     expect(prompt).toMatch(/not a (software )?project (checkout|you develop)|not a checkout of any project/i)
   })
@@ -105,10 +105,12 @@ describe('agent folder vs project repo', () => {
     ['default prompt', DEFAULT_SYSTEM_PROMPT],
     ['slim prompt', SLIM_SYSTEM_PROMPT],
   ])('splits brokered push from host-stage-only PR creation in the %s', (_name, prompt) => {
-    expect(prompt).toContain('git -C workspace/<repo> push -u origin <branch>')
+    expect(prompt).toContain('git -C <checkout> push <remote> <branch>')
+    expect(prompt).toMatch(/any accessible repository path/i)
+    expect(prompt).not.toMatch(/git[^\n]*push\s+(?:-u|--set-upstream)/i)
     expect(prompt).toMatch(/broker[\s\S]*?credential/i)
     expect(prompt).toMatch(/gh pr create[\s\S]*?host-stage only/i)
-    expect(prompt).toMatch(/refuse it/i)
+    expect(prompt).toMatch(/refus/i)
     expect(prompt).not.toMatch(/cannot push or create a PR/i)
   })
 
@@ -118,7 +120,7 @@ describe('agent folder vs project repo', () => {
     const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('\n\n', start + 400))
     expect(section).toMatch(/not\*{0,2} a checkout of any project/i)
     expect(section).toMatch(/anything a human must act on later cannot live there alone/i)
-    expect(section).toMatch(/gitExfil/)
+    expect(section).toMatch(/broker or your permissions refuse/i)
     expect(section).toMatch(/ask the user where it lives/i)
   })
 
@@ -130,7 +132,11 @@ describe('agent folder vs project repo', () => {
     ['github-contributing skill', 'typeclaw-github-contributing'],
   ])('mirrors the brokered-push / host-stage-PR split in the %s', (_name, slug) => {
     const skill = readFileSync(join(import.meta.dir, '..', 'skills', slug, 'SKILL.md'), 'utf8')
-    expect(skill).toMatch(/push -u origin <branch>/)
+    expect(skill).toMatch(/push <remote> <branch>/)
+    expect(skill).toMatch(/any accessible repository path/i)
+    expect(skill).toMatch(/GitHub App[\s\S]*PAT[\s\S]*trusted GitHub CLI store/i)
+    expect(skill).toMatch(/gh auth login --hostname github\.com/)
+    expect(skill).not.toMatch(/push -u origin <branch>/)
     expect(skill).toMatch(/broker[\s\S]*?credential/i)
     expect(skill).toMatch(/gh pr create[\s\S]*?host-stage only/i)
     expect(skill).toMatch(/refuse it/i)
