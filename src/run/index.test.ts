@@ -126,6 +126,10 @@ describe('startAgent', () => {
         order.push('export:claude')
         return { action: 'skipped', reason: 'claude-code-disabled' }
       },
+      exportGithubCliStore: () => {
+        order.push('export:github-cli')
+        return { action: 'skipped', reason: 'no-github-cli-credential' }
+      },
     })
 
     await lockAcquiredSignal
@@ -145,6 +149,7 @@ describe('startAgent', () => {
       'refresh:lock-released',
       'export:codex',
       'export:claude',
+      'export:github-cli',
       'channel:start',
       'auth:sync-read',
     ])
