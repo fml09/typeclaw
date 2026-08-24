@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 
-import { applyReadability, applyReadabilityDetailed } from './readability'
+import { VISIBILITY_PROPERTIES } from '../inline-style-visibility'
+import {
+  applyReadability,
+  applyReadabilityDetailed,
+  buildComputedStyleResolver,
+  pruneHiddenContent,
+  reduceToVisibilityDeclarations,
+} from './readability'
 
 const ARTICLE = `
 <!doctype html>
@@ -263,5 +270,140 @@ describe('applyReadability', () => {
 
       expect(result).toContain(`Visible positive ${opacity} opacity article`)
     }
+  })
+
+  test('prunes stylesheet-hidden content on pages whose CSS also conflicts border shorthand with longhand', async () => {
+    const concealed = 'Concealed article behind conflicting border declarations. '.repeat(40)
+    const visible = 'Visible article behind conflicting border declarations. '.repeat(40)
+    const result = await applyReadability(
+      `<html><head><style>span,article{margin:0;padding:0;border:0px;font-size:100%}.chrome{border-bottom:1px solid;display:none}</style></head><body><article class="chrome"><h1>Hidden</h1><p>${concealed}</p></article><article><h1>Visible</h1><p>${visible}</p></article></body></html>`,
+      'https://example.com/border-shorthand-conflict',
+    )
+
+    expect(result).toContain('Visible article behind conflicting border declarations')
+    expect(result).not.toContain('Concealed article behind conflicting border declarations')
+  })
+})
+
+describe('buildComputedStyleResolver', () => {
+  const resolverFor = async (css: string, inlineStyle = '') => {
+    const { JSDOM } = await import('jsdom')
+    const dom = new JSDOM(
+      `<html><head><style>${css}</style></head><body><p class="a" style="${inlineStyle}">x</p></body></html>`,
+    )
+    const { document } = dom.window
+    const resolve = buildComputedStyleResolver(document, (element) => dom.window.getComputedStyle(element))
+    return { resolve, element: document.querySelector('p')! }
+  }
+
+  test('resolves the visibility properties pruning depends on', async () => {
+    const { resolve, element } = await resolverFor('.a{border-bottom:3px solid red;display:none}')
+
+    expect(resolve?.(element).display).toBe('none')
+  })
+
+  test('cannot resolve declarations pruning never reads, so jsdom never computes them', async () => {
+    const { resolve, element } = await resolverFor('.a{border-bottom:3px solid red;display:none}')
+
+    expect(resolve?.(element).borderBottomWidth).not.toBe('3px')
+  })
+
+  test('cannot resolve an inline shorthand/longhand conflict, the other route into the cascade', async () => {
+    const { resolve, element } = await resolverFor(
+      '.unused{color:red}',
+      'border:0;border-bottom:1px solid;display:none',
+    )
+
+    expect(resolve?.(element).borderBottomStyle).not.toBe('solid')
+  })
+
+  test('keeps an inline custom property while removing the inline declarations it never reads', async () => {
+    const { resolve, element } = await resolverFor(
+      '.unused{color:red}',
+      '--hidden:0;border:0;border-bottom:1px solid;display:none',
+    )
+
+    resolve?.(element)
+
+    expect(Array.from((element as HTMLElement).style).toSorted()).toEqual(['--hidden', 'display'])
+    expect((element as HTMLElement).style.getPropertyValue('--hidden')).toBe('0')
+  })
+
+  test('still resolves inline visibility declarations so inline pruning keeps working', async () => {
+    const { resolve, element } = await resolverFor(
+      '.unused{color:red}',
+      'border:0;border-bottom:1px solid;display:none',
+    )
+
+    expect(resolve?.(element).display).toBe('none')
+  })
+})
+
+describe('pruneHiddenContent', () => {
+  test('reduces every inline style before resolving any element, including ancestors it prunes first', async () => {
+    const { JSDOM } = await import('jsdom')
+    const dom = new JSDOM(
+      `<html><body><div hidden style="color:rgb(1,2,3);border:0;border-bottom:1px solid"><p>x</p></div><section style="position:absolute;left:-10000px;border:0;border-bottom:1px solid"><span>y</span></section></body></html>`,
+    )
+    const { document } = dom.window
+    const unreduced: string[] = []
+
+    pruneHiddenContent(document, (element) => {
+      for (let node = element.parentElement; node !== null; node = node.parentElement) {
+        const declarations = Array.from(node.style).filter((property) => !VISIBILITY_PROPERTIES.has(property))
+        if (declarations.length > 0) unreduced.push(`${node.tagName}:${declarations.join(',')}`)
+      }
+      return dom.window.getComputedStyle(element)
+    })
+
+    expect(unreduced).toEqual([])
+  })
+})
+
+describe('reduceToVisibilityDeclarations', () => {
+  const styleElementsFor = async (css: string) => {
+    const { JSDOM } = await import('jsdom')
+    const dom = new JSDOM(`<html><head><style>${css}</style></head><body><p>x</p></body></html>`)
+    return Array.from(dom.window.document.querySelectorAll('style'))
+  }
+
+  test('drops declarations that cannot affect visibility and keeps the ones that can', async () => {
+    const styles = await styleElementsFor(
+      '.a{border:0px;border-bottom:1px solid;transition:all 250ms;display:none;opacity:0;visibility:hidden;content-visibility:hidden}',
+    )
+
+    reduceToVisibilityDeclarations(styles)
+
+    const rule = styles[0]!.sheet!.cssRules[0] as CSSStyleRule
+    expect(Array.from(rule.style).toSorted()).toEqual(['content-visibility', 'display', 'opacity', 'visibility'])
+  })
+
+  test('keeps custom properties a retained visibility declaration could reference', async () => {
+    const styles = await styleElementsFor('.a{--hidden:0;border:0px;transition:all 250ms;opacity:var(--hidden)}')
+
+    reduceToVisibilityDeclarations(styles)
+
+    const rule = styles[0]!.sheet!.cssRules[0] as CSSStyleRule
+    expect(Array.from(rule.style).toSorted()).toEqual(['--hidden', 'opacity'])
+    expect(rule.style.getPropertyValue('--hidden')).toBe('0')
+  })
+
+  test('reduces declarations nested inside grouping rules', async () => {
+    const styles = await styleElementsFor('@media screen{@supports (display:grid){.a{border:0px;display:none}}}')
+
+    reduceToVisibilityDeclarations(styles)
+
+    const media = styles[0]!.sheet!.cssRules[0] as CSSGroupingRule
+    const supports = media.cssRules[0] as CSSGroupingRule
+    expect(Array.from((supports.cssRules[0] as CSSStyleRule).style)).toEqual(['display'])
+  })
+
+  test('leaves style textContent untouched so the complexity budgets still measure the original stylesheet', async () => {
+    const css = '.a{border:0px;display:none}'
+    const styles = await styleElementsFor(css)
+
+    reduceToVisibilityDeclarations(styles)
+
+    expect(styles[0]!.textContent).toBe(css)
   })
 })
