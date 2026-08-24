@@ -65,9 +65,10 @@ The default GitHub event allowlist already covers reviews. If you want to narrow
   **private** repo the agent also needs **Contents: read** — the runtime-owned exact-SHA review fetch (and any raw
   file-tree access) of a private repo fails with 403/404 without it; **Metadata: read** alone lets the App _see_ the
   repo but not read its files. Model-driven review, commenting, and triage do not require **Contents: write**, so keep
-  that permission disabled for this recipe. If a finding needs a fix, a host-stage operator checks out the repository,
-  makes the authenticated push, publishes the branch, and creates the pull request using host credentials. The wizard's
-  permission note lists exactly what to enable.
+  that permission disabled for this recipe. If a finding needs a fix, a host-stage operator performs checkout and pull-
+  request creation. The agent performs an eligible push to a configured GitHub remote through the broker, using GitHub
+  App auth, an authorized declared PAT, or the automatically refreshed trusted host `gh` store. The wizard's permission
+  note lists exactly what to enable.
 </Callout>
 
 <Callout type="warn" title="The preflight won't catch a missing Contents grant">
@@ -124,7 +125,7 @@ stale/transient GitHub responses, and operator policy that downgraded an approva
 
 ## Lock down who can trigger it
 
-Inbound GitHub authors resolve to a role like any other channel. Keep public participants on `guest` with just `channel.respond`, and reserve privileged model-driven actions such as scheduling cron for `owner`. Repository checkout, authenticated push, branch publication, and pull-request creation remain host-stage operator actions regardless of role. To pair yourself as `owner`, run `typeclaw role claim --as owner` and follow the prompt — or, if you're already paired, ask the agent to grant a role via its `grant_role` tool from the TUI or a DM. The review path itself only needs read access plus the ability to post, so a stranger requesting the decoy gets a review but cannot trigger privileged model actions or host-stage repository publication. See [/concepts/permissions-model](/docs/concepts/permissions-model) for why provenance is enforced at the tool boundary.
+Inbound GitHub authors resolve to a role like any other channel. Keep public participants on `guest` with just `channel.respond`, and reserve privileged model-driven actions such as scheduling cron for `owner`. Repository checkout and pull-request creation remain host-stage operator actions. An eligible push to an operator-configured GitHub remote is instead performed by the agent through the repository-bound credential broker, subject to the caller's role and Git guards. To pair yourself as `owner`, run `typeclaw role claim --as owner` and follow the prompt — or, if you're already paired, ask the agent to grant a role via its `grant_role` tool from the TUI or a DM. The review path itself only needs read access plus the ability to post, so a stranger requesting the decoy gets a review but cannot trigger privileged model actions or repository publication. See [/concepts/permissions-model](/docs/concepts/permissions-model) for why provenance is enforced at the tool boundary.
 
 ---
 
