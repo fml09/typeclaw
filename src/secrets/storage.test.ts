@@ -66,6 +66,8 @@ describe('SecretsBackend', () => {
         version: 2,
         providers: { openai: { type: 'api_key', key: { value: 'sk-existing' } } },
         channels: { 'discord-bot': { token: { value: 'd-keep' } } },
+        githubCli: { hosts: 'generated-store' },
+        futureSlice: { keep: true },
       }),
     )
 
@@ -77,11 +79,40 @@ describe('SecretsBackend', () => {
       version: number
       providers: Record<string, unknown>
       channels: Record<string, unknown>
+      githubCli: unknown
+      futureSlice: unknown
     }
     expect(obj.version).toBe(2)
     expect(obj.providers['openai']).toEqual({ type: 'api_key', key: { value: 'sk-existing' } })
     expect(obj.providers['fireworks']).toEqual({ type: 'api_key', key: { value: 'fw-added' } })
     expect(obj.channels['discord-bot']).toEqual({ token: { value: 'd-keep' } })
+    expect(obj.githubCli).toEqual({ hosts: 'generated-store' })
+    expect(obj.futureSlice).toEqual({ keep: true })
+  })
+
+  test('locked GitHub CLI reads and writes preserve every sibling and unknown slice', async () => {
+    await writeFile(
+      secretsPath,
+      JSON.stringify({
+        version: 2,
+        providers: { openai: { type: 'api_key', key: { value: 'provider-test' } } },
+        channels: { 'discord-bot': { token: { value: 'channel-test' } } },
+        mcp: { example: { tokens: { access_token: 'mcp-test' } } },
+        futureSlice: { keep: true },
+      }),
+    )
+    const backend = new SecretsBackend(secretsPath)
+
+    expect(backend.tryReadGithubCliSync()).toBeUndefined()
+    backend.writeGithubCliSync({ hosts: 'first-store' })
+    backend.writeGithubCliSync({ hosts: 'refreshed-store' })
+
+    expect(backend.tryReadGithubCliSync()).toEqual({ hosts: 'refreshed-store' })
+    const raw = JSON.parse(await readFile(secretsPath, 'utf8')) as Record<string, unknown>
+    expect(raw['providers']).toEqual({ openai: { type: 'api_key', key: { value: 'provider-test' } } })
+    expect(raw['channels']).toEqual({ 'discord-bot': { token: { value: 'channel-test' } } })
+    expect(raw['mcp']).toEqual({ example: { tokens: { access_token: 'mcp-test' } } })
+    expect(raw['futureSlice']).toEqual({ keep: true })
   })
 
   test('file mode is 0o600 after first write', async () => {

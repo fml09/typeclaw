@@ -13,6 +13,7 @@ import { registerXaiOAuthProvider } from './oauth-xai'
 import { resolveSecret, type Secret } from './resolve'
 import {
   type Channels,
+  type GithubCliSecrets,
   type McpCredential,
   type McpSlice,
   type ProviderCredential,
@@ -199,6 +200,35 @@ export class SecretsBackend implements AuthStorageBackend {
     try {
       release = this.acquireSyncLockWithRetry()
       return { ...this.readEnvelope().mcp }
+    } finally {
+      release?.()
+    }
+  }
+
+  tryReadGithubCliSync(): GithubCliSecrets | undefined {
+    if (!existsSync(this.secretsPath)) return undefined
+    let release: (() => void) | undefined
+    try {
+      release = this.acquireSyncLockWithRetry()
+      return this.readEnvelope().githubCli
+    } finally {
+      release?.()
+    }
+  }
+
+  writeGithubCliSync(githubCli: GithubCliSecrets): void {
+    this.ensureParentDir()
+    this.ensureFileExists()
+    let release: (() => void) | undefined
+    try {
+      release = this.acquireSyncLockWithRetry()
+      const envelope = this.readEnvelope()
+      this.writeEnvelopeAtomic({
+        ...envelope,
+        $schema: envelope.$schema ?? SCHEMA_REL,
+        version: SECRETS_FILE_VERSION,
+        githubCli,
+      })
     } finally {
       release?.()
     }
