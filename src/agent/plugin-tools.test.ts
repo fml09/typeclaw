@@ -19,7 +19,6 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { defineTool as definePiTool } from '@mariozechner/pi-coding-agent'
-import type { ToolDefinition } from '@mariozechner/pi-coding-agent'
 import { Type } from 'typebox'
 import { z } from 'zod'
 
@@ -58,6 +57,7 @@ import {
   forgetSharedLoopGuardTool,
   sanitizeBashSpawnEnvironment,
   TYPECLAW_INTERNAL_BASH_ENV,
+  TYPECLAW_INTERNAL_BASH_PREPARE,
   TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV,
   wrapBuiltinToolDefinition,
   wrapPluginTool,
@@ -4830,6 +4830,373 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     )
     expect(seenInHook).toBeUndefined()
     expect(args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+  })
+
+  test('a client-supplied deferred bash preparation is stripped before hooks run', async () => {
+    let seenInHook: unknown = 'unset'
+    const hooks = createHookBus()
+    hooks.registerAll('observer', '/agent', noopLogger, {
+      'tool.before': (event) => {
+        seenInHook = (event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_PREPARE]
+      },
+    })
+    const args: Record<string, unknown> = {
+      command: 'echo hi',
+      [TYPECLAW_INTERNAL_BASH_PREPARE]: async () => {
+        throw new Error('client preparation ran')
+      },
+    }
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks,
+      getOrigin: () => tui,
+    })
+
+    await expect(wrapped.execute('c', args as never, undefined, undefined, {} as never)).rejects.toThrow(
+      /permission service/i,
+    )
+    expect(seenInHook).toBeUndefined()
+    expect(args[TYPECLAW_INTERNAL_BASH_PREPARE]).toBeUndefined()
+  })
+
+  test('subagent policy rejection happens before deferred preparation', async () => {
+    let prepared = 0
+    const hooks = createHookBus()
+    hooks.registerAll('preparer', '/agent', noopLogger, {
+      'tool.before': (event) => {
+        ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_PREPARE] = async () => {
+          prepared += 1
+          throw new Error('preparation should not run')
+        }
+      },
+    })
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashPolicy: { kind: 'readonly-reviewer' },
+    })
+
+    await expect(
+      wrapped.execute('c', { command: 'git push origin HEAD' }, undefined, undefined, {} as never),
+    ).rejects.toThrow()
+    expect(prepared).toBe(0)
+  })
+
+  test.each([false, true])(
+    'deferred preparation adds a last-wins read-only mount and cleans it after execution (failure=%s)',
+    async (failExecution) => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-deferred-bash-'))
+      const source = await mkdtemp(path.join(tmpdir(), 'typeclaw-deferred-source-'))
+      let capturedPolicy: SandboxPolicy | undefined
+      const hooks = createHookBus()
+      hooks.registerAll('preparer', agentDir, noopLogger, {
+        'tool.before': (event) => {
+          ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_PREPARE] = async () => ({
+            command: 'git --git-dir /tmp/isolated push https://github.com/acme/widgets.git HEAD:HEAD',
+            env: { GIT_DIR: '/tmp/isolated' },
+            mount: { type: 'ro-bind', source, dest: '/tmp/isolated' },
+            cleanup: async () => await rm(source, { recursive: true, force: true }),
+          })
+        },
+      })
+      const bash = {
+        ...fakeBash({}),
+        async execute() {
+          if (failExecution) throw new Error('synthetic execution failure')
+          return { content: [{ type: 'text' as const, text: 'ran' }], details: undefined }
+        },
+      }
+      const wrapped = wrapBuiltinToolDefinition(bash, {
+        agentDir,
+        sessionId: `deferred-${failExecution}`,
+        hooks,
+        getOrigin: () => tui,
+        permissions: createPermissionService(),
+        bashSandboxBoundary: {
+          ensureAvailable: async () => {},
+          buildCommand(command, options) {
+            if (options === undefined) throw new Error('sandbox options missing')
+            capturedPolicy = options
+            return { ...buildSandboxedCommand(command, options), commandString: command }
+          },
+        },
+      })
+
+      try {
+        if (failExecution) {
+          await expect(
+            wrapped.execute('c', { command: 'git push origin HEAD' }, undefined, undefined, {} as never),
+          ).rejects.toThrow(/synthetic execution failure/)
+        } else {
+          await wrapped.execute('c', { command: 'git push origin HEAD' }, undefined, undefined, {} as never)
+        }
+        const mounts = capturedPolicy?.mounts ?? []
+        const writableTmp = mounts.findIndex((mount) => mount.type === 'bind' && mount.dest === '/tmp')
+        const isolated = mounts.findIndex(
+          (mount) => mount.type === 'ro-bind' && mount.source === source && mount.dest === '/tmp/isolated',
+        )
+        expect(writableTmp).toBeGreaterThanOrEqual(0)
+        expect(isolated).toBeGreaterThan(writableTmp)
+        expect(
+          await stat(source).then(
+            () => true,
+            () => false,
+          ),
+        ).toBe(false)
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+        await rm(source, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('sandbox build failure cleans deferred preparation exactly once', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-deferred-build-'))
+    const source = await mkdtemp(path.join(tmpdir(), 'typeclaw-deferred-build-source-'))
+    let cleanups = 0
+    const hooks = createHookBus()
+    hooks.registerAll('preparer', agentDir, noopLogger, {
+      'tool.before': (event) => {
+        ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_PREPARE] = async () => ({
+          command: 'echo prepared',
+          mount: { type: 'ro-bind', source, dest: '/tmp/isolated' },
+          cleanup: async () => {
+            cleanups += 1
+            await rm(source, { recursive: true, force: true })
+          },
+        })
+      },
+    })
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'deferred-build-error',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand() {
+          throw new Error('synthetic sandbox build failure')
+        },
+      },
+    })
+
+    try {
+      await expect(
+        wrapped.execute('c', { command: 'echo original' }, undefined, undefined, {} as never),
+      ).rejects.toThrow(/synthetic sandbox build failure/)
+      expect(cleanups).toBe(1)
+      expect(
+        await stat(source).then(
+          () => true,
+          () => false,
+        ),
+      ).toBe(false)
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+      await rm(source, { recursive: true, force: true })
+    }
+  })
+
+  test('remediation retry gets a fresh preparation and cleans each attempt once', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-deferred-retry-'))
+    const registry = new RemediationRegistry()
+    registry.register('bash-command-not-found', async () => ({ repaired: true }))
+    const sources: string[] = []
+    const cleanupCounts: number[] = []
+    const hooks = createHookBus()
+    hooks.registerAll('preparer', agentDir, noopLogger, {
+      'tool.before': (event) => {
+        ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_PREPARE] = async () => {
+          const source = await mkdtemp(path.join(tmpdir(), 'typeclaw-deferred-retry-source-'))
+          const index = sources.push(source) - 1
+          cleanupCounts[index] = 0
+          return {
+            command: 'opensoma --version',
+            mount: { type: 'ro-bind' as const, source, dest: `/tmp/isolated-${index}` },
+            cleanup: async () => {
+              cleanupCounts[index] = (cleanupCounts[index] ?? 0) + 1
+              await rm(source, { recursive: true, force: true })
+            },
+          }
+        }
+      },
+    })
+    let attempts = 0
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      if (attempts === 1) throw new Error('/bin/bash: opensoma: command not found\n\nCommand exited with code 127')
+      return { content: [{ type: 'text' as const, text: 'retried' }], details: undefined }
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'deferred-retry',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: registry,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand(command, options) {
+          if (options === undefined) throw new Error('sandbox options missing')
+          return { ...buildSandboxedCommand(command, options), commandString: command }
+        },
+      },
+    })
+
+    try {
+      expect(
+        textOfFirstContent(
+          await wrapped.execute('c', { command: 'opensoma --version' }, undefined, undefined, {} as never),
+        ),
+      ).toBe('retried')
+      expect(attempts).toBe(2)
+      expect(sources).toHaveLength(2)
+      expect(new Set(sources).size).toBe(2)
+      expect(cleanupCounts).toEqual([1, 1])
+      for (const source of sources) {
+        expect(
+          await stat(source).then(
+            () => true,
+            () => false,
+          ),
+        ).toBe(false)
+      }
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+      for (const source of sources) await rm(source, { recursive: true, force: true })
+    }
+  })
+
+  test('a cleanup failure prevents remediation retry and surfaces the cleanup error', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-deferred-cleanup-failure-'))
+    const registry = new RemediationRegistry()
+    registry.register('bash-command-not-found', async () => ({ repaired: true }))
+    let attempts = 0
+    let cleanups = 0
+    const hooks = createHookBus()
+    hooks.registerAll('preparer', agentDir, noopLogger, {
+      'tool.before': (event) => {
+        ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_PREPARE] = async () => ({
+          command: 'opensoma --version',
+          mount: { type: 'ro-bind' as const, source: agentDir, dest: '/tmp/isolated' },
+          cleanup: async () => {
+            cleanups += 1
+            throw new Error('synthetic deferred cleanup failure')
+          },
+        })
+      },
+    })
+    const tool = fakeBash({})
+    tool.execute = async () => {
+      attempts += 1
+      throw new Error('/bin/bash: opensoma: command not found\n\nCommand exited with code 127')
+    }
+    const wrapped = wrapBuiltinToolDefinition(tool, {
+      agentDir,
+      sessionId: 'deferred-cleanup-failure',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: registry,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        buildCommand(command, options) {
+          if (options === undefined) throw new Error('sandbox options missing')
+          return { ...buildSandboxedCommand(command, options), commandString: command }
+        },
+      },
+    })
+
+    try {
+      await expect(
+        wrapped.execute('c', { command: 'opensoma --version' }, undefined, undefined, {} as never),
+      ).rejects.toThrow(/synthetic deferred cleanup failure/)
+      expect(attempts).toBe(1)
+      expect(cleanups).toBe(1)
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('loop guard blocks before creating a fifth deferred preparation', async () => {
+    let preparations = 0
+    const hooks = createHookBus()
+    hooks.registerAll('preparer', '/agent', noopLogger, {
+      'tool.before': (event) => {
+        ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_PREPARE] = async () => {
+          preparations += 1
+          throw new Error('preparation should not run')
+        }
+      },
+    })
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir: '/agent',
+      sessionId: 'deferred-loop',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashPolicy: { kind: 'readonly-reviewer' },
+    })
+
+    for (let i = 0; i < 4; i++) {
+      await expect(
+        wrapped.execute(`c${i}`, { command: 'git push origin HEAD' }, undefined, undefined, {} as never),
+      ).rejects.toThrow()
+    }
+    await expect(
+      wrapped.execute('c5', { command: 'git push origin HEAD' }, undefined, undefined, {} as never),
+    ).rejects.toThrow(/loop-guard/)
+    expect(preparations).toBe(0)
+  })
+
+  test('final write guard blocks before deferred preparation for a non-bash tool', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-deferred-final-'))
+    const configPath = path.join(agentDir, 'typeclaw.json')
+    await writeFile(configPath, '{"models":{"default":"anthropic/claude-haiku-4-5"}}\n')
+    let preparations = 0
+    const hooks = createHookBus()
+    hooks.registerAll('preparer', agentDir, noopLogger, {
+      'tool.before': (event) => {
+        ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_PREPARE] = async () => {
+          preparations += 1
+          throw new Error('preparation should not run')
+        }
+      },
+    })
+    const editTool = {
+      name: 'edit',
+      label: 'edit',
+      description: '',
+      parameters: Type.Object({
+        path: Type.String(),
+        edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() })),
+      }),
+      async execute() {
+        throw new Error('underlying edit should not run')
+      },
+    }
+    const wrapped = wrapBuiltinToolDefinition(editTool, { agentDir, sessionId: 'deferred-final', hooks })
+
+    try {
+      await expect(
+        wrapped.execute(
+          'c',
+          { path: configPath, edits: [{ oldText: 'anthropic/claude-haiku-4-5', newText: 'invalid' }] },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toThrow(/blocked/i)
+      expect(preparations).toBe(0)
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
   })
 
   test('a hook-set env withhold removes an ambient name from sandbox inherit and spawn env', async () => {
