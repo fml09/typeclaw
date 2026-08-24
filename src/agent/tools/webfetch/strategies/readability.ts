@@ -2,7 +2,7 @@ import type { Readability as ReadabilityClass } from '@mozilla/readability'
 import type TurndownService from 'turndown'
 
 import { walkHtmlLexically } from '../html-lexical'
-import { classifyRawInlineStyleVisibility } from '../inline-style-visibility'
+import { classifyRawInlineStyleVisibility, VISIBILITY_PROPERTIES } from '../inline-style-visibility'
 
 // Perf: jsdom (+readability+turndown) costs ~40-60MB RSS at import time. Keep it
 // lazy so idle agents that never call web_fetch don't pay for it. Do NOT hoist to
@@ -180,7 +180,7 @@ function countRawCssRules(source: string): { rules: number; selectorComponents: 
   return { rules, selectorComponents }
 }
 
-function buildComputedStyleResolver(
+export function buildComputedStyleResolver(
   document: Document,
   resolve: (element: Element) => CSSStyleDeclaration,
 ): ((element: Element) => CSSStyleDeclaration) | undefined {
@@ -206,7 +206,52 @@ function buildComputedStyleResolver(
   if (selectorComponentCount * elementCount > MAX_COMPUTED_STYLE_WORK) {
     throw new Error('Embedded stylesheet complexity limit exceeded')
   }
-  return resolve
+  reduceToVisibilityDeclarations(styles)
+  return (element) => {
+    reduceInlineStyleToVisibilityDeclarations(element)
+    return resolve(element)
+  }
+}
+
+// getComputedStyle resolves the WHOLE declaration, but pruneHiddenContent reads
+// only VISIBILITY_PROPERTIES. Everything else is computed at our expense and at
+// our risk, so it is deleted from the CSSOM before the first resolve.
+//
+// Load-bearing, not a micro-optimization: this is the fix for an OOM that killed
+// a live agent. jsdom 29.0.2 allocates ~27GB and burns ~11s inside a SINGLE
+// getComputedStyle() call while reconciling a `border` shorthand against a
+// `border-bottom` longhand (living/css/helpers/shorthand-properties.js), then
+// throws a TypeError. The triggering CSS is ubiquitous rather than hostile: a
+// reset (`span { border: 0 }`) plus a component rule that omits the border
+// colour (`.x { border-bottom: 1px solid }`), as every Emotion/MUI page emits.
+// A 236KB page with 545 elements was enough to exhaust a 16GB host.
+//
+// Nothing upstream can catch it. The allocation is SYNCHRONOUS, so the request
+// AbortSignal and the 30s timeout never get a turn, and the try/catch in
+// isHiddenElement catches the TypeError only after the memory is committed. The
+// complexity budgets above bound the QUANTITY of CSS work, so a single
+// pathological declaration on a small page passes all of them.
+//
+// Deleting declarations rather than hand-rolling a cascade keeps jsdom
+// authoritative for specificity, inheritance, and !important on the properties
+// actually read, so pruning behaviour is unchanged. It also generalises: a
+// future jsdom blowup in any property never read here is now unreachable.
+// Only the CSSOM is edited — <style> textContent is untouched, so the budgets
+// above still measure the original stylesheet.
+export function reduceToVisibilityDeclarations(styles: HTMLStyleElement[]): void {
+  let budget = MAX_EMBEDDED_STYLE_RULES
+  const visit = (rules: CSSRuleList): void => {
+    for (const rule of Array.from(rules)) {
+      if (budget-- <= 0) return
+      if ('cssRules' in rule) visit((rule as CSSGroupingRule).cssRules)
+      const { style } = rule as CSSStyleRule
+      if (!style) continue
+      removeUnreadDeclarations(style)
+    }
+  }
+  for (const style of styles) {
+    if (style.sheet !== null) visit(style.sheet.cssRules)
+  }
 }
 
 function countCssRules(rules: CSSRuleList): { rules: number; selectorComponents: number } {
@@ -273,14 +318,61 @@ function countVisibleTextCharacters(body: HTMLElement | null): number {
   return Array.from(normalizeVisibleText(body.textContent ?? '')).length
 }
 
-function pruneHiddenContent(
+export function pruneHiddenContent(
   document: Document,
   computedStyle: ((element: Element) => CSSStyleDeclaration) | undefined,
 ): void {
   for (const details of document.querySelectorAll('details:not([open])')) pruneClosedDetails(details)
 
-  for (const element of document.querySelectorAll('*')) {
-    if (isHiddenElement(element, computedStyle)) element.remove()
+  const elements = Array.from(document.querySelectorAll('*'))
+  // Three passes, because reducing an element's inline style has to happen
+  // after the checks that read the declarations it removes, but before ANY
+  // element resolves a computed style.
+  //
+  // A single interleaved pass cannot satisfy both. querySelectorAll returns a
+  // STATIC list, so a descendant is still visited after its ancestor is
+  // removed, and jsdom resolves inherited properties by walking parentElement
+  // into that removed ancestor. An ancestor pruned by `hidden`, aria-hidden or
+  // the offscreen test returns before the resolver ever touches it, so it would
+  // still be carrying its full inline declaration when the descendant reaches
+  // it — the OOM route again, one level up.
+  const staticallyHidden = new Set<Element>()
+  for (const element of elements) {
+    if (isStaticallyHiddenElement(element)) staticallyHidden.add(element)
+  }
+  for (const element of elements) reduceInlineStyleToVisibilityDeclarations(element)
+  for (const element of elements) {
+    if (staticallyHidden.has(element) || isComputedHiddenElement(element, computedStyle)) element.remove()
+  }
+}
+
+// The inline style attribute is the second way a declaration reaches the
+// cascade, so reducing stylesheets alone leaves the same OOM reachable via
+// style="border:0;border-bottom:1px solid". See reduceToVisibilityDeclarations
+// for the mechanism.
+//
+// This runs inside the resolver rather than at a call site so the invariant
+// holds for every caller: an element cannot reach getComputedStyle carrying a
+// declaration outside VISIBILITY_PROPERTIES. It is safe to reduce this late
+// because the callers that need the removed declarations read them WITHOUT the
+// resolver — classifyRawInlineStyleVisibility parses the raw attribute text and
+// the offscreen test reads position/left/top off element.style, both before
+// isHiddenElement resolves anything.
+function reduceInlineStyleToVisibilityDeclarations(element: Element): void {
+  if (!('style' in element)) return
+  removeUnreadDeclarations((element as HTMLElement).style)
+}
+
+// Custom properties are retained even though they are not read directly: a
+// retained declaration can be written `opacity: var(--hidden)`, and dropping
+// the `--hidden` definition would silently un-hide content this guard exists to
+// prune. They are safe to keep because a custom property is stored as an
+// unparsed token sequence — it never enters the shorthand expansion that makes
+// ordinary properties dangerous.
+function removeUnreadDeclarations(style: CSSStyleDeclaration): void {
+  for (const property of Array.from(style)) {
+    if (property.startsWith('--')) continue
+    if (!VISIBILITY_PROPERTIES.has(property.toLocaleLowerCase())) style.removeProperty(property)
   }
 }
 
@@ -291,10 +383,10 @@ function pruneClosedDetails(details: Element): void {
   }
 }
 
-function isHiddenElement(
-  element: Element,
-  computedStyle: ((element: Element) => CSSStyleDeclaration) | undefined,
-): boolean {
+// Everything decidable from attributes and the element's own inline style, so
+// it stays readable before reduceInlineStyleToVisibilityDeclarations strips the
+// declarations these checks consume.
+function isStaticallyHiddenElement(element: Element): boolean {
   if (element.hasAttribute('hidden')) return true
   if (element.getAttribute('aria-hidden')?.toLocaleLowerCase() === 'true') return true
   if (element.tagName === 'INPUT' && element.getAttribute('type')?.toLocaleLowerCase() === 'hidden') return true
@@ -308,6 +400,13 @@ function isHiddenElement(
     if ((position === 'absolute' || position === 'fixed') && (isFarOffscreen(left) || isFarOffscreen(top))) return true
   }
 
+  return false
+}
+
+function isComputedHiddenElement(
+  element: Element,
+  computedStyle: ((element: Element) => CSSStyleDeclaration) | undefined,
+): boolean {
   if (computedStyle === undefined || NON_CONTENT_ELEMENTS.has(element.tagName)) return false
   let resolved: CSSStyleDeclaration
   try {
