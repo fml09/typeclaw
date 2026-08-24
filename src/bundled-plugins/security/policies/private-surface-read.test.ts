@@ -540,6 +540,10 @@ describe('private-surface-read guard — traversal + scope', () => {
     )
     expect(check('read', { path: '/home/agent/.codex/auth.json' }, privilegedHidden)?.block).toBe(true)
     expect(check('read', { path: '/home/agent/.claude/.credentials.json' }, privilegedHidden)?.block).toBe(true)
+    expect(check('read', { path: '/home/agent/.config/gh/hosts.yml' }, privilegedHidden)?.block).toBe(true)
+    expect(check('read', { path: path.join(homedir(), '.config', 'gh', 'hosts.yml') }, privilegedHidden)?.block).toBe(
+      true,
+    )
     expect(
       check('read', { path: path.join(homedir(), '.config', 'agent-messenger', 'credentials.json') }, privilegedHidden)
         ?.block,

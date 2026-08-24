@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
@@ -166,6 +166,7 @@ const deterministicAllocator = async (preferred: number): Promise<number> => (pr
 const noEnsureDeps = async (): Promise<{ ok: true; installed: false }> => ({ ok: true, installed: false })
 const noEnsureModels = async (): Promise<void> => {}
 const noArchiveLogs = async () => ({ ok: true as const, status: 'archived' as const, path: '/archive.log' })
+const noGithubCliProvision = () => ({ ok: true as const })
 
 // The real autoUpgrade detector sees the test runner itself as a LOCAL typeclaw
 // checkout and would relink each agent's package.json — disruptive to tests that
@@ -181,6 +182,7 @@ const bypassVerify = {
   verifyRunning: async () => ({ ok: true as const }),
   ensureModels: noEnsureModels,
   archiveLogs: noArchiveLogs,
+  provisionGithubCliStore: noGithubCliProvision,
 }
 
 function labelValue(runArgs: string[], key: string): string | undefined {
@@ -1746,7 +1748,18 @@ describe('start (composition)', () => {
       exec,
       operationLock,
       allocatePort: deterministicAllocator,
-      ensureDeps: noEnsureDeps,
+      assertConfigWritable: () => {
+        events.push('config-writable')
+      },
+      provisionGithubCliStore: ({ agentDir }) => {
+        expect(agentDir).toBe(root)
+        events.push('github-cli')
+        return { ok: true }
+      },
+      ensureDeps: async () => {
+        events.push('ensure-deps')
+        return { ok: true, installed: false }
+      },
       ensureModels: noEnsureModels,
       autoUpgrade: noAutoUpgrade,
       verifyRunning: async () => {
@@ -1756,7 +1769,17 @@ describe('start (composition)', () => {
     })
 
     expect(result.ok).toBe(true)
-    expect(events).toEqual(['lock-enter', 'inspect', 'migration', 'docker-run', 'verify', 'lock-exit'])
+    expect(events).toEqual([
+      'lock-enter',
+      'inspect',
+      'config-writable',
+      'github-cli',
+      'ensure-deps',
+      'migration',
+      'docker-run',
+      'verify',
+      'lock-exit',
+    ])
   })
 
   test('contention prevents Docker and agent-messenger migration side effects', async () => {
@@ -1996,6 +2019,74 @@ describe('start (composition)', () => {
     })
     expect(await readFile(join(root, '.gitignore'), 'utf8')).toBe('# stale\n')
     expect(calls.some((call) => call.args[0] === 'run')).toBe(false)
+  })
+
+  test('warns and continues without replacing persisted GitHub CLI credentials when refresh fails', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const persisted = '{"githubCli":{"hosts":"existing-good-store"}}\n'
+    await writeFile(join(root, 'secrets.json'), persisted)
+    const { exec, calls } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+    try {
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+        provisionGithubCliStore: () => ({ ok: false, reason: 'sensitive-command-output' }),
+      })
+
+      expect(result.ok).toBe(true)
+      expect(calls.some((call) => call.args[0] === 'run')).toBe(true)
+      expect(await readFile(join(root, 'secrets.json'), 'utf8')).toBe(persisted)
+      const warning = stderr.mock.calls.map(([chunk]) => String(chunk)).join('')
+      expect(warning).toContain('warning')
+      expect(warning).toContain('gh auth login --hostname github.com')
+      expect(warning).toContain('Keeping the previously persisted credential store')
+      expect(warning).not.toContain('sensitive-command-output')
+    } finally {
+      stderr.mockRestore()
+    }
+  })
+
+  test('passes the canonical agent root and configured writable mount roots to GitHub CLI refresh', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const writableMount = join(root, 'host-mounts', 'writable')
+    const readOnlyMount = join(root, 'host-mounts', 'readonly')
+    await mkdir(writableMount, { recursive: true })
+    await mkdir(readOnlyMount, { recursive: true })
+    await writeTypeclawConfig(root, {
+      mounts: [
+        { name: 'writable', path: writableMount },
+        { name: 'readonly', path: readOnlyMount, readOnly: true },
+      ],
+    })
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    let deniedRoots: readonly string[] | undefined
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      provisionGithubCliStore: (options) => {
+        deniedRoots = options.deniedRoots
+        return { ok: true }
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(deniedRoots).toEqual([realpathSync(root), writableMount])
+    expect(deniedRoots).not.toContain(readOnlyMount)
   })
 
   test('provisions embedding models on every fresh start', async () => {
@@ -2694,6 +2785,7 @@ describe('start (composition)', () => {
       allocatePort: deterministicAllocator,
       ensureDeps: async () => ({ ok: false, reason: 'lockfile permission denied' }),
       ensureModels: noEnsureModels,
+      provisionGithubCliStore: noGithubCliProvision,
       autoUpgrade: noAutoUpgrade,
     })
 
@@ -3350,6 +3442,7 @@ describe('start (composition)', () => {
       imageExists: true,
       container: { exists: true, running: true },
     })
+    let githubCliProvisionCalls = 0
 
     // when
     const result = await start({
@@ -3360,6 +3453,10 @@ describe('start (composition)', () => {
       ensureDeps: noEnsureDeps,
       autoUpgrade: noAutoUpgrade,
       ...bypassVerify,
+      provisionGithubCliStore: () => {
+        githubCliProvisionCalls += 1
+        return { ok: true }
+      },
     })
 
     // then: success with alreadyRunning=true, no docker side effects, no template churn
@@ -3369,6 +3466,7 @@ describe('start (composition)', () => {
     expect(result.built).toBe(false)
     expect(result.hostPort).toBe(8973)
     expect(result.containerId).toBe('fake-running-id-123456')
+    expect(githubCliProvisionCalls).toBe(0)
     expect(calls.find((c) => c.args[0] === 'run')).toBeUndefined()
     expect(calls.find((c) => c.args[0] === 'rm')).toBeUndefined()
     expect(calls.find((c) => isBuildCall(c.args))).toBeUndefined()
@@ -4485,6 +4583,7 @@ describe('start (post-run verification composition)', () => {
         reuseCurrentHostDaemon: true,
         ensureDeps: noEnsureDeps,
         ensureModels: noEnsureModels,
+        provisionGithubCliStore: noGithubCliProvision,
         autoUpgrade: noAutoUpgrade,
         verifyRunning: async () => ({
           ok: false,
@@ -4519,6 +4618,7 @@ describe('start (post-run verification composition)', () => {
       allocatePort: deterministicAllocator,
       ensureDeps: noEnsureDeps,
       ensureModels: noEnsureModels,
+      provisionGithubCliStore: noGithubCliProvision,
       autoUpgrade: noAutoUpgrade,
       verifyRunning: async () => {
         const runIdx = calls.findIndex((c) => c.args[0] === 'run')
@@ -4549,6 +4649,7 @@ describe('start (post-run verification composition)', () => {
       allocatePort: deterministicAllocator,
       ensureDeps: noEnsureDeps,
       ensureModels: noEnsureModels,
+      provisionGithubCliStore: noGithubCliProvision,
       autoUpgrade: noAutoUpgrade,
       verifyRunning: async () => {
         verifierCalled = true
@@ -4675,6 +4776,7 @@ describe('start autoUpgrade integration', () => {
       autoUpgrade: async () => ({ kind: 'reinstall-needed', from: '0.1.0', to: '0.1.2' }),
       forceBunUpdate: async () => ({ ok: false, reason: 'registry timeout' }),
       ensureModels: noEnsureModels,
+      provisionGithubCliStore: noGithubCliProvision,
     })
 
     expect(result.ok).toBe(false)

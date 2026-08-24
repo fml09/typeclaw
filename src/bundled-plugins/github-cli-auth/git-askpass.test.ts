@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { isWindows } from '@/shared'
 
 import { ensureGitAskPassHelper, resetGitAskPassHelperForTests } from './git-askpass'
+import { buildGitCredentialEnv, type GitRepoCredential } from './git-credential-env'
 
 const onWindows = isWindows()
 
@@ -109,12 +110,19 @@ describe.skipIf(onWindows)('ensureGitAskPassHelper', () => {
 
 // POSIX shell helper, #899.
 describe.skipIf(onWindows)('ensureGitAskPassHelper — host-scoped behavior (executed)', () => {
-  async function run(promptArg: string): Promise<{ code: number; out: string }> {
+  async function run(
+    promptArg: string,
+    credentials?: readonly GitRepoCredential[],
+  ): Promise<{ code: number; out: string }> {
     const path = await tmpHelperPath()
     await ensureGitAskPassHelper(path)
     const proc = Bun.spawn({
       cmd: [path, promptArg],
-      env: { TYPECLAW_GIT_TOKEN: 'ghs_secret_token' },
+      env: {
+        ...(credentials === undefined
+          ? { TYPECLAW_GIT_TOKEN: 'test-installation-token' }
+          : buildGitCredentialEnv(credentials, path)),
+      },
       stdout: 'pipe',
       stderr: 'ignore',
     })
@@ -126,7 +134,7 @@ describe.skipIf(onWindows)('ensureGitAskPassHelper — host-scoped behavior (exe
   test('emits the token for a github.com password prompt', async () => {
     const { code, out } = await run("Password for 'https://github.com': ")
     expect(code).toBe(0)
-    expect(out).toBe('ghs_secret_token')
+    expect(out).toBe('test-installation-token')
   })
 
   test('emits x-access-token for a github.com username prompt', async () => {
@@ -143,7 +151,7 @@ describe.skipIf(onWindows)('ensureGitAskPassHelper — host-scoped behavior (exe
   test('emits the token for the userinfo-host password prompt git sends after the username', async () => {
     const { code, out } = await run("Password for 'https://x-access-token@github.com': ")
     expect(code).toBe(0)
-    expect(out).toBe('ghs_secret_token')
+    expect(out).toBe('test-installation-token')
   })
 
   test('is not fooled by a userinfo prompt whose host is a suffix lookalike', async () => {
@@ -172,5 +180,29 @@ describe.skipIf(onWindows)('ensureGitAskPassHelper — host-scoped behavior (exe
   test('is not fooled by a suffix lookalike host (github.com.evil)', async () => {
     const { out } = await run("Password for 'https://github.com.evil.test': ")
     expect(out).toBe('')
+  })
+
+  test('repository-bound mode emits a token only for the exact github.com repository path', async () => {
+    const credentials = [{ repoSlug: 'acme/widgets', token: 'test-installation-token' }]
+    expect((await run("Password for 'https://github.com/ACME/Widgets.git': ", credentials)).out).toBe(
+      'test-installation-token',
+    )
+    expect((await run("Password for 'https://github.com/acme/other.git': ", credentials)).out).toBe('')
+    expect((await run("Password for 'https://github.com/acme/widgets/extra': ", credentials)).out).toBe('')
+    expect((await run("Password for 'https://gitlab.com/acme/widgets.git': ", credentials)).out).toBe('')
+    expect((await run("Password for 'https://github.com': ", credentials)).out).toBe('')
+  })
+
+  test('repository-token map selects only the exact listed destination and rejects a third repo', async () => {
+    const credentials = [
+      { repoSlug: 'acme/widgets', token: 'test-token-one' },
+      { repoSlug: 'other/tools', token: 'test-token-two' },
+    ]
+
+    expect((await run("Password for 'https://github.com/acme/widgets.git': ", credentials)).out).toBe('test-token-one')
+    expect((await run("Password for 'https://x-access-token@github.com/OTHER/TOOLS': ", credentials)).out).toBe(
+      'test-token-two',
+    )
+    expect((await run("Password for 'https://github.com/acme/unlisted.git': ", credentials)).out).toBe('')
   })
 })

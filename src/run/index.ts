@@ -69,6 +69,7 @@ import { createClaimController } from '@/role-claim'
 import {
   exportClaudeCredentialsFileForAgent,
   exportCodexAuthFileForAgent,
+  exportGithubCliStoreForAgent,
   hydrateChannelEnvFromSecrets,
   refreshProviderOAuthForAgent,
 } from '@/secrets'
@@ -130,6 +131,7 @@ export type StartAgentOptions = {
   // observe secrets only after the awaited provider-OAuth refresh settles.
   exportCodexAuthFile?: typeof exportCodexAuthFileForAgent
   exportClaudeCredentialsFile?: typeof exportClaudeCredentialsFileForAgent
+  exportGithubCliStore?: typeof exportGithubCliStoreForAgent
   // Boot-time proactive provider-OAuth refresh. Injectable so a test can supply
   // a refresh that holds the real secrets lock on a gate, proving the boot
   // barrier settles this before any session-producing consumer starts.
@@ -196,6 +198,7 @@ async function startAgentRuntime(
     caps = createRuntimeCapabilities(process.env, join(cwd, 'secrets.json')),
     exportCodexAuthFile = exportCodexAuthFileForAgent,
     exportClaudeCredentialsFile = exportClaudeCredentialsFileForAgent,
+    exportGithubCliStore = exportGithubCliStoreForAgent,
     refreshProviderOAuth = refreshProviderOAuthForAgent,
   }: StartAgentOptions,
   registerBootCleanup: (cleanup: () => void | Promise<void>) => void,
@@ -424,6 +427,17 @@ async function startAgentRuntime(
     claudeCodeEnabled: cwdConfig.docker.file.claudeCode,
     log: (message) => console.warn(message),
   })
+
+  const githubCliExport = exportGithubCliStore({
+    agentDir: cwd,
+    log: (message) => console.warn(message),
+  })
+  if (githubCliExport.action === 'failed') {
+    console.warn(
+      '[run] trusted GitHub CLI store unavailable; store-backed GitHub pushes will not authenticate. ' +
+        'On the host, run `gh auth login --hostname github.com`, then run a real `typeclaw restart`.',
+    )
+  }
 
   const claimController = createClaimController({
     cwd,

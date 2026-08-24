@@ -75,6 +75,7 @@ import {
   SandboxPolicyError,
   SandboxDegradedProcError,
   SandboxProcProbeUnverifiedError,
+  type SandboxMount,
   type DependencyBinReconciliation,
   subtractMasked,
   verifyHiddenMaskTargets,
@@ -110,9 +111,17 @@ let sharedLoopGuard: LoopGuard = createLoopGuard()
 // hooks can set it.
 export const TYPECLAW_INTERNAL_BASH_ENV = '__typeclawBashEnv'
 export const TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV = '__typeclawBashWithholdEnv'
+export const TYPECLAW_INTERNAL_BASH_PREPARE = '__typeclawBashPrepare'
 
 type BashEnvOverlay = Record<string, string>
 type BashEnvWithhold = string[]
+export type DeferredBashPreparationResult = {
+  command: string
+  env?: Record<string, string>
+  mount: Extract<SandboxMount, { type: 'ro-bind' }>
+  cleanup: () => Promise<void>
+}
+export type DeferredBashPreparation = () => Promise<DeferredBashPreparationResult>
 const SECRET_BASH_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN'])
 
 // Transport classifier for the TRUSTED hook-injected overlay only (e.g.
@@ -152,6 +161,11 @@ function readBashEnvWithhold(args: Record<string, unknown>): BashEnvWithhold | u
   if (!Array.isArray(raw) || !raw.every((name) => typeof name === 'string')) return undefined
   const names = [...new Set(raw)]
   return names.length > 0 ? names : undefined
+}
+
+function readBashPreparation(args: Record<string, unknown>): DeferredBashPreparation | undefined {
+  const raw = args[TYPECLAW_INTERNAL_BASH_PREPARE]
+  return typeof raw === 'function' ? (raw as DeferredBashPreparation) : undefined
 }
 
 function bashSpawnHookWithOverlay(context: BashSpawnContext): BashSpawnContext {
@@ -604,6 +618,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       // hooks run so only trusted tool.before hooks can set them.
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_PREPARE]
       const blockResult = await opts.hooks.runToolBefore({
         tool: tool.name,
         sessionId: opts.sessionId,
@@ -620,8 +635,10 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       // loop-detection state, or pi's execute.
       const bashEnvOverlay = readBashEnvOverlay(mutableArgs)
       const bashEnvWithhold = readBashEnvWithhold(mutableArgs)
+      const bashPreparation = readBashPreparation(mutableArgs)
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_PREPARE]
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
         fireLoopAbort(opts.getAbort, 'loop_guard:block')
@@ -685,6 +702,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               opts.sessionId,
               bashEnvOverlay,
               bashEnvWithhold,
+              bashPreparation,
               sandboxBoundary,
             )
           }
@@ -747,7 +765,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       // no-op for every message/tool outside the allowlist, so abort, sandbox,
       // and policy errors pass through untouched. Mutating the message in place
       // preserves the error's subclass and stack for the rethrow.
-      if (executionError instanceof Error && signal?.aborted !== true) {
+      if (cleanupError === undefined && executionError instanceof Error && signal?.aborted !== true) {
         executionError.message = remediateToolErrorMessage(tool.name, executionError.message)
         const incidentFact = classifyToolOutcome({ tool: tool.name, error: executionError })
         if (incidentFact !== null) {
@@ -790,7 +808,13 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
           }
         }
       }
-      let finalError = executionError ?? cleanupError
+      let finalError =
+        executionError !== undefined && cleanupError !== undefined
+          ? new Error(
+              `${executionError instanceof Error ? executionError.message : String(executionError)}\n\n` +
+                `Cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+            )
+          : (executionError ?? cleanupError)
       if (finalError !== undefined) {
         // The builtin reports command failures as execution errors rather than
         // result details. Once the sandbox was prepared, annotate every such
@@ -914,10 +938,11 @@ async function applyBashSandbox(
   sessionId: string,
   envOverlay: BashEnvOverlay | undefined,
   envWithhold: BashEnvWithhold | undefined,
+  deferredPreparation: DeferredBashPreparation | undefined,
   boundary: BashSandboxBoundary,
 ): Promise<PreparedBashSandbox> {
-  const command = mutableArgs.command
-  if (typeof command !== 'string') {
+  const originalCommand = mutableArgs.command
+  if (typeof originalCommand !== 'string') {
     return {
       verify: async () => {},
       cleanup: async () => {},
@@ -925,44 +950,57 @@ async function applyBashSandbox(
     }
   }
 
-  const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
-  const envNames = resolveExposableBashEnvNames(agentDir)
-  const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, envOverlay)
-  const effectiveEnvWithhold = (envWithhold ?? []).filter((name) => !Object.hasOwn(sandboxEnvOverlay ?? {}, name))
-  const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
-  await boundary.ensureAvailable()
-  const sessionTmp = await ensureSessionTmpDir(sessionId)
-  const dependencyBins = await reconcileDependencyBinWrappers({ agentDir, sessionTmp })
-  const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
-    dirs,
-    files,
-  })
-  const writableRoot = canWriteAgentRootInSandbox(permissions, origin)
-  const baseProtectedZones =
-    writableRoot || writable.dirs.includes(join(agentDir, '.git'))
-      ? subtractMasked(await resolveProtectedZones(agentDir), { dirs, files })
-      : { dirs: [], files: [] }
-  const protectedZones = {
-    dirs: baseProtectedZones.dirs,
-    files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles])],
+  let preparation: DeferredBashPreparationResult | undefined
+  let privilegedRuntime: Awaited<ReturnType<typeof resolvePrivilegedSandboxRuntime>> | undefined
+  const cleanup = async (): Promise<void> => {
+    const tasks: Promise<void>[] = []
+    if (privilegedRuntime !== undefined) {
+      tasks.push((boundary.cleanupRuntime ?? cleanupPrivilegedSandboxRuntime)(privilegedRuntime))
+    }
+    if (preparation !== undefined) tasks.push(preparation.cleanup())
+    const outcomes = await Promise.allSettled(tasks)
+    const failure = outcomes.find((outcome) => outcome.status === 'rejected')
+    if (failure?.status === 'rejected') throw failure.reason
   }
-  const writableDirSet = new Set(writable.dirs)
-  const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'
-  const symlinks = resolveSandboxSymlinks(agentDir, config.sandbox.symlinks, sandboxHome).filter((op) =>
-    writableDirSet.has(op.target),
-  )
-  const { strategy: proc, degradeReason } = await resolveProcStrategy()
-  if (proc === 'tmpfs' && commandNeedsRealProc(command)) {
-    throw degradeReason === 'unverified' ? new SandboxProcProbeUnverifiedError() : new SandboxDegradedProcError()
-  }
-  const privilegedRuntime = await (boundary.resolveRuntime ?? resolvePrivilegedSandboxRuntime)({
-    agentDir,
-    command,
-    env: sandboxEnvOverlay,
-  })
-  const cleanup = async (): Promise<void> =>
-    (boundary.cleanupRuntime ?? cleanupPrivilegedSandboxRuntime)(privilegedRuntime)
   try {
+    preparation = await deferredPreparation?.()
+    const command = preparation?.command ?? originalCommand
+    const preparedEnvOverlay = preparation?.env === undefined ? envOverlay : { ...envOverlay, ...preparation.env }
+    const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
+    const envNames = resolveExposableBashEnvNames(agentDir)
+    const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, preparedEnvOverlay)
+    const effectiveEnvWithhold = (envWithhold ?? []).filter((name) => !Object.hasOwn(sandboxEnvOverlay ?? {}, name))
+    const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
+    await boundary.ensureAvailable()
+    const sessionTmp = await ensureSessionTmpDir(sessionId)
+    const dependencyBins = await reconcileDependencyBinWrappers({ agentDir, sessionTmp })
+    const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
+      dirs,
+      files,
+    })
+    const writableRoot = canWriteAgentRootInSandbox(permissions, origin)
+    const baseProtectedZones =
+      writableRoot || writable.dirs.includes(join(agentDir, '.git'))
+        ? subtractMasked(await resolveProtectedZones(agentDir), { dirs, files })
+        : { dirs: [], files: [] }
+    const protectedZones = {
+      dirs: baseProtectedZones.dirs,
+      files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles])],
+    }
+    const writableDirSet = new Set(writable.dirs)
+    const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'
+    const symlinks = resolveSandboxSymlinks(agentDir, config.sandbox.symlinks, sandboxHome).filter((op) =>
+      writableDirSet.has(op.target),
+    )
+    const { strategy: proc, degradeReason } = await resolveProcStrategy()
+    if (proc === 'tmpfs' && commandNeedsRealProc(command)) {
+      throw degradeReason === 'unverified' ? new SandboxProcProbeUnverifiedError() : new SandboxDegradedProcError()
+    }
+    privilegedRuntime = await (boundary.resolveRuntime ?? resolvePrivilegedSandboxRuntime)({
+      agentDir,
+      command,
+      env: sandboxEnvOverlay,
+    })
     await verifyHiddenMaskTargets(maskTargets)
     const { commandString, spawnEnv } = boundary.buildCommand(command, {
       mounts: [
@@ -973,6 +1011,7 @@ async function applyBashSandbox(
         // read-only without adding any broader filesystem exposure.
         { type: 'ro-bind', source: dependencyBins.wrapperDir, dest: DEPENDENCY_BIN_SANDBOX_DIR },
         ...(privilegedRuntime?.mounts ?? []),
+        ...(preparation === undefined ? [] : [preparation.mount]),
       ],
       ...(writableRoot
         ? { writableRoot: { dir: agentDir }, masks: maskTargets, protected: protectedZones }
@@ -993,8 +1032,9 @@ async function applyBashSandbox(
     // to complete the exact bwrap-parent env.
     const mergedSpawnEnv =
       spawnEnv !== undefined && sandboxEnvOverlay !== undefined ? { ...spawnEnv, ...sandboxEnvOverlay } : spawnEnv
+    const runtimeForResult = privilegedRuntime
     return {
-      verify: async () => (boundary.verifyRuntime ?? verifyPrivilegedSandboxRuntime)(privilegedRuntime),
+      verify: async () => (boundary.verifyRuntime ?? verifyPrivilegedSandboxRuntime)(runtimeForResult),
       cleanup,
       spawnEnv: mergedSpawnEnv,
       dependencyBins,
