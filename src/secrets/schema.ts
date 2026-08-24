@@ -32,6 +32,8 @@ export const mcpCredentialSchema = z
 
 export const mcpSliceSchema = z.record(z.string(), mcpCredentialSchema)
 
+export const githubCliSecretsSchema = z.object({ hosts: z.string().min(1) }).strict()
+
 // Per-adapter channel slots use named fields (`botToken`, `appToken`, `token`)
 // instead of env-var-name keys. The Secret union per field carries the env-var
 // override. Unknown adapter ids pass through via catchall so a future
@@ -259,18 +261,22 @@ export const channelsSchema = z
 // channel field shapes.
 export const SECRETS_FILE_VERSION = 2
 
-export const secretsFileSchema = z.object({
-  $schema: z.string().optional(),
-  version: z.literal(SECRETS_FILE_VERSION),
-  providers: providersSchema.default({}),
-  channels: channelsSchema.default({}),
-  mcp: mcpSliceSchema.default({}),
-})
+export const secretsFileSchema = z
+  .object({
+    $schema: z.string().optional(),
+    version: z.literal(SECRETS_FILE_VERSION),
+    providers: providersSchema.default({}),
+    channels: channelsSchema.default({}),
+    mcp: mcpSliceSchema.default({}),
+    githubCli: githubCliSecretsSchema.optional(),
+  })
+  .catchall(z.unknown())
 
 export type ProviderCredential = z.infer<typeof providerCredentialSchema>
 export type Providers = z.infer<typeof providersSchema>
 export type McpCredential = z.infer<typeof mcpCredentialSchema>
 export type McpSlice = z.infer<typeof mcpSliceSchema>
+export type GithubCliSecrets = z.infer<typeof githubCliSecretsSchema>
 export type Channels = z.infer<typeof channelsSchema>
 export type GithubPatAuthBlock = z.infer<typeof githubPatAuthSchema>
 export type GithubAppAuthBlock = z.infer<typeof githubAppAuthSchema>

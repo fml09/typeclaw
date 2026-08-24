@@ -44,6 +44,15 @@ describe('parseSecretsFile (v2 envelope)', () => {
     expect(result.file.mcp).toEqual({})
   })
 
+  test('accepts an optional isolated GitHub CLI store without changing the v2 envelope', () => {
+    const result = parseSecretsFile({ version: 2, githubCli: { hosts: 'github.com:\n  user: test-user\n' } })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.file.version).toBe(2)
+    expect(result.file.githubCli).toEqual({ hosts: 'github.com:\n  user: test-user\n' })
+  })
+
   test('accepts and preserves MCP OAuth credentials while keeping mcp optional', () => {
     const result = parseSecretsFile({
       version: 2,
