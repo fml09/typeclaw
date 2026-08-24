@@ -1657,6 +1657,8 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     tasks: Array<() => Promise<void>>
     warns?: string[]
     authToken?: GithubWebhookHandlerOptions['authToken']
+    reviewOn?: 'review_requested' | 'opened' | 'off'
+    sleepImpl?: GithubWebhookHandlerOptions['sleepImpl']
   }) {
     return createGithubWebhookHandler({
       webhookSecret: 'secret',
@@ -1665,11 +1667,13 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
       selfId: () => '99',
       selfLogin: () => 'typeclaw-bot[bot]',
       authType: () => 'app',
+      ...(input.reviewOn !== undefined ? { reviewOn: () => input.reviewOn! } : {}),
       authToken: input.authToken ?? (async () => 'tok'),
       fetchImpl: input.fetchImpl,
       scheduleBackgroundTask: (task) => {
         input.tasks.push(task)
       },
+      sleepImpl: input.sleepImpl ?? (async () => {}),
       logger: { info: () => {}, warn: (m) => input.warns?.push(m), error: () => {} },
       route: (msg) => {
         input.routed.push(msg)
@@ -1742,8 +1746,6 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(msg.workspace).toBe('acme/project')
     expect(msg.text).toContain('PR #7')
     expect(msg.text).toContain('deadbee')
-    // Per-thread context lets the model tell threads apart so it passes the
-    // right root comment id as `thread` (the resolve+reply pairing key).
     expect(msg.text).toContain('thread 100 on src/api/auth.ts:42')
     expect(msg.text).toContain('This token never expires — set a TTL.')
     expect(msg.text).toContain('thread 200')
@@ -1769,7 +1771,32 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(routed).toHaveLength(0)
   })
 
-  it('dedups a redelivered synchronize so the sweep runs once', async () => {
+  it('does not schedule a synchronize excluded by the event allowlist', async () => {
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => [],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot[bot]',
+      authToken: async () => 'tok',
+      scheduleBackgroundTask: (task) => {
+        tasks.push(task)
+      },
+      logger,
+      route: (msg) => {
+        routed.push(msg)
+      },
+    })
+
+    await handler(signedRequest(JSON.stringify(synchronizePayload()), 'pull_request', 'sync-not-allowed'))
+
+    expect(tasks).toHaveLength(0)
+    expect(routed).toHaveLength(0)
+  })
+
+  it('dedups a successful synchronize redelivery with the same delivery id', async () => {
     const routed: InboundMessage[] = []
     const tasks: Array<() => Promise<void>> = []
     const dedup = createDeliveryDedup()
@@ -1793,9 +1820,11 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
 
     const body = JSON.stringify(synchronizePayload())
     await handler(signedRequest(body, 'pull_request', 'sync-dup'))
+    await tasks[0]?.()
     await handler(signedRequest(body, 'pull_request', 'sync-dup'))
 
     expect(tasks).toHaveLength(1)
+    expect(routed).toHaveLength(1)
   })
 
   it('warns and does not route when the thread listing fails', async () => {
@@ -1814,6 +1843,69 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
 
     expect(routed).toHaveLength(0)
     expect(warns.some((w) => w.includes('review-thread recheck failed'))).toBe(true)
+  })
+
+  it('retries a failed thread-list lookup within one scheduled followup', async () => {
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const sleeps: number[] = []
+    let calls = 0
+    const handler = recheckHandler({
+      fetchImpl: fakeFetch((url) => {
+        if (url.includes('/reviews')) return reviewsResponse([])
+        calls++
+        if (calls === 1) return new Response('boom', { status: 500 })
+        return threadsResponse([{ id: 'T1', isResolved: false, rootCommentId: 100, login: 'typeclaw-bot' }])
+      }),
+      routed,
+      tasks,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+
+    await handler(signedRequest(JSON.stringify(synchronizePayload('retry-sha')), 'pull_request', 'sync-retry'))
+    await tasks[0]?.()
+
+    expect(tasks).toHaveLength(1)
+    expect(calls).toBe(2)
+    expect(sleeps).toEqual([1000])
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.thread).toBe(null)
+    expect(routed[0]?.externalMessageId).toBe('pr-7-recheck-retry-sha')
+  })
+
+  it('bounds failed followup retries for a persistently failing repo', async () => {
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const warns: string[] = []
+    const sleeps: number[] = []
+    let calls = 0
+    const handler = recheckHandler({
+      fetchImpl: fakeFetch(() => {
+        calls++
+        return new Response('boom', { status: 500 })
+      }),
+      routed,
+      tasks,
+      warns,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+
+    await handler(
+      signedRequest(JSON.stringify(synchronizePayload('always-fails')), 'pull_request', 'sync-always-fails'),
+    )
+    await tasks[0]?.()
+
+    expect(tasks).toHaveLength(1)
+    expect(calls).toBe(3)
+    expect(sleeps).toEqual([1000, 2000])
+    expect(routed).toHaveLength(0)
+    expect(warns.some((warning) => warning.includes('retry cap exhausted') && warning.includes('acme/project#7'))).toBe(
+      true,
+    )
   })
 
   it('re-reviews a held CHANGES_REQUESTED even with no unresolved threads', async () => {
@@ -1875,9 +1967,11 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     await tasks[0]?.()
 
     expect(routed).toHaveLength(1)
+    expect(routed[0]!.thread).toBe(null)
     expect(routed[0]!.text).toContain('100')
     expect(routed[0]!.text).toContain('CHANGES_REQUESTED')
     expect(routed[0]!.text).not.toContain('end your turn without replying')
+    expect(routed[0]!.externalMessageId).toBe('pr-7-recheck-abc1234def')
   })
 
   it('skips the CHANGES_REQUESTED re-review when review.on is off', async () => {
@@ -1908,7 +2002,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(routed).toHaveLength(0)
   })
 
-  it('dedups two deliveries with the same head sha to one followup', async () => {
+  it('reserves a same-sha followup synchronously across concurrent deliveries', async () => {
     const routed: InboundMessage[] = []
     const tasks: Array<() => Promise<void>> = []
     const dedup = createDeliveryDedup()
@@ -1931,8 +2025,10 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     })
 
     const body = JSON.stringify(synchronizePayload('samesha777'))
-    await handler(signedRequest(body, 'pull_request', 'sync-sha-1'))
-    await handler(signedRequest(body, 'pull_request', 'sync-sha-2'))
+    await Promise.all([
+      handler(signedRequest(body, 'pull_request', 'sync-sha-1')),
+      handler(signedRequest(body, 'pull_request', 'sync-sha-2')),
+    ])
 
     expect(tasks).toHaveLength(1)
     await tasks[0]?.()
@@ -1967,6 +2063,30 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(tasks).toHaveLength(2)
   })
 
+  it('bounds completed followup reservations across many distinct head shas', async () => {
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = recheckHandler({ fetchImpl: followupFetch({}), routed, tasks })
+
+    for (let index = 0; index <= 1000; index++) {
+      const sha = `sha-${index}`
+      await handler(signedRequest(JSON.stringify(synchronizePayload(sha)), 'pull_request', `sync-cap-${index}`))
+      await tasks[index]?.()
+    }
+
+    expect(tasks).toHaveLength(1001)
+
+    await handler(
+      signedRequest(JSON.stringify(synchronizePayload('sha-1000')), 'pull_request', 'sync-cap-latest-redelivery'),
+    )
+    expect(tasks).toHaveLength(1001)
+
+    await handler(
+      signedRequest(JSON.stringify(synchronizePayload('sha-0')), 'pull_request', 'sync-cap-oldest-redelivery'),
+    )
+    expect(tasks).toHaveLength(1002)
+  })
+
   it('skips the followup when the synchronize carries no head sha', async () => {
     const routed: InboundMessage[] = []
     const tasks: Array<() => Promise<void>> = []
@@ -1988,26 +2108,43 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(warns.some((w) => w.includes('no head sha'))).toBe(true)
   })
 
-  it('still routes threads when the review-state lookup fails', async () => {
+  it('retries the whole followup when review-state lookup fails with unresolved threads', async () => {
     const routed: InboundMessage[] = []
     const tasks: Array<() => Promise<void>> = []
     const warns: string[] = []
+    const sleeps: number[] = []
+    let reviewCalls = 0
     const handler = recheckHandler({
       fetchImpl: fakeFetch((url) => {
-        if (url.includes('/reviews')) return new Response('boom', { status: 500 })
+        if (url.includes('/reviews')) {
+          reviewCalls++
+          return reviewCalls === 1
+            ? new Response('boom', { status: 500 })
+            : reviewsResponse([{ state: 'CHANGES_REQUESTED' }])
+        }
         return threadsResponse([{ id: 'T1', isResolved: false, rootCommentId: 100, login: 'typeclaw-bot' }])
       }),
       routed,
       tasks,
       warns,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms)
+      },
     })
 
-    await handler(signedRequest(JSON.stringify(synchronizePayload()), 'pull_request', 'sync-state-fail'))
+    await handler(
+      signedRequest(JSON.stringify(synchronizePayload('state-retry-sha')), 'pull_request', 'sync-state-fail'),
+    )
     await tasks[0]?.()
 
-    expect(routed).toHaveLength(1)
-    expect(routed[0]!.text).toContain('100')
     expect(warns.some((w) => w.includes('review-state recheck failed'))).toBe(true)
+    expect(tasks).toHaveLength(1)
+    expect(reviewCalls).toBe(2)
+    expect(sleeps).toEqual([1000])
+    expect(routed).toHaveLength(1)
+    expect(routed[0]!.thread).toBe(null)
+    expect(routed[0]!.externalMessageId).toBe('pr-7-recheck-state-retry-sha')
+    expect(routed[0]!.text).toContain('CHANGES_REQUESTED')
   })
 })
 

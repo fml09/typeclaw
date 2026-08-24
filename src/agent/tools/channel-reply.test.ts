@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
+import { createGithubReviewThreadResolver } from '@/channels/adapters/github/review-thread-resolver'
 import { OUTBOUND_FLOOD_ERROR, type ChannelRouter } from '@/channels/router'
 import type { OutboundMessage, SendResult } from '@/channels/types'
 
@@ -841,6 +842,105 @@ describe('channel_reply resolve_review_thread', () => {
     expect(result.details).toEqual({ ok: true })
   })
 
+  test('reports success without posting when the thread was already resolved', async () => {
+    const calls: OutboundMessage[] = []
+    const tool = createChannelReplyTool({
+      router: fakeRouter(
+        async (msg) => {
+          calls.push(msg)
+          return { ok: true }
+        },
+        { resolveReviewThread: async () => ({ ok: true, alreadyResolved: true }) },
+      ),
+      origin: githubThreadOrigin,
+    })
+
+    const result = await runTool(tool, { text: 'Verified — fix looks solid.', resolve_review_thread: true })
+
+    expect(calls).toHaveLength(0)
+    expect(result.details).toEqual({ ok: true })
+    const rendered = (result.content[0] as { text: string }).text
+    expect(rendered).toContain('already resolved')
+    expect(rendered).toContain('no acknowledgement comment was posted')
+  })
+
+  test('posts only one acknowledgement when concurrent close-outs target the same thread', async () => {
+    let resolved = false
+    let mutations = 0
+    const fetchImpl = Object.assign(
+      async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { query: string }
+        if (body.query.includes('resolveReviewThread(input')) {
+          mutations += 1
+          resolved = true
+          return new Response(
+            JSON.stringify({
+              data: { resolveReviewThread: { thread: { id: 'PRRT_CONCURRENT', isResolved: true } } },
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response(
+          JSON.stringify({
+            data: {
+              repository: {
+                pullRequest: {
+                  reviewThreads: {
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                    nodes: [
+                      {
+                        id: 'PRRT_CONCURRENT',
+                        isResolved: resolved,
+                        comments: {
+                          nodes: [
+                            {
+                              databaseId: Number(githubThreadOrigin.thread),
+                              author: { __typename: 'Bot', login: 'bot' },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          }),
+          { status: 200 },
+        )
+      },
+      { preconnect: () => {} },
+    )
+    const resolveReviewThread = createGithubReviewThreadResolver({
+      token: async () => 'tok',
+      selfLogin: () => 'bot[bot]',
+      fetchImpl,
+    })
+    const sent: OutboundMessage[] = []
+    const tool = createChannelReplyTool({
+      router: fakeRouter(
+        async (msg) => {
+          sent.push(msg)
+          return { ok: true }
+        },
+        { resolveReviewThread },
+      ),
+      origin: githubThreadOrigin,
+    })
+
+    const results = await Promise.all([
+      runTool(tool, { text: 'Verified — fix looks solid.', resolve_review_thread: true }),
+      runTool(tool, { text: 'Verified — fix looks solid.', resolve_review_thread: true }),
+    ])
+    const rendered = results.map((result) => (result.content[0] as { text: string }).text)
+
+    expect(results.every((result) => result.details.ok)).toBe(true)
+    expect(rendered.filter((text) => text.includes('already resolved'))).toHaveLength(1)
+    expect(rendered.filter((text) => text.includes('posted to github:acme/widgets/pr:585'))).toHaveLength(1)
+    expect(mutations).toBe(1)
+    expect(sent).toHaveLength(1)
+  })
+
   test('blocks the reply when the resolve fails', async () => {
     const calls: OutboundMessage[] = []
     const tool = createChannelReplyTool({
@@ -960,19 +1060,27 @@ describe('channel_reply resolve_review_thread', () => {
 
   test('does not attempt resolution on an explicit false (thread stays open)', async () => {
     let resolveCalled = false
+    let sent = 0
     const tool = createChannelReplyTool({
-      router: fakeRouter(async () => ({ ok: true }), {
-        resolveReviewThread: async () => {
-          resolveCalled = true
+      router: fakeRouter(
+        async () => {
+          sent++
           return { ok: true }
         },
-      }),
+        {
+          resolveReviewThread: async () => {
+            resolveCalled = true
+            return { ok: true, alreadyResolved: true }
+          },
+        },
+      ),
       origin: githubThreadOrigin,
     })
 
     await runTool(tool, { text: 'plain reply', resolve_review_thread: false })
 
     expect(resolveCalled).toBe(false)
+    expect(sent).toBe(1)
   })
 })
 

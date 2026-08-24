@@ -57,31 +57,63 @@ export function createGithubReviewThreadResolver(deps: {
       }
     }
 
-    const token = await deps.token({ repoSlug: `${target.owner}/${target.repo}` })
-    const lookup = await findThread(fetchImpl, token, target)
-    if (lookup.kind === 'error') return lookup.result
-    if (lookup.kind === 'absent') {
-      return {
-        ok: false,
-        error: `no review thread rooted at comment ${target.rootCommentId} on ${req.chat}`,
-        code: 'no-match',
+    return await withThreadLock(threadLockKey(target), async () => {
+      const token = await deps.token({ repoSlug: `${target.owner}/${target.repo}` })
+      const lookup = await findThread(fetchImpl, token, target)
+      if (lookup.kind === 'error') return lookup.result
+      if (lookup.kind === 'absent') {
+        return {
+          ok: false,
+          error: `no review thread rooted at comment ${target.rootCommentId} on ${req.chat}`,
+          code: 'no-match',
+        }
       }
-    }
 
-    const thread = lookup.thread
-    // The load-bearing guard: only the bot may resolve the bot's own thread.
-    // Resolving a human reviewer's thread would erase their open question.
-    if (!isSelfAuthor(thread, selfLogin)) {
-      return {
-        ok: false,
-        error: `refusing to resolve thread authored by @${thread.rootAuthorLogin ?? 'unknown'} (not @${selfLogin})`,
-        code: 'not-author',
+      const thread = lookup.thread
+      // The load-bearing guard: only the bot may resolve the bot's own thread.
+      // Resolving a human reviewer's thread would erase their open question.
+      if (!isSelfAuthor(thread, selfLogin)) {
+        return {
+          ok: false,
+          error: `refusing to resolve thread authored by @${thread.rootAuthorLogin ?? 'unknown'} (not @${selfLogin})`,
+          code: 'not-author',
+        }
       }
-    }
-    if (thread.isResolved) return { ok: true, alreadyResolved: true }
+      if (thread.isResolved) return { ok: true, alreadyResolved: true }
 
-    return await runResolveMutation(fetchImpl, token, thread.id)
+      return await runResolveMutation(fetchImpl, token, thread.id)
+    })
   }
+}
+
+// `alreadyResolved` is only observable from the pre-mutation lookup, so two
+// callers that each see the thread open would both mutate and both post an
+// acknowledgement. Serializing per thread makes the follower's lookup run after
+// the leader's mutation, so it observes `isResolved` and reports the no-op
+// instead. Resolved state is never cached — GitHub stays the authority, which is
+// what keeps this correct across processes and restarts.
+const threadResolveLocks = new Map<string, Promise<void>>()
+
+function threadLockKey(target: ResolveTarget): string {
+  return `${target.owner}/${target.repo}#${target.prNumber}:${target.rootCommentId}`
+}
+
+// Deliberately NOT a bounded/evicting map: dropping an in-flight key would let a
+// second caller enter the critical section concurrently and reopen the race this
+// closes. Entries are deleted once their tail settles, so the map stays bounded
+// by the number of resolves actually in flight.
+function withThreadLock<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const previous = threadResolveLocks.get(key) ?? Promise.resolve()
+  const result = previous.then(run)
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  threadResolveLocks.set(key, tail)
+  void tail.then(() => {
+    if (threadResolveLocks.get(key) === tail) threadResolveLocks.delete(key)
+  })
+  return result
 }
 
 // A GitHub App's own login differs across the two APIs this guard straddles:
