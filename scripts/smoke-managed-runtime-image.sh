@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -uxo pipefail
 echo "SMOKE_SCRIPT_VERSION=privileged-trace-v1"
+echo "SCRIPT_REACHED_LINE_4"
+ls -l /usr/bin/bwrap >&2
+exit 99
 
 set -euo pipefail
 
