@@ -644,26 +644,45 @@ jobs:
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-      - name: Smoke single-platform runtime by digest
+      - name: Smoke metadata contract
+        id: smoke_meta
         env:
-          VERSION: ${{ needs.checks.outputs.version }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           IMAGE_REF="${RUNTIME_REGISTRY_IMAGE}@${DIGEST}"
-          GWS_VERSION="$(cat runtime-input/gws-version.txt)"
           docker pull --platform "${{ matrix.platform }}" "$IMAGE_REF"
           test "$(docker image inspect "$IMAGE_REF" --format '{{.Config.User}}')" = "65532:65532"
           test "$(docker image inspect "$IMAGE_REF" --format '{{json .Config.Entrypoint}}')" = '["/usr/bin/tini","--","/usr/local/bin/typeclaw-entrypoint"]'
           test "$(docker image inspect "$IMAGE_REF" --format '{{json .Config.Cmd}}')" = '["run"]'
+
+      - name: Smoke embedded dependency graph
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euxo pipefail
+          IMAGE_REF="${RUNTIME_REGISTRY_IMAGE}@${DIGEST}"
+          GWS_VERSION="$(cat runtime-input/gws-version.txt)"
           docker run --rm --entrypoint sh \
             -e EXPECTED_VERSION="$VERSION" \
             -e EXPECTED_GWS_VERSION="$GWS_VERSION" \
             "$IMAGE_REF" -ec '
+              command -v bwrap >/dev/null && echo UNEXPECTED_BWRAP_ON_PATH || true
               test "$(bun -e "import pkg from \"/node_modules/typeclaw/package.json\"; console.log(pkg.version)")" = "$EXPECTED_VERSION"
               test "$(bun -e "import pkg from \"/node_modules/typeclaw-gws-multi-account/package.json\"; console.log(pkg.version)")" = "$EXPECTED_GWS_VERSION"
               test -f /opt/typeclaw/models/.typeclaw-model.json
+              echo EMBEDDED_GRAPH_OK
             '
+
+      - name: Smoke managed entrypoint and restart spool
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euxo pipefail
+          IMAGE_REF="${RUNTIME_REGISTRY_IMAGE}@${DIGEST}"
+          GWS_VERSION="$(cat runtime-input/gws-version.txt)"
           bash scripts/smoke-managed-runtime-image.sh "$IMAGE_REF"
 
       - name: Export digest
