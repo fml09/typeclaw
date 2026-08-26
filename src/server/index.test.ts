@@ -2000,6 +2000,11 @@ describe('createServer plugin hooks', () => {
     await waitFor((m) => m.type === 'connected')
 
     ws.close()
+    // Wait for the close path to actually DISPATCH session.end before
+    // resolving it manually: under an oversubscribed runner the dispatch can
+    // lag past a fixed sleep, which previously left endResolve.fn null,
+    // made the manual resolve a no-op, and timed out the whole test.
+    await waitForState(() => endResolve.fn !== null)
     await expectStable(() => ended, { durationMs: 20, description: 'session.end resolved early' })
     expect(ended).toBe(false)
     endResolve.fn?.()
