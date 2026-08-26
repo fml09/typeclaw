@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdir, mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -8,15 +8,32 @@ import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from 
 import { createChannelRouter, type ChannelManager, type ChannelManagerOptions } from '@/channels'
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { CronFile, CronJob, LoadCronResult, Scheduler } from '@/cron'
-import { SecretsBackend } from '@/secrets'
+import { exportGithubCliStoreForAgent, SecretsBackend } from '@/secrets'
 import type { SessionFactory } from '@/sessions'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 import type { TuiOptions } from '@/tui'
 import type { TunnelManager, TunnelManagerOptions } from '@/tunnels'
 
-import { type LoadCronFn, type SchedulerFactory, startAgent, type TuiFactory } from './index'
+import {
+  type LoadCronFn,
+  type SchedulerFactory,
+  startAgent as startAgentRuntime,
+  type StartAgentOptions,
+  type TuiFactory,
+} from './index'
 
 const noCron: LoadCronFn = async () => ({ ok: true, file: null }) as LoadCronResult
+
+let githubCliHomeDir: string
+
+function startAgent(options: StartAgentOptions) {
+  return startAgentRuntime({
+    ...options,
+    exportGithubCliStore:
+      options.exportGithubCliStore ??
+      ((exportOptions) => exportGithubCliStoreForAgent({ ...exportOptions, homeDir: githubCliHomeDir })),
+  })
+}
 
 function stubScheduler(): Scheduler {
   return {
@@ -30,7 +47,8 @@ function stubScheduler(): Scheduler {
 let running: Awaited<ReturnType<typeof startAgent>> | null = null
 let savedBrokerToken: string | undefined
 
-beforeEach(() => {
+beforeEach(async () => {
+  githubCliHomeDir = await mkdtemp(join(tmpdir(), 'typeclaw-run-home-'))
   // startAgent boots the agent-browser plugin. Keep the broker token absent so
   // these run-loop tests do not publish a reserved dashboard forward request
   // into an unrelated in-process bus subscriber.
@@ -42,10 +60,12 @@ afterEach(async () => {
   resetDashboardForwardRequest()
   if (savedBrokerToken === undefined) delete process.env['TYPECLAW_HOSTD_BROKER_TOKEN']
   else process.env['TYPECLAW_HOSTD_BROKER_TOKEN'] = savedBrokerToken
-  if (!running) return
-  running.tuiPromise?.catch(() => {})
-  await running.stop()
-  running = null
+  if (running) {
+    running.tuiPromise?.catch(() => {})
+    await running.stop()
+    running = null
+  }
+  await rmTempDir(githubCliHomeDir)
 })
 
 describe('startAgent', () => {
@@ -69,6 +89,30 @@ describe('startAgent', () => {
     const res = await fetch(`http://localhost:${running.server.port}`)
     expect(res.status).toBe(200)
     expect(await res.text()).toBe('typeclaw agent')
+  })
+
+  test('keeps the host GitHub CLI store untouched when the agent has no stored credential', async () => {
+    const hostHomeDir = await mkdtemp(join(tmpdir(), 'typeclaw-run-host-home-'))
+    const hostTarget = join(hostHomeDir, '.config', 'gh', 'hosts.yml')
+    const runtimeTarget = join(githubCliHomeDir, '.config', 'gh', 'hosts.yml')
+    const sentinel = 'host credential sentinel\n'
+    const savedHome = process.env.HOME
+
+    await mkdir(join(hostHomeDir, '.config', 'gh'), { recursive: true })
+    await mkdir(join(githubCliHomeDir, '.config', 'gh'), { recursive: true })
+    await Bun.write(hostTarget, sentinel)
+    await Bun.write(runtimeTarget, 'stale runtime credential\n')
+    process.env.HOME = hostHomeDir
+    try {
+      running = await startAgent({ port: 0, attachTui: false, cwd: testCwd, loadCron: noCron })
+
+      expect(await Bun.file(hostTarget).text()).toBe(sentinel)
+      expect(existsSync(runtimeTarget)).toBe(false)
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME
+      else process.env.HOME = savedHome
+      await rmTempDir(hostHomeDir)
+    }
   })
 
   test('awaits provider-OAuth refresh before any session consumer starts, so a lock-holding refresh cannot ELOCKED a boot auth read', async () => {

@@ -6,18 +6,31 @@ import { join } from 'node:path'
 import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from '@/bundled-plugins/agent-browser'
 import { createChannelRouter, type ChannelManager } from '@/channels'
 import type { LoadCronResult } from '@/cron'
+import { exportGithubCliStoreForAgent } from '@/secrets'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 import type { TunnelManager } from '@/tunnels'
 
-import { startAgent, type LoadCronFn } from './index'
+import { type LoadCronFn, startAgent as startAgentRuntime, type StartAgentOptions } from './index'
 
 const noCron: LoadCronFn = async () => ({ ok: true, file: null }) as LoadCronResult
+
+let githubCliHomeDir: string
+
+function startAgent(options: StartAgentOptions) {
+  return startAgentRuntime({
+    ...options,
+    exportGithubCliStore:
+      options.exportGithubCliStore ??
+      ((exportOptions) => exportGithubCliStoreForAgent({ ...exportOptions, homeDir: githubCliHomeDir })),
+  })
+}
 
 let running: Awaited<ReturnType<typeof startAgent>> | null = null
 let agentDir: string | null = null
 let savedBrokerToken: string | undefined
 
-beforeEach(() => {
+beforeEach(async () => {
+  githubCliHomeDir = await mkdtemp(join(tmpdir(), 'typeclaw-plugin-home-'))
   // startAgent boots the agent-browser plugin. Keep the broker token absent so
   // these run-loop tests do not publish a reserved dashboard forward request
   // into an unrelated in-process bus subscriber.
@@ -27,7 +40,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   if (running) {
-    running.stop()
+    await running.stop()
     running.tuiPromise?.catch(() => {})
     running = null
   }
@@ -35,6 +48,7 @@ afterEach(async () => {
     await rmTempDir(agentDir)
     agentDir = null
   }
+  await rmTempDir(githubCliHomeDir)
   resetDashboardForwardRequest()
   if (savedBrokerToken === undefined) delete process.env['TYPECLAW_HOSTD_BROKER_TOKEN']
   else process.env['TYPECLAW_HOSTD_BROKER_TOKEN'] = savedBrokerToken
