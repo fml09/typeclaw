@@ -36,6 +36,11 @@ describe('release workflow immutable version tags', () => {
     expect(workflow).not.toContain('secrets.DEPLOY_KEY')
     expect(workflow).not.toContain('id-token: write')
     expect(workflow).toContain('promote_latest: ${{ steps.preflight.outputs.promote_latest }}')
+    // The managed runtime must FROM this fork's base image, never the
+    // upstream-owned default that produced the first failed dispatch.
+    expect(workflow).toContain(
+      'emit-managed-runtime-dockerfile.ts "$VERSION" \\\n            "ghcr.io/${{ github.repository_owner }}/typeclaw-base"',
+    )
     expect(workflow.match(/-t "\$\{REGISTRY_IMAGE\}:latest"/g)).toHaveLength(1)
     expect(workflow).toContain('"${REGISTRY_IMAGE}@${{ needs.merge-base.outputs.version_digest }}"')
   })
