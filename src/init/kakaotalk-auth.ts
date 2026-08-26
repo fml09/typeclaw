@@ -52,7 +52,7 @@ export async function runKakaotalkBootstrap(input: KakaotalkLoginInput): Promise
     const result = await loginFlow({
       email: input.email,
       password: input.password,
-      deviceType: 'tablet',
+      deviceType: (process.env.TYPECLAW_KAKAO_DEVICE_TYPE as 'pc' | 'tablet' | undefined) ?? 'tablet',
       force: false,
       ...(savedDeviceUuid !== undefined ? { savedDeviceUuid } : {}),
       onPasscodeDisplay: input.callbacks.onPasscode,
