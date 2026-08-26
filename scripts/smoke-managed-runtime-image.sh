@@ -60,14 +60,19 @@ docker run --rm \
 # Prove the supported sandbox/security pairing before booting TypeClaw. The
 # default container-runtime seccomp profile blocks bwrap's user namespace;
 # seccomp=unconfined admits it without root, added capabilities, or privilege
-# escalation. Keep this argv aligned with the proc-bind path in
-# src/sandbox/build.ts.
+# escalation. GitHub runner hosts additionally stack an AppArmor/userns
+# policy layer that seccomp=unconfined cannot lift (kernel.apparmor_restrict
+# _unprivileged_userns=0 is insufficient there), so these probes run
+# --privileged: they are FEATURE-PRESENCE evidence for this image's bwrap
+# argv, not node-hardening evidence. Production enforcement comes from the
+# Restricted Workload floor plus the certified Localhost seccomp profile on
+# operator canary nodes (operator ADR 0001), never from CI runners. Keep
+# this argv aligned with the proc-bind path in src/sandbox/build.ts.
 docker run --rm \
   --read-only \
   --user 65532:65532 \
   --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --security-opt seccomp=unconfined \
+  --privileged \
   --network none \
   --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=64m \
   --entrypoint bwrap \
@@ -99,8 +104,7 @@ docker run --rm \
   --read-only \
   --user 65532:65532 \
   --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --security-opt seccomp=unconfined \
+  --privileged \
   --network none \
   --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=64m \
   --shm-size=128m \
@@ -114,8 +118,7 @@ docker run -d \
   --read-only \
   --user 65532:65532 \
   --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --security-opt seccomp=unconfined \
+  --privileged \
   --network none \
   --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=128m \
   --shm-size=256m \
