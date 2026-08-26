@@ -5,6 +5,11 @@ import { join } from 'node:path'
 
 import { createHostdRuntimeRestarter, createManagedFileRestarter } from './runtime-restarter'
 
+// The managed spool contract is defined in POSIX mode bits (0700 dir / 0600
+// request files) and enforced fail-closed; win32 cannot represent either, so
+// the mode-coupled cases are POSIX-only evidence.
+const onWindows = process.platform === 'win32'
+
 describe('createHostdRuntimeRestarter', () => {
   test('preserves the established five-second ACK budget when none is injected', async () => {
     let timeoutMs: number | undefined
@@ -30,7 +35,7 @@ describe('createManagedFileRestarter', () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
   })
 
-  test('atomically publishes one versioned restart request and ACKs only after rename', async () => {
+  test.skipIf(onWindows)('atomically publishes one versioned restart request and ACKs only after rename', async () => {
     const root = await mkdtemp(join(tmpdir(), 'typeclaw-managed-restart-'))
     roots.push(root)
     const restarter = createManagedFileRestarter({
@@ -55,7 +60,7 @@ describe('createManagedFileRestarter', () => {
     expect((await stat(join(root, files[0]!))).mode & 0o777).toBe(0o600)
   })
 
-  test('rejects an existing control directory with platform-unsafe permissions', async () => {
+  test.skipIf(onWindows)('rejects an existing control directory with platform-unsafe permissions', async () => {
     const root = await mkdtemp(join(tmpdir(), 'typeclaw-managed-restart-'))
     roots.push(root)
     await chmod(root, 0o755)

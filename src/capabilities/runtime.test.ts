@@ -5,6 +5,9 @@ import { join } from 'node:path'
 
 import { createRuntimeCapabilities } from './runtime'
 
+// Managed restart enforcement is POSIX-mode-based; see runtime-restarter.test.ts.
+const onWindows = process.platform === 'win32'
+
 describe('createRuntimeCapabilities', () => {
   const roots: string[] = []
 
@@ -34,7 +37,7 @@ describe('createRuntimeCapabilities', () => {
     expect(caps.restarter).toBeNull()
   })
 
-  test('binds managed secrets and restart capabilities to writable filesystem mounts', async () => {
+  test.skipIf(onWindows)('binds managed secrets and restart capabilities to writable filesystem mounts', async () => {
     const root = await mkdtemp(join(tmpdir(), 'typeclaw-managed-caps-'))
     roots.push(root)
     const secretsPath = join(root, 'secrets.json')

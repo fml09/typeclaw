@@ -37,7 +37,10 @@ describe.skipIf(process.platform === 'win32')('default Git resolver subprocess b
       const started = performance.now()
 
       expect(await defaultGitResolvers.resolveConfig('/unused', 'remote.pushDefault')).toBeNull()
-      expect(performance.now() - started).toBeLessThan(maxMs)
+      // Oversubscribed CI runners overshoot the kill deadline by scheduler
+      // jitter alone (observed 3012ms against the 3000ms bound). The
+      // invariant is failing closed well before the 5s runaway subprocess,
+      expect(performance.now() - started).toBeLessThan(maxMs + 1_500)
       if (mode === 'timeout') {
         await Bun.sleep(600)
         expect(
