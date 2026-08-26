@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+set -uxo pipefail
+echo "SMOKE_SCRIPT_VERSION=privileged-trace-v1"
 
 set -euo pipefail
 
