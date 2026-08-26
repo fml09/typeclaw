@@ -112,6 +112,14 @@ jobs:
             --tag "typeclaw-runtime:pr-${{ matrix.arch }}" \
             runtime-input
 
+      - name: Permit unprivileged user namespaces
+        # Ubuntu 23.10+ defaults kernel.apparmor_restrict_unprivileged_userns
+        # to 1, which blocks bubblewrap's user namespace even under
+        # seccomp=unconfined (same fix as the release workflow's runtime
+        # smoke).
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Smoke immutable image contract
         env:
           IMAGE: typeclaw-runtime:pr-${{ matrix.arch }}

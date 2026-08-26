@@ -635,6 +635,15 @@ jobs:
           cache-from: type=registry,ref=${{ env.RUNTIME_REGISTRY_IMAGE }}:cache-${{ matrix.arch }}
           cache-to: type=registry,ref=${{ env.RUNTIME_REGISTRY_IMAGE }}:cache-${{ matrix.arch }},mode=max
 
+      - name: Permit unprivileged user namespaces
+        # Ubuntu 23.10+ defaults kernel.apparmor_restrict_unprivileged_userns
+        # to 1, which blocks bubblewrap's user namespace even under
+        # seccomp=unconfined. The managed-entrypoint smoke below IS the
+        # executable Native+LocalBwrap evidence required by operator ADR 0001,
+        # so lift exactly this one restriction on the ephemeral runner.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Smoke single-platform runtime by digest
         env:
           VERSION: ${{ needs.checks.outputs.version }}
