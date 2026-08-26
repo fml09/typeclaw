@@ -8,6 +8,7 @@ permissions:
 jobs:
   probe:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux/amd64
@@ -31,19 +32,18 @@ jobs:
         run: |
           unshare --user --map-current-user true && echo HOST_USERNS_OK || echo HOST_USERNS_FAIL
 
-      - name: Pull runtime digest
-        env:
-          DIGEST_AMD64: sha256:5d93e4c49d63cea8ebe228c2f108505ab31c32eb8dc69d402d605a355920aab9
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull arch image
         run: |
-          if [ "${{ matrix.platform }}" = "linux/amd64" ]; then
-            REF="ghcr.io/fml09/typeclaw-runtime@${DIGEST_AMD64}"
-          else
-            # arm64 leg uses the multi-arch list tag; only amd64 digest exists
-            # so this leg validates the harness itself.
-            REF="ghcr.io/fml09/typeclaw-runtime@${DIGEST_AMD64}"
-          fi
-          docker pull --platform "${{ matrix.platform }}" "$REF"
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          if [ "${{ matrix.arch }}" = amd64 ]; then REF=cache-amd64; else REF=cache-arm64; fi
+          echo "ref=ghcr.io/fml09/typeclaw-runtime:${REF}" >> "$GITHUB_ENV"
+          docker pull --platform "${{ matrix.platform }}" "ghcr.io/fml09/typeclaw-runtime:${REF}"
 
       - name: bwrap under seccomp=unconfined
         continue-on-error: true
@@ -56,7 +56,7 @@ jobs:
             --network none \
             --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=64m \
             --entrypoint bwrap \
-            "ghcr.io/fml09/typeclaw-runtime@sha256:5d93e4c49d63cea8ebe228c2f108505ab31c32eb8dc69d402d605a355920aab9" \
+            "${{ env.ref }}" \
             --unshare-all --new-session --die-with-parent --clearenv \
             --setenv PATH /usr/local/bin:/usr/bin:/bin --setenv HOME /tmp \
             --setenv LANG C.UTF-8 --ro-bind /usr /usr --ro-bind /etc /etc \
@@ -75,7 +75,7 @@ jobs:
             --network none \
             --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=64m \
             --entrypoint bwrap \
-            "ghcr.io/fml09/typeclaw-runtime@sha256:5d93e4c49d63cea8ebe228c2f108505ab31c32eb8dc69d402d605a355920aab9" \
+            "${{ env.ref }}" \
             --unshare-all --new-session --die-with-parent --clearenv \
             --setenv PATH /usr/local/bin:/usr/bin:/bin --setenv HOME /tmp \
             --setenv LANG C.UTF-8 --ro-bind /usr /usr --ro-bind /etc /etc \
