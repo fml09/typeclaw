@@ -41,9 +41,15 @@ jobs:
 
       - name: Pull arch image
         run: |
-          if [ "${{ matrix.arch }}" = amd64 ]; then REF=cache-amd64; else REF=cache-arm64; fi
-          echo "ref=ghcr.io/fml09/typeclaw-runtime:${REF}" >> "$GITHUB_ENV"
-          docker pull --platform "${{ matrix.platform }}" "ghcr.io/fml09/typeclaw-runtime:${REF}"
+          # Single-platform digests pushed by run 32925378185 (merge job
+          # never ran, so no tag references these).
+          if [ "${{ matrix.arch }}" = amd64 ]; then
+            REF="ghcr.io/fml09/typeclaw-runtime@sha256:5d93e4c49d63cea8ebe228c2f108505ab31c32eb8dc69d402d605a355920aab9"
+          else
+            REF="ghcr.io/fml09/typeclaw-runtime@sha256:f11ab6be5d6b1aa1e2c456bc2d551c86ec6aa654d5ca5faf2dfbe1abe9fbc426"
+          fi
+          echo "ref=${REF}" >> "$GITHUB_ENV"
+          docker pull --platform "${{ matrix.platform }}" "$REF"
 
       - name: bwrap under seccomp=unconfined
         continue-on-error: true
