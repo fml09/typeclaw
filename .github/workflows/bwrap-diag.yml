@@ -1,0 +1,86 @@
+name: bwrap diagnostic
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Environment facts
+        run: |
+          set -x
+          uname -a
+          cat /etc/os-release | head -2
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone 2>&1 || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          sudo aa-status 2>&1 | head -8 || true
+          docker info --format '{{json .SecurityOptions}}'
+
+      - name: Bare unshare test on host
+        run: |
+          unshare --user --map-current-user true && echo HOST_USERNS_OK || echo HOST_USERNS_FAIL
+
+      - name: Pull runtime digest
+        env:
+          DIGEST_AMD64: sha256:5d93e4c49d63cea8ebe228c2f108505ab31c32eb8dc69d402d605a355920aab9
+        run: |
+          if [ "${{ matrix.platform }}" = "linux/amd64" ]; then
+            REF="ghcr.io/fml09/typeclaw-runtime@${DIGEST_AMD64}"
+          else
+            # arm64 leg uses the multi-arch list tag; only amd64 digest exists
+            # so this leg validates the harness itself.
+            REF="ghcr.io/fml09/typeclaw-runtime@${DIGEST_AMD64}"
+          fi
+          docker pull --platform "${{ matrix.platform }}" "$REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: bwrap under seccomp=unconfined
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            --read-only --user 65532:65532 --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --security-opt seccomp=unconfined \
+            --network none \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=64m \
+            --entrypoint bwrap \
+            "ghcr.io/fml09/typeclaw-runtime@sha256:5d93e4c49d63cea8ebe228c2f108505ab31c32eb8dc69d402d605a355920aab9" \
+            --unshare-all --new-session --die-with-parent --clearenv \
+            --setenv PATH /usr/local/bin:/usr/bin:/bin --setenv HOME /tmp \
+            --setenv LANG C.UTF-8 --ro-bind /usr /usr --ro-bind /etc /etc \
+            --dev /dev --tmpfs /tmp --ro-bind-try /bin /bin \
+            --ro-bind-try /sbin /sbin --ro-bind-try /lib /lib \
+            --ro-bind-try /lib64 /lib64 --ro-bind /proc /proc \
+            --chdir /tmp bash -c 'echo BWRAP_UNCONFINED_OK' \
+            && echo RESULT=PASS || echo RESULT=FAIL
+
+      - name: bwrap under privileged
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            --privileged \
+            --network none \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=64m \
+            --entrypoint bwrap \
+            "ghcr.io/fml09/typeclaw-runtime@sha256:5d93e4c49d63cea8ebe228c2f108505ab31c32eb8dc69d402d605a355920aab9" \
+            --unshare-all --new-session --die-with-parent --clearenv \
+            --setenv PATH /usr/local/bin:/usr/bin:/bin --setenv HOME /tmp \
+            --setenv LANG C.UTF-8 --ro-bind /usr /usr --ro-bind /etc /etc \
+            --dev /dev --tmpfs /tmp --ro-bind-try /bin /bin \
+            --ro-bind-try /sbin /sbin --ro-bind-try /lib /lib \
+            --ro-bind-try /lib64 /lib64 --ro-bind /proc /proc \
+            --chdir /tmp bash -c 'echo BWRAP_PRIVILEGED_OK' \
+            && echo RESULT=PASS || echo RESULT=FAIL
