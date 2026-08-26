@@ -40,9 +40,19 @@ Slim vs full mode is decided by `deriveSystemPromptMode` (exhaustive `switch` on
 
 ## Release
 
-Use the **Release** GitHub Actions workflow (`workflow_dispatch`, see `.github/workflows/release.yml`). It validates the version, runs checks, bumps `package.json`, builds and pushes multi-arch base to `ghcr.io/typeclaw/typeclaw-base:X.Y.Z`, verifies cross-platform pullability, publishes to npm with provenance, then tags + releases. Tags have no `v` prefix.
+**Fork divergence (registry-only).** This fork's `release.yml` drops the npm
+publication and its OIDC/deploy-key machinery: the `typeclaw` npm package is
+upstream-owned so trusted publishing cannot be configured here, the managed
+runtime image embeds its own dependency graph, and this fork carries no
+branch ruleset (the default GITHUB_TOKEN pushes bump commits and tags). It
+builds and pushes multi-arch base + runtime images to
+`ghcr.io/fml09/typeclaw-{base,runtime}:X.Y.Z`, promotes `:latest`
+forward-only based on existing release tags (never backward during a repair),
+then tags + releases. `scripts/release-workflow.test.ts` pins this posture.
 
-The workflow is the only supported release path. The GHCR-first-then-npm ordering is load-bearing for the version-pin invariant: a user who `npm install`s before the base image lands cannot `typeclaw start`.
+Use the **Release** GitHub Actions workflow (`workflow_dispatch`, see `.github/workflows/release.yml`). It validates the version, runs checks, bumps `package.json`, builds and pushes multi-arch base to the fork GHCR registry, verifies cross-platform pullability, then tags + releases. Tags have no `v` prefix.
+
+Upstream semantics for reference: the original workflow published to npm with provenance after the images landed; that GHCR-first-then-npm ordering was load-bearing for upstream's version-pin invariant (a user who `npm install`s before the base image lands cannot `typeclaw start`). Registry-only releases keep the same invariant because the image embeds its dependency graph.
 
 **Version decision.** Specified version → use as-is. Otherwise **default to patch** and only escalate to minor when one of the explicit minor triggers below is clearly met. When in doubt, it's a patch.
 

@@ -24,21 +24,30 @@ describe('release workflow immutable version tags', () => {
     expect(workflow).toContain("if: needs.checks.outputs.runtime_exists != 'true'")
   })
 
-  test('promotes mutable latest tags only after npm publish and never during an older repair', () => {
+  test('is registry-only: no npm publication, OIDC, or deploy-key credential remains', () => {
+    // Fork divergence (ADR 0003 in fml09/typeclaw-operator): the `typeclaw`
+    // npm package is upstream-owned, so trusted publishing can never be
+    // configured here. The managed runtime image embeds its own dependency
+    // graph, so nothing consumes npm at runtime either. These assertions
+    // keep the registry-only posture from regressing.
+    expect(workflow).not.toContain('npm publish')
+    expect(workflow).not.toContain('--provenance')
+    expect(workflow).not.toContain('registry-url')
+    expect(workflow).not.toContain('secrets.DEPLOY_KEY')
+    expect(workflow).not.toContain('id-token: write')
     expect(workflow).toContain('promote_latest: ${{ steps.preflight.outputs.promote_latest }}')
-    expect(workflow).toContain('npm publish --provenance --access public --tag "release-${VERSION//./-}"')
-    expect(workflow.indexOf('- name: Publish to npm')).toBeLessThan(
-      workflow.indexOf('- name: Promote matching base image to latest'),
-    )
     expect(workflow.match(/-t "\$\{REGISTRY_IMAGE\}:latest"/g)).toHaveLength(1)
     expect(workflow).toContain('"${REGISTRY_IMAGE}@${{ needs.merge-base.outputs.version_digest }}"')
   })
 
-  test('fails closed when npm, image, or git release identity belongs to another source commit', () => {
-    expect(workflow).toContain('npm_git_head')
+  test('derives latest promotion from repository release tags instead of npm', () => {
+    expect(workflow).toContain("git ls-remote --tags origin 'refs/tags/[0-9]*'")
+    expect(workflow).toContain("grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+$'")
+  })
+
+  test('fails closed when image or git release identity belongs to another source commit', () => {
     expect(workflow).toContain('org.opencontainers.image.revision')
     expect(workflow).toContain('release tag source does not match workflow source')
-    expect(workflow).toContain('published npm source does not match workflow source')
     expect(workflow).toContain('source_sha="$(bash scripts/resolve-release-source.sh "$VERSION" "$GITHUB_SHA")"')
     expect(workflow).toContain('git checkout --detach "$source_sha"')
     expect(workflow).toContain('fetch-depth: 0')

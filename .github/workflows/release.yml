@@ -7,11 +7,20 @@ on:
         description: 'Version (x.y.z)'
         required: true
 
-# Serialize every release so two versions cannot race mutable npm/GHCR tags or
+# Fork divergence (ADR 0003 in fml09/typeclaw-operator, owner decision
+# 2026-08-26): releases are REGISTRY-ONLY. The upstream publication step is
+# removed because the `typeclaw` package is owned by the upstream org and
+# OIDC trusted publishing cannot be configured for this fork; the managed
+# runtime image embeds its own dependency graph and consumes nothing from
+# npm at runtime. Everything else — GHCR-first immutable images, reserved
+# bump commit, immutable version tag, GitHub Release — keeps upstream
+# semantics.
+#
+# Serialize every release so two versions cannot race mutable GHCR tags or
 # reserve competing package.json bumps on main. `cancel-in-progress: false`:
-# a release in flight must NEVER be cancelled mid-publish — the GHCR-first/
-# npm-second ordering and the irreversible `npm publish` depend on the job
-# running to completion once started. A duplicate dispatch waits instead.
+# a release in flight must NEVER be cancelled mid-publish — the image-first
+# ordering and the immutable version tag depend on the job running to
+# completion once started. A duplicate dispatch waits instead.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -24,8 +33,8 @@ env:
   RUNTIME_REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/typeclaw-runtime
 
 # Job-default permissions are read-only; each job widens only what it needs
-# (packages: write for the GHCR push/merge jobs, contents: write + id-token:
-# write for the final publish job). Keeping the workflow-level grant minimal
+# (packages: write for the GHCR push/merge jobs, contents: write for the
+# final tag/release job). Keeping the workflow-level grant minimal
 # means the checks job — which runs untrusted-ish test code — can't push.
 permissions:
   contents: read
@@ -46,7 +55,6 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       source_sha: ${{ steps.version.outputs.source_sha }}
-      npm_exists: ${{ steps.preflight.outputs.npm_exists }}
       base_exists: ${{ steps.preflight.outputs.base_exists }}
       runtime_exists: ${{ steps.preflight.outputs.runtime_exists }}
       tag_exists: ${{ steps.preflight.outputs.tag_exists }}
@@ -119,38 +127,26 @@ jobs:
           scratch="$(mktemp -d)"
           trap 'rm -rf -- "$scratch"' EXIT
 
-          npm_exists=false
-          if npm_metadata="$(npm view "typeclaw@${VERSION}" --json 2>"${scratch}/npm.err")"; then
-            npm_exists=true
-            npm_git_head="$(jq -r '.gitHead // empty' <<<"$npm_metadata")"
-            if [ "$npm_git_head" != "$SOURCE_SHA" ]; then
-              echo "::error::published npm source does not match workflow source: ${npm_git_head:-<missing>} != ${SOURCE_SHA}"
-              exit 1
-            fi
-          elif grep -q 'E404' "${scratch}/npm.err"; then
-            npm_exists=false
+          # With npm out of the picture, the mutable-tag guard derives from
+          # this repository's own release tags: promoting :latest backward
+          # while repairing an older version would strand host installs that
+          # pin :latest.
+          latest_tag="$(
+            git ls-remote --tags origin 'refs/tags/[0-9]*' \
+              | sed 's|.*refs/tags/||' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n 1 || true
+          )"
+          if [ -z "$latest_tag" ]; then
+            promote_latest=true
           else
-            echo "::error::could not determine whether typeclaw@${VERSION} exists"
-            cat "${scratch}/npm.err" >&2
-            exit 1
-          fi
-          echo "npm_exists=$npm_exists" >> "$GITHUB_OUTPUT"
-
-          if ! latest_version="$(npm view typeclaw@latest version 2>"${scratch}/npm-latest.err")"; then
-            echo "::error::could not resolve the current npm latest version"
-            cat "${scratch}/npm-latest.err" >&2
-            exit 1
-          fi
-          if ! [[ "$latest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::npm latest is not a strict release version: ${latest_version:-<missing>}"
-            exit 1
-          fi
-          promote_latest="$(node - "$VERSION" "$latest_version" <<'NODE'
+            promote_latest="$(node - "$VERSION" "$latest_tag" <<'NODE'
           const [candidate, current] = process.argv.slice(2).map((version) => version.split('.').map(Number))
           const comparison = candidate[0] - current[0] || candidate[1] - current[1] || candidate[2] - current[2]
           process.stdout.write(comparison >= 0 ? 'true' : 'false')
           NODE
           )"
+          fi
           echo "promote_latest=$promote_latest" >> "$GITHUB_OUTPUT"
 
           inspect_release_image() {
@@ -207,12 +203,8 @@ jobs:
             echo "::error::managed runtime version tag exists without its paired base image"
             exit 1
           fi
-          if [ "$npm_exists" = true ] && { [ "$base_exists" != true ] || [ "$runtime_exists" != true ]; }; then
-            echo "::error::published npm version is missing a paired immutable image"
-            exit 1
-          fi
-          if [ "$tag_exists" = true ] && { [ "$npm_exists" != true ] || [ "$base_exists" != true ] || [ "$runtime_exists" != true ]; }; then
-            echo "::error::release tag exists without the complete npm and image release set"
+          if [ "$tag_exists" = true ] && { [ "$base_exists" != true ] || [ "$runtime_exists" != true ]; }; then
+            echo "::error::release tag exists without the complete image release set"
             exit 1
           fi
 
@@ -314,11 +306,15 @@ jobs:
       bump_sha: ${{ steps.reserve.outputs.bump_sha }}
 
     steps:
+      # This fork carries no branch ruleset, so the default GITHUB_TOKEN
+      # (contents: write above) may push the bump commit directly to main;
+      # upstream needed a bypass-capable deploy key only because of its
+      # ruleset. GITHUB_TOKEN pushes also cannot re-trigger workflows,
+      # which is exactly what a bookkeeping bump wants.
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.checks.outputs.source_sha }}
           fetch-depth: 0
-          ssh-key: ${{ secrets.DEPLOY_KEY }}
 
       - uses: actions/setup-node@v4
         with:
@@ -381,7 +377,8 @@ jobs:
   # Each leg pushes its single-platform image BY DIGEST (push-by-digest=true),
   # NOT to a tag. The immutable `:X.Y.Z` tag is written exactly once by the
   # merge-base job below, so it never resolves to a single-arch image. Mutable
-  # `:latest` promotion is deliberately later, after npm publication.
+  # `:latest` promotion is deliberately deferred to the release job, after
+  # both indexes have been verified pullable.
   build-base:
     name: Build base image / ${{ matrix.arch }}
     needs: [checks, reserve-version]
@@ -435,7 +432,7 @@ jobs:
         # the merge job can pass straight to `imagetools create`.
         #
         # Do NOT add a "skip if exists" guard: partial-failure recovery
-        # (digests pushed, npm publish failed) depends on a re-run re-pushing
+        # (digests pushed, a later release stage failed) depends on a re-run re-pushing
         # identical content so the merge+verify steps have something to
         # assemble. Re-pushing the same digest to GHCR is idempotent.
         id: build
@@ -479,7 +476,7 @@ jobs:
   # is the SINGLE WRITER of the version-named tag. It
   # `needs:` the whole build matrix, so it only runs once both arches pushed
   # their digests. The verify step is the publish gate: the release job
-  # `needs: merge-base`, so npm publish cannot run unless a real multi-arch
+  # `needs: merge-base`, so the release job cannot run unless a real multi-arch
   # manifest resolved and pulled cleanly from a logged-out client.
   merge-base:
     name: Merge and verify base image
@@ -556,7 +553,7 @@ jobs:
         # No retries: `imagetools create` is immediately consistent, and the
         # pulls run from a fresh connection. If any step fails the image is
         # not safe to release — and because the release job `needs:` this
-        # one, a failure here blocks the irreversible npm publish.
+        # one, a failure here blocks the irreversible release finale.
         env:
           VERSION: ${{ needs.checks.outputs.version }}
           SOURCE_SHA: ${{ needs.checks.outputs.source_sha }}
@@ -746,108 +743,30 @@ jobs:
   # SECOND. Order matters: a user who `npm install`s typeclaw@X.Y.Z and runs
   # `typeclaw start` writes a per-agent Dockerfile that does
   # `FROM ghcr.io/typeclaw/typeclaw-base:X.Y.Z` (see src/init/dockerfile.ts).
-  # If `npm publish` ran before the GHCR image existed, there is a window
-  # where users can install a CLI version whose base image does not yet
-  # exist. `needs: [merge-base, merge-runtime]` (which verified both images are
-  # pullable) closes that race. The npm publish below remains the cardinal
-  # irreversible step; everything before it is already in place by the time
-  # this job starts.
+  # Registry-only finale: both multi-arch indexes are already pushed AND
+  # verified anonymously pullable by merge-base / merge-runtime, so the only
+  # remaining acts are the :latest promotion (forward-only), the immutable
+  # version tag over the reserved bump commit, and the GitHub Release.
   release:
-    name: Publish npm, tag, and release
+    name: Tag and release
     needs: [checks, reserve-version, merge-base, merge-runtime]
     runs-on: ubuntu-latest
-    # id-token: write is required for `npm publish --provenance` (OIDC
-    # trusted publishing) — and ONLY this job needs it. contents: write is
-    # for the release tag (over the deploy key) and GitHub Release.
+    # contents: write covers the version tag and GitHub Release; packages:
+    # write covers the :latest promotion into GHCR.
     permissions:
       contents: write
-      id-token: write
       packages: write
 
     steps:
+      # Tag from the canonical source commit so the OCI revision annotations
+      # and the annotated history share one identity. The bump commit
+      # reserved main before builds and is only the tag target. Full history
+      # is required to resolve BUMP_SHA below. This fork has no branch
+      # ruleset, so the default GITHUB_TOKEN may push the tag directly.
       - uses: actions/checkout@v4
-        # SSH deploy key (write-enabled) is the only credential allowed to
-        # bypass the `main` branch ruleset (required PR + status check). The
-        # default GITHUB_TOKEN cannot push directly to main, and adding it
-        # to `bypass_actors` is impossible — GitHub Actions itself is not an
-        # installable App. The deploy key, by contrast, is repo-scoped (not
-        # account-scoped like a PAT) and lives in the ruleset's bypass list
-        # via `actor_type: DeployKey`. See:
-        # https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets#bypass
-        #
-        # `actions/checkout` configures the origin remote with this key, so
-        # the `Commit and tag` step below can `git push` over SSH without
-        # any further setup. `persist-credentials: true` (the default) is
-        # required — turning it off strips the auth and the push falls back
-        # to anonymous HTTPS.
         with:
-          # Publish from the canonical source commit so npm gitHead and both
-          # OCI revision annotations share one identity. The separate bump
-          # commit reserved main before builds and is only the tag target.
           ref: ${{ needs.checks.outputs.source_sha }}
-          ssh-key: ${{ secrets.DEPLOY_KEY }}
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Ensure npm CLI supports OIDC trusted publishing
-        # npm trusted publishing requires npm ≥ 11.5.1. Node 24's bundled npm
-        # has been past that threshold since 24.5.0 (Aug 2025), but Node 24.0.x
-        # ships npm 11.3.0 — too old, so we upgrade explicitly.
-        #
-        # Pin to 11.18.0 (last stable 11.x), NOT npm@latest. npm@latest is
-        # 12.0.0 as of this pin, and the 12.0.0 global install strips the
-        # `sigstore` package, which the `--provenance` publish path requires —
-        # `npm publish --provenance` then dies with `Cannot find module
-        # 'sigstore'`. 11.18.0 supports OIDC trusted publishing and ships
-        # sigstore intact. Bump this pin deliberately once a fixed npm 12.x
-        # is verified to keep sigstore under a global install.
-        run: npm install -g npm@11.18.0 && npm --version
-
-      - name: Bump version
-        # TypeClaw publishes raw TS sources (no build step), and has no
-        # .claude-plugin/plugin.json or skill `version:` frontmatter to sync —
-        # package.json is the only place a version lives. `--allow-same-version`
-        # makes this idempotent across re-runs. Mutates package.json in this
-        # canonical-source checkout only; reserve-version already committed
-        # the same one-file bump on main before any artifact build began.
-        run: npm version ${{ needs.checks.outputs.version }} --no-git-tag-version --allow-same-version
-
-      - name: Publish to npm
-        # Cardinal irreversible step. npm enforces version immutability —
-        # once typeclaw@X.Y.Z is on the registry, that name is burned
-        # forever. By the time this step runs, the GHCR image at the same
-        # version tags have been pushed AND verified pullable (merge-base and
-        # merge-runtime jobs),
-        # so any user who installs typeclaw@X.Y.Z within seconds of this step
-        # completing will succeed at `typeclaw start`.
-        #
-        # The checks job queried this exact version fail-closed and verified
-        # an existing package's gitHead against the immutable source SHA.
-        # Reuse that result here instead of swallowing registry/network errors.
-        env:
-          NPM_EXISTS: ${{ needs.checks.outputs.npm_exists }}
-          PROMOTE_LATEST: ${{ needs.checks.outputs.promote_latest }}
-          VERSION: ${{ needs.checks.outputs.version }}
-        run: |
-          if [ "$NPM_EXISTS" = true ]; then
-            echo "typeclaw@${VERSION} already published, skipping npm publish"
-          elif [ "$PROMOTE_LATEST" = true ]; then
-            npm publish --provenance --access public --tag latest
-          else
-            # A delayed repair of an older version must not move npm latest
-            # backward. The immutable version remains directly installable.
-            npm publish --provenance --access public --tag "release-${VERSION//./-}"
-          fi
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@v3
         if: needs.checks.outputs.promote_latest == 'true'
@@ -882,9 +801,9 @@ jobs:
 
       - name: Create release tag
         if: needs.checks.outputs.tag_exists != 'true'
-        # Runs after BOTH the GHCR image push and the npm publish so a
-        # transient failure in either does not leave a published git tag
-        # pointing at a half-released state. `reserve-version` already pushed
+        # Runs after both multi-arch indexes are pushed AND verified
+        # anonymously pullable, so a transient failure in either does not
+        # leave a published git tag pointing at a half-released state. `reserve-version` already pushed
         # (or recovered) the package.json-only bump before builds; tag that
         # exact commit without moving main here. Existing tags are validated
         # during preflight and never force-moved.
