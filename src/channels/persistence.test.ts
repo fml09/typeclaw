@@ -50,6 +50,42 @@ describe('loadChannelSessions', () => {
     expect(out[0]?.lastInboundAt).toBe(1234)
   })
 
+  test('migrates a v6 session by dropping its timestamp-less review round', async () => {
+    const dir = await tempDir()
+    const path = channelsSessionsPath(dir)
+    await mkdir(join(dir, 'channels'), { recursive: true })
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 6,
+        sessions: [
+          {
+            adapter: 'github',
+            workspace: 'acme/widgets',
+            chat: 'pr:7',
+            thread: '101',
+            sessionId: 'ses_legacy_round',
+            participants: [],
+            githubReviewRound: {
+              workspace: 'acme/widgets',
+              prNumber: 7,
+              headSha: 'sha-round',
+              carrierThread: '101',
+              status: 'pending',
+              attemptedCarriers: ['101'],
+            },
+          },
+        ],
+      }),
+    )
+
+    const out = await loadChannelSessions(dir, silentLogger)
+
+    expect(out).toHaveLength(1)
+    expect(out[0]?.sessionId).toBe('ses_legacy_round')
+    expect(out[0]?.githubReviewRound).toBeUndefined()
+  })
+
   test('migrates v4 Webex room ids to refs and leaves existing refs unchanged', async () => {
     const dir = await tempDir()
     const path = channelsSessionsPath(dir)
@@ -165,7 +201,7 @@ describe('loadChannelSessions', () => {
 
       expect(out).toEqual([])
       expect(warns[0]).toContain(`version ${version} not supported`)
-      expect(warns[0]).toContain('expected 5')
+      expect(warns[0]).toContain('expected 7')
     })
   }
 
@@ -184,17 +220,17 @@ describe('loadChannelSessions', () => {
     const dir = await tempDir()
     const path = channelsSessionsPath(dir)
     await mkdir(join(dir, 'channels'), { recursive: true })
-    await writeFile(path, JSON.stringify({ version: 6, sessions: [] }))
+    await writeFile(path, JSON.stringify({ version: 8, sessions: [] }))
     const warns: string[] = []
     const out = await loadChannelSessions(dir, { info: () => {}, warn: (m) => warns.push(m), error: () => {} })
     expect(out).toEqual([])
-    expect(warns[0]).toContain('version 6 not supported')
-    expect(warns[0]).toContain('expected 5')
+    expect(warns[0]).toContain('version 8 not supported')
+    expect(warns[0]).toContain('expected 7')
   })
 })
 
 describe('saveChannelSessions', () => {
-  test('persists records as a v5 file with stable structure', async () => {
+  test('persists records as a v6 file with stable structure', async () => {
     const dir = await tempDir()
     const records: ChannelSessionRecord[] = [
       {
@@ -210,7 +246,7 @@ describe('saveChannelSessions', () => {
     await saveChannelSessions(dir, records, silentLogger)
     const raw = await readFile(channelsSessionsPath(dir), 'utf8')
     const parsed = JSON.parse(raw)
-    expect(parsed.version).toBe(5)
+    expect(parsed.version).toBe(7)
     expect(parsed.sessions).toHaveLength(1)
     expect(parsed.sessions[0].sessionId).toBe('ses_abc')
     expect(parsed.sessions[0].sessionFile).toBe('2026-05-02T16-56-52-380Z_ses_abc.jsonl')
@@ -251,6 +287,87 @@ describe('saveChannelSessions', () => {
     expect(loaded).toHaveLength(1)
     expect(loaded[0]?.sessionId).toBe('ses_abc')
     expect(loaded[0]?.sessionFile).toBeUndefined()
+  })
+
+  test('round-trips a pending GitHub review round on the existing session record', async () => {
+    const dir = await tempDir()
+    const records: ChannelSessionRecord[] = [
+      {
+        adapter: 'github',
+        workspace: 'acme/widgets',
+        chat: 'pr:7',
+        thread: '101',
+        sessionId: 'ses_round',
+        participants: [],
+        githubReviewRound: {
+          workspace: 'acme/widgets',
+          prNumber: 7,
+          headSha: 'sha-round',
+          carrierThread: '101',
+          status: 'pending',
+          createdAt: Date.now(),
+          attemptedCarriers: ['101'],
+        },
+      },
+    ]
+    await saveChannelSessions(dir, records, silentLogger)
+    expect(await loadChannelSessions(dir, silentLogger)).toEqual(records)
+  })
+
+  test('round-trips a completed GitHub review round until its thread close-out', async () => {
+    const dir = await tempDir()
+    const records: ChannelSessionRecord[] = [
+      {
+        adapter: 'github',
+        workspace: 'acme/widgets',
+        chat: 'pr:7',
+        thread: '202',
+        sessionId: 'ses_completed_round',
+        participants: [],
+        githubReviewRound: {
+          workspace: 'acme/widgets',
+          prNumber: 7,
+          headSha: 'sha-round',
+          carrierThread: '101',
+          status: 'completed',
+          createdAt: Date.now(),
+          attemptedCarriers: ['101'],
+        },
+      },
+    ]
+    await saveChannelSessions(dir, records, silentLogger)
+    expect(await loadChannelSessions(dir, silentLogger)).toEqual(records)
+  })
+
+  test('drops a pending round whose PR identity does not match its session record', async () => {
+    const dir = await tempDir()
+    const path = channelsSessionsPath(dir)
+    await mkdir(join(dir, 'channels'), { recursive: true })
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 7,
+        sessions: [
+          {
+            adapter: 'github',
+            workspace: 'acme/widgets',
+            chat: 'pr:7',
+            thread: '101',
+            participants: [],
+            githubReviewRound: {
+              workspace: 'acme/other',
+              prNumber: 8,
+              headSha: 'sha-round',
+              carrierThread: '101',
+              status: 'pending',
+              createdAt: Date.now(),
+              attemptedCarriers: ['101'],
+            },
+          },
+        ],
+      }),
+    )
+    expect(await loadChannelSessions(dir, silentLogger)).toEqual([])
   })
 
   test('dedupes by 4-tuple, last-write-wins', async () => {

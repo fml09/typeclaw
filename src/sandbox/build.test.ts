@@ -161,6 +161,21 @@ describe('buildSandboxedCommand env policy', () => {
     }
   })
 
+  test('explicitly unsets a withheld name and omits it from the frozen parent env', () => {
+    const name = 'TYPECLAW_SANDBOX_WITHHELD_SECRET'
+    process.env[name] = 'ambient-secret'
+    try {
+      const { argv, spawnEnv } = buildSandboxedCommand('true', { env: { withhold: [name] } })
+      expect(argv).toContain('--clearenv')
+      expect(argv).toEqual(expect.arrayContaining(['--unsetenv', name]))
+      expect(argv).not.toContain('ambient-secret')
+      expect(spawnEnv[name]).toBeUndefined()
+      expect(Object.keys(spawnEnv)).not.toContain(name)
+    } finally {
+      delete process.env[name]
+    }
+  })
+
   test('keeps an inherited secret out of /proc cmdline while the child receives it', async () => {
     if (process.platform !== 'linux') return
     const name = 'TYPECLAW_SANDBOX_PROC_SECRET'

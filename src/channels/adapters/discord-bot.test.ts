@@ -1922,7 +1922,7 @@ describe('discord-bot slash command declarations', () => {
 
 describe('createInteractionHandler', () => {
   type CapturedCall = { url: string; init: RequestInit }
-  type RouterCall = { key: ChannelKey; name: string; invokerId: string }
+  type RouterCall = { key: ChannelKey; name: string; invokerId: string; parentChat?: string }
   type RouterResult =
     | { kind: 'handled'; name: string; reply?: string }
     | { kind: 'no-live-session' }
@@ -1948,7 +1948,12 @@ describe('createInteractionHandler', () => {
     const handler = createInteractionHandler({
       router: {
         executeCommand: async (key, name, options) => {
-          routerCalls.push({ key, name, invokerId: options.invokerId })
+          routerCalls.push({
+            key,
+            name,
+            invokerId: options.invokerId,
+            ...(options.parentChat !== undefined ? { parentChat: options.parentChat } : {}),
+          })
           return routerImpl(key, name, options.invokerId)
         },
       },
@@ -1995,6 +2000,25 @@ describe('createInteractionHandler', () => {
     const body = JSON.parse(fetchCalls[0]!.init.body as string)
     expect(body.data.content).toContain('Stopped')
     expect(body.data.flags).toBe(64)
+  })
+
+  test('/stop interaction forwards its Discord thread parent to executeCommand', async () => {
+    const { handler, routerCalls } = setup(async () => ({ kind: 'handled', name: 'stop' }))
+    const event = interaction({
+      channel_id: '100000000000000001',
+      guild_id: '100000000000000002',
+    }) as Parameters<ReturnType<typeof createInteractionHandler>>[0] & {
+      channel: { id: string; type: number; parent_id: string }
+    }
+    event.channel = {
+      id: '100000000000000001',
+      type: 11,
+      parent_id: '100000000000000003',
+    }
+
+    await handler(event)
+
+    expect(routerCalls[0]?.parentChat).toBe('100000000000000003')
   })
 
   test('/help interaction acks with the handler-provided command list', async () => {

@@ -31,6 +31,8 @@ Compact strings parsed at config load. AND within a rule (whitespace-separated t
 | `kakao:group/*`             | any KakaoTalk group chat          |
 | `kakao:group/<chat-id>`     | one specific group chat           |
 
+Discord threads inherit their parent channel's scope. A rule for `discord:<guild-id>/<parent-channel-id>` therefore matches both the parent channel and its resolved child threads. A rule that names a thread ID still matches only that thread, and a thread whose parent cannot be resolved does not inherit a parent rule.
+
 ## Author qualifier
 
 Appended to a channel rule, AND-combined:

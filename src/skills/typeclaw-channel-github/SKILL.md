@@ -1,6 +1,6 @@
 ---
 name: typeclaw-channel-github
-description: Use this skill ALWAYS for PR review requests in any phrasing, including "requested your review on PR #N", "requested a review from team @… on PR #N", "@bot review this", "can you take a look at #123", "이 PR 리뷰해줘", and "리뷰 반영"; delegate reviews of other people's PRs to the `reviewer` subagent and post line-anchored findings with `post_github_review`. ALWAYS settle PR authorship first (triage #0): on a PR you opened, act as the CONTRIBUTOR/author, never review your own PR, and use host-stage operator checkout/push help to address feedback. Also use this skill to resolve threads you authored with `resolve_review_thread`, create issues with model-driven `gh issue create`, or prepare host-stage PR creation, checkout, and push actions.
+description: Use this skill ALWAYS for PR review requests in any phrasing, including "requested your review on PR #N", "requested a review from team @… on PR #N", "@bot review this", "can you take a look at #123", "이 PR 리뷰해줘", and "리뷰 반영"; delegate reviews of other people's PRs to the `reviewer` subagent and post line-anchored findings with `post_github_review`. ALWAYS settle PR authorship first (triage #0): on a PR you opened, act as the CONTRIBUTOR/author, never review your own PR, use host-stage operator help only for checkout and PR creation, and perform eligible configured-remote pushes yourself through the broker. Also use this skill to resolve threads you authored with `resolve_review_thread`, create issues with model-driven `gh issue create`, or prepare host-stage PR creation/checkout and brokered push actions.
 ---
 
 GitHub renders normal Markdown in issues, PRs, discussions, and review comments. Use headings, lists, tables, fenced code blocks, links, and inline code when they improve clarity.
@@ -24,7 +24,7 @@ Before you pick an action, classify the inbound. Skipping this step is how a PR 
    gh pr view <N> --repo owner/repo --json author --jq '.author.login'
    ```
 
-- **The PR author is you (`<your-login>`).** You are the **contributor/author** on this PR, not its reviewer. Feedback on it — a review, a "리뷰 반영 부탁드려요" / "address the review" / "please apply the feedback" / "fixed?" comment, a `CHANGES_REQUESTED` someone else left — is yours to **address as the author**: read it, ask the operator for the required host-stage checkout, change and commit the code, ask the operator to push, and reply. Go to the **contributor flow** ("When the PR is yours"). **You never review your own PR**, and you never spawn the `reviewer` subagent on it — GitHub does not even let an author formally review their own PR, so an attempt produces a self-addressed "review" comment, which is the exact persona-confusion bug to avoid. Gates 1–2 below (review obligations / review requests) describe the _reviewer_ persona and **do not apply when the PR is yours** — skip straight to the contributor flow.
+- **The PR author is you (`<your-login>`).** You are the **contributor/author** on this PR, not its reviewer. Feedback on it — a review, a "리뷰 반영 부탁드려요" / "address the review" / "please apply the feedback" / "fixed?" comment, a `CHANGES_REQUESTED` someone else left — is yours to **address as the author**: read it, ask the operator for the required host-stage checkout, change and commit the code, push the configured remote yourself through an eligible broker credential, and reply. Go to the **contributor flow** ("When the PR is yours"). **You never review your own PR**, and you never spawn the `reviewer` subagent on it — GitHub does not even let an author formally review their own PR, so an attempt produces a self-addressed "review" comment, which is the exact persona-confusion bug to avoid. Gates 1–2 below (review obligations / review requests) describe the _reviewer_ persona and **do not apply when the PR is yours** — skip straight to the contributor flow.
   - **The PR author is someone else.** You may be its reviewer. Continue to gate 1.
 
   This gate is first because everything after it assumes the reviewer persona. "Address the review" sounds identical whether you wrote the PR or someone else did; only the author check disambiguates, and getting it wrong is what makes the agent review its own work.
@@ -80,17 +80,17 @@ The flow:
    gh pr checkout <N> --repo owner/repo
    ```
 
-   After the operator confirms the checkout, make the minimal fixes and commit them locally with `typeclaw-git` hygiene. Pushing is **not** host-stage only: the broker mints a per-repo credential for a standalone push, so run it yourself from the accessible checkout, naming the remote and branch explicitly:
+   After the operator confirms the checkout, make the minimal fixes and commit them locally with `typeclaw-git` hygiene. Pushing is **not** host-stage only when an eligible broker credential exists. Credential precedence is GitHub App, then an authorized PAT declared in `.env`, then the trusted GitHub CLI store. A configured GitHub remote can use the store fallback from any accessible repository path. The store accepts one configured destination and does not accept explicit-URL or `--set-upstream` pushes.
 
    ```sh
-   git -C <checkout> push -u origin <branch>
+   git -C <checkout> push origin <branch>
    ```
 
-   Fix ordinary Git errors (missing upstream, stale ref, needs a rebase) yourself and retry. Hand the operator that exact push command only when the broker or your permissions refuse it — no brokered credential for the repo, or your role lacks the `gitExfil` bypass.
+Fix ordinary Git errors (missing upstream, stale ref, needs a rebase) yourself and retry. If the broker or your permissions refuse it — no eligible credential for the repo, or your role lacks the `gitExfil` bypass — surface that exact denial instead of claiming every push is host-stage.
 
-   Do **not** open a _new_ PR to fix your existing one; the push goes to the same branch so the open PR updates in place.
+Do **not** open a _new_ PR to fix your existing one; the push goes to the same branch so the open PR updates in place.
 
-   If a point is a genuine disagreement (the reviewer is mistaken, or the behavior is intentional), don't silently change it — reply in the thread with your reasoning instead.
+If a point is a genuine disagreement (the reviewer is mistaken, or the behavior is intentional), don't silently change it — reply in the thread with your reasoning instead.
 
 3. **Reply to the feedback as the author.** After pushing, acknowledge each addressed thread with a normal `channel_reply` (keep `thread` set to stay in the inline thread; omit it for the PR conversation). Say what you changed ("Fixed — switched to the wiki-link form in `abc1234`") or why you didn't ("Left as-is — this path can't be null because …"). Keep it short.
    - **Do not resolve the threads.** On your own PR the open inline threads were authored by your **reviewer**, not by you — and the base principle is _whoever opened the thread closes it_. Resolving is the reviewer's call once they're satisfied; the runtime enforces this (it only lets you resolve threads whose root comment **you** authored). Push the fix, reply, and leave the thread for the reviewer to close.
@@ -309,13 +309,15 @@ gh issue create --repo owner/repo --title 'Bug: ...' --body '...'
 
 ```
 
-For a pull request from a project repo you cloned into `workspace/<repo>`, push the head branch yourself — the broker mints a per-repo credential for a standalone push. A fresh PR branch has no upstream, so name the remote and branch explicitly:
+For a pull request from any accessible project checkout, push the head branch yourself when an eligible broker credential exists. Credential precedence is GitHub App, then an authorized PAT declared in `.env`, then the trusted GitHub CLI store. The store can fund a configured GitHub remote from `workspace`, mounts, nested repositories, or `/tmp`; it requires one configured destination and does not accept explicit-URL or `--set-upstream` pushes. Name the checkout, remote, and branch explicitly:
 
 ```sh
-git -C workspace/<repo> push -u origin <branch>
+git -C <checkout> push <remote> <branch>
 ```
 
-Then prepare the exact title, body, head branch and base branch and ask the operator to run `gh pr create --repo owner/repo --title 'Fix: ...' --head my-branch --base main --body '...'` at the host stage from that same checkout: `gh pr create` is host-stage only because it may execute local Git hooks with reusable credentials. Fix ordinary Git errors yourself and retry; hand the operator the push command only when the broker or your permissions refuse it — no brokered credential, or your role lacks the `gitExfil` bypass. When you do hand off, name the host-accessible `workspace/<repo>` checkout; never direct them to a per-session `/tmp` path.
+If the trusted store is unavailable, ask the operator to run `gh auth login --hostname github.com` on the host. The next real `typeclaw start` or `typeclaw restart` refreshes the stored account automatically; a start that finds the container already running does not.
+
+Then prepare the exact title, body, head branch and base branch and ask the operator to run `gh pr create --repo owner/repo --title 'Fix: ...' --head my-branch --base main --body '...'` at the host stage from that same checkout: `gh pr create` is host-stage only because it may execute local Git hooks with reusable credentials. Fix ordinary Git push errors yourself and retry; if the broker or your permissions refuse, surface the exact denial. For the PR-creation handoff, name the host-accessible `workspace/<repo>` checkout; never direct the operator to a per-session `/tmp` path.
 
 For the supported issue form under App auth, TypeClaw mints a short-lived token for the explicit `--repo owner/repo` target and withholds it from sibling commands and shell expansions.
 

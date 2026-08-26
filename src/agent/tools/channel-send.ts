@@ -12,6 +12,7 @@ import {
   type ChannelRouter,
 } from '@/channels/router'
 import { ADAPTER_IDS, type AdapterId } from '@/channels/schema'
+import type { GithubReviewFollowupRound } from '@/channels/types'
 
 import { type ChannelToolLogger, consoleChannelLogger, formatChannelToolFailure } from './channel-log'
 import { renderOutboundEcho, TOOL_RESULT_PREFIX } from './channel-reply'
@@ -22,6 +23,7 @@ export type ChannelSendOrigin = {
   workspace: string
   chat: string
   thread: string | null
+  githubReviewRound?: GithubReviewFollowupRound
 }
 
 export type CreateChannelSendToolOptions = {
@@ -233,6 +235,14 @@ export function createChannelSendTool({
         wantsResolve,
         moreWorkThisTurn: false,
         getReviewState: (req) => router.getReviewState(req),
+        ...(origin !== undefined &&
+        origin.adapter === adapter &&
+        origin.workspace === params.workspace &&
+        origin.chat === params.chat &&
+        origin.thread === (params.thread ?? null) &&
+        origin.githubReviewRound !== undefined
+          ? { round: origin.githubReviewRound }
+          : {}),
       })
       if (rereview.block) {
         logger.warn(formatChannelToolFailure('channel_send', rereview.reason))
@@ -261,6 +271,18 @@ export function createChannelSendTool({
             details: { ok: false, error: resolve.error },
           }
         }
+        if (resolve.kind === 'already-resolved') {
+          router.finishGithubReviewRoundCloseout?.({
+            sessionId,
+            workspace: params.workspace,
+            prNumber: parseGithubPrNumber(params.chat),
+            thread: params.thread ?? null,
+          })
+          return {
+            content: [{ type: 'text' as const, text: alreadyResolvedHint(params.thread ?? null) }],
+            details: { ok: true },
+          }
+        }
         // `no-match`: the thread listed cleanly but nothing is rooted at this
         // comment (gone, or a mispaired id from the bare-id follow-up list). It
         // stays non-blocking so a genuinely-deleted thread's ack still posts,
@@ -271,6 +293,12 @@ export function createChannelSendTool({
           resolveMissNotice = resolveMissHint(params.thread ?? null)
         } else {
           recordResolvedThreadFromSend(sessionId, params.workspace, params.chat, params.thread ?? null)
+          router.finishGithubReviewRoundCloseout?.({
+            sessionId,
+            workspace: params.workspace,
+            prNumber: parseGithubPrNumber(params.chat),
+            thread: params.thread ?? null,
+          })
         }
       }
 
@@ -340,6 +368,11 @@ export function createChannelSendTool({
   })
 }
 
+function parseGithubPrNumber(chat: string): number {
+  const match = /^pr:(\d+)$/.exec(chat)
+  return match === null ? 0 : Number(match[1])
+}
+
 function missingReviewThreadResolveChoiceError(input: {
   adapter: AdapterId
   chat: string
@@ -360,7 +393,11 @@ function missingReviewThreadResolveChoiceError(input: {
   )
 }
 
-type ResolveOutcome = { kind: 'resolved' } | { kind: 'no-match' } | { kind: 'block'; error: string }
+type ResolveOutcome =
+  | { kind: 'resolved' }
+  | { kind: 'already-resolved' }
+  | { kind: 'no-match' }
+  | { kind: 'block'; error: string }
 
 async function resolveReviewThreadBeforeSend(
   router: ChannelRouter,
@@ -378,9 +415,15 @@ async function resolveReviewThreadBeforeSend(
     chat: target.chat,
     rootCommentId: target.thread,
   })
-  if (result.ok) return { kind: 'resolved' }
+  if (result.ok) return { kind: result.alreadyResolved === true ? 'already-resolved' : 'resolved' }
   if (result.code === 'no-match') return { kind: 'no-match' }
   return { kind: 'block', error: `could not resolve review thread: ${result.error}` }
+}
+
+function alreadyResolvedHint(thread: string | null): string {
+  return fenceRuntimeNotice(
+    `review thread ${JSON.stringify(thread)} was already resolved; no acknowledgement comment was posted.`,
+  )
 }
 
 // The model asked to resolve but no thread was rooted at this comment. Fenced

@@ -27,6 +27,7 @@ export type MatchableOrigin =
       adapter: AdapterId
       workspace: string
       chat: string
+      parentChat?: string
       lastInboundAuthorId?: string
     }
 
@@ -53,14 +54,19 @@ function matchesChannel(rule: Extract<MatchRule, { kind: 'channel' }>, origin: M
 
   if (rule.bucket !== undefined) {
     if (!matchesBucket(rule.bucket, origin)) return false
-    if (rule.chat !== undefined && rule.chat !== origin.chat) return false
+    if (rule.chat !== undefined && !matchesChat(rule.chat, origin)) return false
   } else {
     if (rule.workspace !== undefined && rule.workspace !== origin.workspace) return false
-    if (rule.chat !== undefined && rule.chat !== origin.chat) return false
+    if (rule.chat !== undefined && !matchesChat(rule.chat, origin)) return false
   }
 
   if (rule.author !== undefined && !matchesAuthor(rule.platform, rule.author, origin.lastInboundAuthorId)) return false
   return true
+}
+
+function matchesChat(ruleChat: string, origin: Extract<MatchableOrigin, { kind: 'channel' }>): boolean {
+  if (ruleChat === origin.chat) return true
+  return ADAPTER_TO_PLATFORM[origin.adapter] === 'discord' && ruleChat === origin.parentChat
 }
 
 // Webex person ids are base64(`ciscospark://<cluster>/PEOPLE/<uuid-or-email>`),

@@ -1,12 +1,42 @@
 // Plain-`git` analog of analyzeGhCommand. Git names its target indirectly, so
 // this analyzer resolves configured remotes before selecting a per-repo token.
 
+import { spawn, type ChildProcess } from 'node:child_process'
+
 import { mapVirtualTmpPath } from '@/sandbox'
+
+import { GIT_CREDENTIAL_ENV_KEYS } from './git-credential-env'
+
+// GitHub refuses anonymous writes, so a `write` decision the broker cannot fund
+// is already doomed — the caller turns that into a block with guidance rather
+// than letting git die on a credential prompt. Reads stay fundable-but-optional:
+// public clone/fetch/ls-remote succeed with no token at all.
+export type GitRemoteAccess = 'read' | 'write'
+
+export type GitPushProvenance =
+  | { kind: 'explicit-url'; complete: true }
+  | {
+      kind: 'configured-remote'
+      remote: string
+      pushUrls: string[]
+      repoSlugs: string[]
+      worktreeTopLevel: string | null
+      sourceCwd: string
+      refspecs: string[]
+      setUpstream: boolean
+      complete: boolean
+    }
 
 export type GitCommandDecision =
   | { kind: 'pass-through' }
   | { kind: 'block'; reason: string }
-  | { kind: 'inject'; repoSlug: string; rewrittenCommand?: string }
+  | {
+      kind: 'inject'
+      repoSlug: string
+      access: GitRemoteAccess
+      pushProvenance?: GitPushProvenance
+      rewrittenCommand?: string
+    }
 
 export type GitRemoteResolver = (cwd: string, remote: string, forPush: boolean) => Promise<string | null>
 export type GitConfigResolver = (cwd: string, key: string) => Promise<string | null>
@@ -16,24 +46,67 @@ export type GitResolvers = {
   resolveRemoteUrl: GitRemoteResolver
   resolveConfig: GitConfigResolver
   resolveCurrentBranch: GitBranchResolver
+  resolvePushUrls?: (cwd: string, remote: string) => Promise<string[] | null>
+  resolveTopLevel?: (cwd: string) => Promise<string | null>
 }
 
+const GIT_RESOLVER_TIMEOUT_MS = 2_000
+const GIT_RESOLVER_STDOUT_LIMIT = 64 * 1024
+const GIT_RESOLVER_KILL_SETTLE_MS = 250
+
 async function runGit(cwd: string, args: string[]): Promise<string | null> {
-  const bun = (globalThis as { Bun?: { spawn: typeof Bun.spawn } }).Bun
-  if (!bun) return null
-  try {
-    const proc = bun.spawn({
-      cmd: ['git', '-C', cwd, ...args],
-      stdout: 'pipe',
-      stderr: 'ignore',
+  return await new Promise((resolveResult) => {
+    const child = spawn('git', ['-C', cwd, ...args], {
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'ignore'],
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
     })
-    if ((await proc.exited) !== 0) return null
-    const out = (await new Response(proc.stdout).text()).trim()
-    return out === '' ? null : out
-  } catch {
-    return null
+    const chunks: Buffer[] = []
+    let bytes = 0
+    let settled = false
+    let settleTimer: ReturnType<typeof setTimeout> | undefined
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined
+    const finish = (value: string | null): void => {
+      if (settled) return
+      settled = true
+      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer)
+      if (settleTimer !== undefined) clearTimeout(settleTimer)
+      resolveResult(value)
+    }
+    const terminate = (): void => {
+      if (settleTimer !== undefined || settled) return
+      killChildProcessGroup(child)
+      settleTimer = setTimeout(() => finish(null), GIT_RESOLVER_KILL_SETTLE_MS)
+    }
+    timeoutTimer = setTimeout(terminate, GIT_RESOLVER_TIMEOUT_MS)
+    child.stdout.on('data', (chunk: Buffer) => {
+      bytes += chunk.length
+      if (bytes > GIT_RESOLVER_STDOUT_LIMIT) {
+        terminate()
+        return
+      }
+      chunks.push(chunk)
+    })
+    child.on('error', () => finish(null))
+    child.on('close', (code) => {
+      if (code !== 0 || bytes > GIT_RESOLVER_STDOUT_LIMIT) return finish(null)
+      const output = Buffer.concat(chunks).toString('utf8').trim()
+      finish(output === '' ? null : output)
+    })
+  })
+}
+
+function killChildProcessGroup(child: ChildProcess): void {
+  if (process.platform !== 'win32' && child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+      return
+    } catch {
+      child.kill('SIGKILL')
+      return
+    }
   }
+  child.kill('SIGKILL')
 }
 
 export const defaultGitResolvers: GitResolvers = {
@@ -41,6 +114,11 @@ export const defaultGitResolvers: GitResolvers = {
     runGit(cwd, forPush ? ['remote', 'get-url', '--push', remote] : ['remote', 'get-url', remote]),
   resolveConfig: (cwd, key) => runGit(cwd, ['config', '--get', key]),
   resolveCurrentBranch: (cwd) => runGit(cwd, ['symbolic-ref', '--short', 'HEAD']),
+  resolvePushUrls: async (cwd, remote) => {
+    const output = await runGit(cwd, ['remote', 'get-url', '--push', '--all', remote])
+    return output === null ? null : output.split(/\r?\n/).filter((line) => line !== '')
+  },
+  resolveTopLevel: (cwd) => runGit(cwd, ['rev-parse', '--show-toplevel']),
 }
 
 // Sandboxed bash sees the per-session scratch dir bound over `/tmp`
@@ -57,17 +135,28 @@ export function createSessionTmpGitResolvers(
   base: GitResolvers = defaultGitResolvers,
 ): GitResolvers {
   const backing = (cwd: string): string => mapVirtualTmpPath(agentDir, sessionId, cwd) ?? cwd
-  return {
+  const mapped: GitResolvers = {
     resolveRemoteUrl: (cwd, remote, forPush) => base.resolveRemoteUrl(backing(cwd), remote, forPush),
     resolveConfig: (cwd, key) => base.resolveConfig(backing(cwd), key),
     resolveCurrentBranch: (cwd) => base.resolveCurrentBranch(backing(cwd)),
   }
+  if (base.resolvePushUrls !== undefined) {
+    mapped.resolvePushUrls = (cwd, remote) => base.resolvePushUrls?.(backing(cwd), remote) ?? Promise.resolve(null)
+  }
+  if (base.resolveTopLevel !== undefined) {
+    mapped.resolveTopLevel = (cwd) => base.resolveTopLevel?.(backing(cwd)) ?? Promise.resolve(null)
+  }
+  return mapped
 }
 
 const MULTI_OWNER_REASON =
   'This git command targets more than one repository; a single minted GitHub App ' +
   'token is scoped to one repo and cannot authenticate all of them. Split it into ' +
   'separate commands, one repository each.'
+
+const MIXED_PUSH_URLS_REASON =
+  'This remote mixes GitHub push destinations with a malformed or non-GitHub push URL. ' +
+  'TypeClaw cannot safely bind credentials to every destination, so the push is blocked.'
 
 const COMPOSITION_REASON =
   'A repo-targeting `git` command receives a minted GitHub App token via ' +
@@ -78,17 +167,17 @@ const COMPOSITION_REASON =
   'which is rewritten to `git -C <path> …`. Run local Git commands separately, ' +
   'then retry the remote operation as a standalone `git -C <path> …` command.'
 
-const TAIL_STRIP_PREFIX =
-  'exec /usr/bin/env -u TYPECLAW_GIT_TOKEN -u GIT_ASKPASS -u GH_TOKEN -u GITHUB_TOKEN ' +
-  '-u GIT_TERMINAL_PROMPT -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 ' +
-  '-u GIT_CONFIG_KEY_1 -u GIT_CONFIG_VALUE_1 -u GIT_CONFIG_KEY_2 -u GIT_CONFIG_VALUE_2 ' +
-  '-u GIT_CONFIG_KEY_3 -u GIT_CONFIG_VALUE_3 /bin/bash -c'
+const AMBIENT_GITHUB_TOKEN_ENV_KEYS = ['GH_TOKEN', 'GITHUB_TOKEN'] as const
+const TAIL_STRIP_ENV_KEYS = GIT_CREDENTIAL_ENV_KEYS.flatMap((key) =>
+  key === 'GIT_ASKPASS' ? [key, ...AMBIENT_GITHUB_TOKEN_ENV_KEYS] : [key],
+)
+const TAIL_STRIP_PREFIX = `exec /usr/bin/env ${TAIL_STRIP_ENV_KEYS.map((key) => `-u ${key}`).join(' ')} /bin/bash -c`
 
 type RemoteSubcommand = 'push' | 'fetch' | 'pull' | 'clone' | 'ls-remote'
 
 type TargetSpec =
-  | { kind: 'default-push' }
-  | { kind: 'single'; value: string; forPush: boolean }
+  | { kind: 'default-push'; refspecs: []; setUpstream: false }
+  | { kind: 'single'; value: string; forPush: boolean; refspecs?: string[]; setUpstream?: boolean }
   | { kind: 'multiple'; values: string[] }
 
 type MintableInvocation = {
@@ -101,6 +190,8 @@ type MintableInvocation = {
 type RepoEvidence = {
   slugs: string[]
   complete: boolean
+  blockReason?: string
+  pushProvenance?: GitPushProvenance
 }
 
 const EVIDENCE_GLOBAL_VALUE_OPTIONS = new Set([
@@ -161,12 +252,24 @@ async function decideStandalone(invocation: MintableInvocation, resolvers: GitRe
   const evidence = await resolveMintableEvidence(invocation, resolvers)
   const repos = new Set(evidence.slugs)
 
+  if (evidence.blockReason !== undefined) return { kind: 'block', reason: evidence.blockReason }
   // The order is deliberate: partial evidence may justify blocking a compound,
   // but it can never justify minting for a standalone command.
   if (repos.size === 0) return { kind: 'pass-through' }
   if (!evidence.complete) return { kind: 'pass-through' }
-  if (repos.size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
-  return { kind: 'inject', repoSlug: [...repos][0] as string }
+  if (repos.size > 1 && evidence.pushProvenance?.kind !== 'configured-remote') {
+    return { kind: 'block', reason: MULTI_OWNER_REASON }
+  }
+  return {
+    kind: 'inject',
+    repoSlug: [...repos][0] as string,
+    access: remoteAccess(invocation.subcommand),
+    ...(evidence.pushProvenance === undefined ? {} : { pushProvenance: evidence.pushProvenance }),
+  }
+}
+
+function remoteAccess(subcommand: RemoteSubcommand): GitRemoteAccess {
+  return subcommand === 'push' ? 'write' : 'read'
 }
 
 function parseMintableGitInvocation(command: string, baseCwd: string): MintableInvocation | null {
@@ -227,9 +330,19 @@ function parseMintablePush(args: readonly string[]): TargetSpec | null {
     positionals.push(arg)
   }
 
-  if (repository !== null) return { kind: 'single', value: repository, forPush: true }
-  if (positionals.length > 0) return { kind: 'single', value: positionals[0] as string, forPush: true }
-  return upstream ? null : { kind: 'default-push' }
+  if (repository !== null) {
+    return { kind: 'single', value: repository, forPush: true, refspecs: positionals, setUpstream: upstream }
+  }
+  if (positionals.length > 0) {
+    return {
+      kind: 'single',
+      value: positionals[0] as string,
+      forPush: true,
+      refspecs: positionals.slice(1),
+      setUpstream: upstream,
+    }
+  }
+  return upstream ? null : { kind: 'default-push', refspecs: [], setUpstream: false }
 }
 
 function parseMintableFetch(args: readonly string[]): TargetSpec | null {
@@ -325,12 +438,19 @@ async function resolveMintableEvidence(invocation: MintableInvocation, resolvers
   if (invocation.target.kind === 'default-push') {
     try {
       const remote = await resolveDefaultPushRemote(invocation.cwd, resolvers)
-      return resolveOneTarget(remote, invocation.cwd, true, resolvers, false)
+      return resolveOneTarget(remote, invocation.cwd, true, resolvers, false, invocation.target)
     } catch {
       return noEvidence(false)
     }
   }
-  return resolveOneTarget(invocation.target.value, invocation.cwd, invocation.target.forPush, resolvers, false)
+  return resolveOneTarget(
+    invocation.target.value,
+    invocation.cwd,
+    invocation.target.forPush,
+    resolvers,
+    false,
+    invocation.target,
+  )
 }
 
 async function resolveFetchMultiple(
@@ -355,11 +475,59 @@ async function resolveOneTarget(
   forPush: boolean,
   resolvers: GitResolvers,
   nonGithubIsIncomplete: boolean,
+  targetSpec?: TargetSpec,
 ): Promise<RepoEvidence> {
   if (target === null) return noEvidence(false)
+  const explicitUrl = looksLikeUrl(target)
+  if (forPush && explicitUrl) {
+    const slug = parseGithubRepoFromGitUrl(target)
+    return slug === null
+      ? { ...noEvidence(!nonGithubIsIncomplete), pushProvenance: { kind: 'explicit-url', complete: true } }
+      : { slugs: [slug], complete: true, pushProvenance: { kind: 'explicit-url', complete: true } }
+  }
+
+  if (forPush && !explicitUrl && resolvers.resolvePushUrls !== undefined) {
+    let pushUrls: string[] | null
+    try {
+      pushUrls = await resolvers.resolvePushUrls(cwd, target)
+    } catch {
+      return noEvidence(false)
+    }
+    if (pushUrls === null || pushUrls.length === 0) return noEvidence(false)
+    const parsedSlugs = pushUrls.map((url) => parseGithubRepoFromGitUrl(url))
+    const githubSlugs = parsedSlugs.filter((slug): slug is string => slug !== null)
+    if (githubSlugs.length === 0) return noEvidence(!nonGithubIsIncomplete && pushUrls.length === 1)
+    if (githubSlugs.length !== pushUrls.length) {
+      return { slugs: orderedCanonicalSlugs(githubSlugs), complete: false, blockReason: MIXED_PUSH_URLS_REASON }
+    }
+    const repoSlugs = orderedCanonicalSlugs(githubSlugs)
+    let worktreeTopLevel: string | null = null
+    if (resolvers.resolveTopLevel !== undefined) {
+      try {
+        worktreeTopLevel = await resolvers.resolveTopLevel(cwd)
+      } catch {
+        worktreeTopLevel = null
+      }
+    }
+    return {
+      slugs: repoSlugs,
+      complete: true,
+      pushProvenance: {
+        kind: 'configured-remote',
+        remote: target,
+        pushUrls,
+        repoSlugs,
+        worktreeTopLevel,
+        sourceCwd: cwd,
+        refspecs: targetSpec?.kind === 'single' ? (targetSpec.refspecs ?? []) : [],
+        setUpstream: targetSpec?.kind === 'single' ? (targetSpec.setUpstream ?? false) : false,
+        complete: worktreeTopLevel !== null,
+      },
+    }
+  }
   let url: string | null
   try {
-    url = looksLikeUrl(target) ? target : await resolvers.resolveRemoteUrl(cwd, target, forPush)
+    url = explicitUrl ? target : await resolvers.resolveRemoteUrl(cwd, target, forPush)
   } catch {
     return noEvidence(false)
   }
@@ -370,6 +538,10 @@ async function resolveOneTarget(
   return { slugs: [], complete: !nonGithubIsIncomplete }
 }
 
+function orderedCanonicalSlugs(slugs: readonly string[]): string[] {
+  return [...new Set(slugs.map((slug) => slug.toLocaleLowerCase()))]
+}
+
 async function resolveDefaultPushRemote(cwd: string, resolvers: GitResolvers): Promise<string> {
   const branch = await resolvers.resolveCurrentBranch(cwd)
   if (branch !== null && branch !== '') {
@@ -377,7 +549,12 @@ async function resolveDefaultPushRemote(cwd: string, resolvers: GitResolvers): P
     if (perBranch !== null && perBranch !== '') return perBranch
   }
   const pushDefault = await resolvers.resolveConfig(cwd, 'remote.pushDefault')
-  return pushDefault === null || pushDefault === '' ? 'origin' : pushDefault
+  if (pushDefault !== null && pushDefault !== '') return pushDefault
+  if (branch !== null && branch !== '') {
+    const branchRemote = await resolvers.resolveConfig(cwd, `branch.${branch}.remote`)
+    if (branchRemote !== null && branchRemote !== '') return branchRemote
+  }
+  return 'origin'
 }
 
 // Evidence discovery is intentionally not a shell parser. It recognizes only a
@@ -513,7 +690,7 @@ function parseEvidenceTarget(subcommand: RemoteSubcommand, args: readonly string
     }
     if (repository !== null) return { kind: 'single', value: repository, forPush: true }
     return positionals.length === 0
-      ? { kind: 'default-push' }
+      ? { kind: 'default-push', refspecs: [], setUpstream: false }
       : { kind: 'single', value: positionals[0] as string, forPush: true }
   }
 
@@ -625,6 +802,7 @@ function analyzeCloneThenInspect(command: string): GitCommandDecision | null {
   return {
     kind: 'inject',
     repoSlug: parsed.repoSlug,
+    access: 'read',
     rewrittenCommand: `${canonicalHead} && ${TAIL_STRIP_PREFIX} ${posixSingleQuote(split.tail)}`,
   }
 }

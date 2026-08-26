@@ -98,15 +98,15 @@ The same applies to PRs: a quick `gh pr list --search` avoids opening a PR for s
    ```sh
    gh issue create --repo OWNER/REPO --title '<conventional title>' --body '<filled body>'
    ```
-   For a **pull request**, push the head branch yourself first — from a project repo cloned into `workspace/<repo>`, the broker mints a per-repo credential for a standalone push. A fresh branch has no upstream, so name the remote and branch explicitly:
+   For a **pull request**, push the head branch yourself first when an eligible broker credential exists. Credential precedence is GitHub App, then an authorized PAT declared in `.env`, then the trusted GitHub CLI store. The store can fund a configured GitHub remote from any accessible repository path, including `workspace`, mounts, nested repositories, and `/tmp`. It accepts one configured destination and does not accept explicit-URL or `--set-upstream` pushes. Name the remote and branch explicitly:
    ```sh
-   git -C workspace/<repo> push -u origin <branch>
+   git -C <checkout> push <remote> <branch>
    ```
    Then prepare the exact title, body, head branch and base branch and ask the operator to run this at the host stage from that same checkout:
    ```sh
    gh pr create --repo OWNER/REPO --title '<conventional title>' --body '<filled body>' --head <branch> --base <branch>
    ```
-   `gh pr create` is host-stage only: TypeClaw blocks it because it may invoke local Git hooks with reusable credentials. Pushing is different — it is brokered per repo. Fix ordinary Git errors yourself and retry; only hand the operator a push command when the broker or your permissions refuse it (no brokered credential, or your role lacks the `gitExfil` bypass). When you do hand off, name the host-accessible `workspace/<repo>` checkout; never direct the operator to a per-session `/tmp` path.
+   `gh pr create` is host-stage only: TypeClaw blocks it because it may invoke local Git hooks with reusable credentials. Fix ordinary Git errors yourself and retry; only hand the operator a push command when the broker or your permissions refuse it. If the trusted store is unavailable, ask the operator to run `gh auth login --hostname github.com` on the host; the next real `typeclaw start` or `typeclaw restart` refreshes it automatically, while a start against an already-running container does not. When handing off, name a host-accessible checkout; never direct the operator to a per-session `/tmp` path.
 5. **Verify it landed** as intended (`gh issue view` / `gh pr view`) — confirm the template rendered and nothing got truncated.
 
 ## Things you must not do

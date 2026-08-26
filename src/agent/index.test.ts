@@ -1237,6 +1237,39 @@ describe('buildChannelTools', () => {
     expect(buildChannelTools(makeRouter(), channelOrigin).map((tool) => tool.name)).not.toContain('post_github_review')
   })
 
+  test('state-mutating review tools read promoted round identity from the live origin', async () => {
+    const router = makeRouter()
+    const threadOrigin: SessionOrigin = { ...githubOrigin, thread: '202' }
+    let liveOrigin: SessionOrigin = threadOrigin
+    const tools = buildChannelTools(router, threadOrigin, 'github-session', () => liveOrigin)
+    const review = tools.find((tool) => tool.name === 'post_github_review')
+    if (review === undefined) throw new Error('post_github_review missing')
+    liveOrigin = {
+      ...threadOrigin,
+      githubReviewRound: {
+        workspace: 'acme/widgets',
+        prNumber: 7,
+        headSha: 'sha-round',
+        carrierThread: '101',
+      },
+    }
+    const context = {} as Parameters<typeof review.execute>[4]
+
+    const result = await review.execute(
+      'round-live-origin',
+      {
+        event: 'REQUEST_CHANGES',
+        body: 'The blocking concern remains.',
+      },
+      undefined,
+      undefined,
+      context,
+    )
+
+    expect((result.content[0] as { text: string }).text).toContain('assigned the formal verdict to another sibling')
+    await router.stop()
+  })
+
   test('exposes channel_send and channel_read when origin is cron (not channel-routed)', () => {
     // given
     const router = makeRouter()

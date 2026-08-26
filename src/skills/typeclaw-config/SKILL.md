@@ -128,6 +128,8 @@ The `mounts/` directory itself is **gitignored** in your agent folder. The mount
 7. **Commit** with a message explaining which mount was added and why (`typeclaw-git` skill).
 8. **Tell the user to restart**: "Added mount `<name>` → `<path>`. Run `typeclaw restart` (host stage). The mount will appear at `mounts/<name>/` after the next start."
 
+GitHub push credentials are independent of mounts. For store-backed pushes, the operator selects the host account with `gh auth login --hostname github.com`; the next real `typeclaw start` or `typeclaw restart` refreshes the masked trusted store automatically. Configured GitHub remotes can then push from any accessible repository path. Runtime credential precedence is GitHub App, then an authorized PAT declared in `.env`, then the trusted store. The store fallback supports one configured destination, not explicit-URL or `--set-upstream` pushes.
+
 ### When the user asks "what can you see / what's mounted"
 
 1. **Read `typeclaw.json`**, list each mount: `name`, `path`, `readOnly`, `description`.

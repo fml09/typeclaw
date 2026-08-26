@@ -91,7 +91,14 @@ function buildArgv(command: string, policy: SandboxPolicy): string[] {
     argv.push('--die-with-parent')
   }
 
-  const inheritedNames = new Set(policy.env?.inherit ?? [])
+  const withheldNames = new Set(policy.env?.withhold ?? [])
+  const inheritedNames = new Set((policy.env?.inherit ?? []).filter((name) => !withheldNames.has(name)))
+  const unsetNames = new Set<string>()
+  const pushUnset = (name: string): void => {
+    if (unsetNames.has(name)) return
+    unsetNames.add(name)
+    argv.push('--unsetenv', name)
+  }
   if (inheritedNames.size === 0) {
     argv.push('--clearenv')
   } else {
@@ -101,9 +108,10 @@ function buildArgv(command: string, policy: SandboxPolicy): string[] {
       ...Object.keys(policy.env?.set ?? {}),
     ])
     for (const key of Object.keys(process.env).sort()) {
-      if (!retained.has(key)) argv.push('--unsetenv', key)
+      if (!retained.has(key)) pushUnset(key)
     }
   }
+  for (const name of withheldNames) pushUnset(name)
   for (const [key, value] of Object.entries(resolveEnv(policy.env))) {
     if (inheritedNames.has(key)) continue
     argv.push('--setenv', key, value)
@@ -267,8 +275,13 @@ function appendMount(argv: string[], mount: SandboxMount): void {
 }
 
 function resolveEnv(env: SandboxEnvPolicy | undefined): Record<string, string> {
-  const resolved: Record<string, string> = { ...DEFAULT_SANDBOX_ENV, ...env?.set }
+  const withheldNames = new Set(env?.withhold ?? [])
+  const resolved: Record<string, string> = {}
+  for (const [key, value] of Object.entries({ ...DEFAULT_SANDBOX_ENV, ...env?.set })) {
+    if (!withheldNames.has(key)) resolved[key] = value
+  }
   for (const key of env?.passthrough ?? []) {
+    if (withheldNames.has(key)) continue
     const value = process.env[key]
     if (value !== undefined) resolved[key] = value
   }
@@ -282,10 +295,13 @@ function resolveEnv(env: SandboxEnvPolicy | undefined): Record<string, string> {
 // build-to-spawn TOCTOU on the --unsetenv enumeration.
 function resolveSpawnEnv(env: SandboxEnvPolicy | undefined): Record<string, string> {
   const resolved = resolveEnv(env)
+  const withheldNames = new Set(env?.withhold ?? [])
   for (const name of env?.inherit ?? []) {
+    if (withheldNames.has(name)) continue
     const value = process.env[name]
     if (value !== undefined) resolved[name] = value
   }
+  for (const name of withheldNames) delete resolved[name]
   return resolved
 }
 

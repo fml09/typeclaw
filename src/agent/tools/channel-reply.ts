@@ -12,6 +12,7 @@ import {
   type ChannelRouter,
 } from '@/channels/router'
 import type { AdapterId } from '@/channels/schema'
+import type { GithubReviewFollowupRound } from '@/channels/types'
 
 import { type ChannelToolLogger, consoleChannelLogger, formatChannelToolFailure } from './channel-log'
 import { fenceRuntimeNotice, fenceToolResult } from './runtime-notice'
@@ -21,6 +22,7 @@ export type ChannelReplyOrigin = {
   workspace: string
   chat: string
   thread: string | null
+  githubReviewRound?: GithubReviewFollowupRound
 }
 
 export type CreateChannelReplyToolOptions = {
@@ -224,6 +226,7 @@ export function createChannelReplyTool({
         wantsResolve: params.resolve_review_thread === true,
         moreWorkThisTurn: keepTurnAlive,
         getReviewState: (req) => router.getReviewState(req),
+        ...(origin.githubReviewRound !== undefined ? { round: origin.githubReviewRound } : {}),
       })
       if (rereview.block) {
         logger.warn(formatChannelToolFailure('channel_reply', rereview.reason))
@@ -248,11 +251,30 @@ export function createChannelReplyTool({
             details: { ok: false, error: resolve.error },
           }
         }
+        if (resolve.kind === 'already-resolved') {
+          router.finishGithubReviewRoundCloseout?.({
+            sessionId,
+            workspace: origin.workspace,
+            prNumber: parseGithubPrNumber(origin.chat),
+            thread: origin.thread,
+          })
+          return {
+            content: [{ type: 'text' as const, text: alreadyResolvedHint(origin.thread) }],
+            details: { ok: true, ...(keepTurnAlive ? { more_work_this_turn: true } : {}) },
+          }
+        }
         // `no-match` stays non-blocking (the thread may be genuinely gone) but
         // the resolve did NOT run, so tell the model instead of posting a clean
         // receipt that hides the miss. Mirrors channel_send.
         if (resolve.kind === 'no-match') {
           resolveMissNotice = resolveMissHint(origin.thread)
+        } else {
+          router.finishGithubReviewRoundCloseout?.({
+            sessionId,
+            workspace: origin.workspace,
+            prNumber: parseGithubPrNumber(origin.chat),
+            thread: origin.thread,
+          })
         }
       }
 
@@ -339,6 +361,11 @@ export function createChannelReplyTool({
   })
 }
 
+function parseGithubPrNumber(chat: string): number {
+  const match = /^pr:(\d+)$/.exec(chat)
+  return match === null ? 0 : Number(match[1])
+}
+
 // Returns the denial string when a terminal github PR review-thread text reply
 // omits an explicit resolve_review_thread choice, or '' when no choice is owed.
 // Scoped by `^pr:\d+$` (not just thread !== null) so a future threaded github
@@ -368,7 +395,11 @@ function missingReviewThreadResolveChoiceError(input: {
 // success. Every hard failure — wrong author, permission denial, HTTP 404 on a
 // misdirected lookup, transient API error — blocks, so the agent never claims a
 // thread is settled when the resolve did not actually run.
-type ResolveOutcome = { kind: 'resolved' } | { kind: 'no-match' } | { kind: 'block'; error: string }
+type ResolveOutcome =
+  | { kind: 'resolved' }
+  | { kind: 'already-resolved' }
+  | { kind: 'no-match' }
+  | { kind: 'block'; error: string }
 
 async function resolveReviewThreadBeforeReply(
   router: ChannelRouter,
@@ -389,9 +420,15 @@ async function resolveReviewThreadBeforeReply(
     chat: origin.chat,
     rootCommentId: origin.thread,
   })
-  if (result.ok) return { kind: 'resolved' }
+  if (result.ok) return { kind: result.alreadyResolved === true ? 'already-resolved' : 'resolved' }
   if (result.code === 'no-match') return { kind: 'no-match' }
   return { kind: 'block', error: `could not resolve review thread: ${result.error}` }
+}
+
+function alreadyResolvedHint(thread: string | null): string {
+  return fenceRuntimeNotice(
+    `review thread ${JSON.stringify(thread)} was already resolved; no acknowledgement comment was posted.`,
+  )
 }
 
 // The model asked to resolve but no thread was rooted at this comment. Fenced

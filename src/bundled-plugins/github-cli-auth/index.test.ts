@@ -1,22 +1,47 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
   defaultBuiltinPiToolDefinitions,
+  type DeferredBashPreparationResult,
   sanitizeBashSpawnEnvironment,
   TYPECLAW_INTERNAL_BASH_ENV,
+  TYPECLAW_INTERNAL_BASH_PREPARE,
+  TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV,
   wrapBuiltinToolDefinition,
 } from '@/agent/plugin-tools'
-import { __resetReviewVerdictGuardForTest } from '@/channels/github-review-verdict-coordinator'
+import { __resetReviewObserverForTest, setReviewObserver } from '@/channels/github-review-turn-ledger'
+import {
+  __resetReviewVerdictGuardForTest,
+  isGithubReviewRoundComplete,
+} from '@/channels/github-review-verdict-coordinator'
 import type { GithubTokenResolveResult } from '@/channels/github-token-bridge'
 import { noopPermissionService, type PermissionService } from '@/permissions'
-import { createHookBus, type PluginContext, type PluginLogger, type ToolBeforeEvent } from '@/plugin'
-import { buildSandboxedCommand } from '@/sandbox'
+import {
+  createHookBus,
+  type PluginContext,
+  type PluginLogger,
+  type ToolAfterEvent,
+  type ToolBeforeEvent,
+} from '@/plugin'
+import { buildSandboxedCommand, sessionTmpDir } from '@/sandbox'
 
+import { planGithubStorePush, setGhTokenCommandRunnerForTests } from './gh-store'
 import { resetGitAskPassHelperForTests } from './git-askpass'
 import githubCliAuthPlugin from './index'
 
@@ -54,7 +79,11 @@ function pluginContext(
     config: undefined,
     logger: opts.logger ?? noopLogger,
     permissions: opts.permissions ?? noopPermissionService,
-    github: { resolveTokenForRepo: resolve, hasAppTokenResolver: () => hasAppTokenResolver },
+    github: {
+      resolveTokenForRepo: resolve,
+      hasAppTokenResolver: () => hasAppTokenResolver,
+      getAppSelfLogin: () => 'review-bot',
+    },
     spawnSubagent: async () => {},
   }
 }
@@ -68,6 +97,18 @@ async function hookFor(
   const hook = exports.hooks?.['tool.before']
   if (!hook) throw new Error('plugin did not register tool.before')
   return hook
+}
+
+async function hooksFor(
+  resolve: (repoSlug: string) => Promise<GithubTokenResolveResult>,
+  hasAppTokenResolver = true,
+  opts: HookOpts = {},
+) {
+  const exports = await githubCliAuthPlugin.plugin(pluginContext(resolve, hasAppTokenResolver, opts))
+  const before = exports.hooks?.['tool.before']
+  const after = exports.hooks?.['tool.after']
+  if (!before || !after) throw new Error('plugin did not register bash hooks')
+  return { before, after }
 }
 
 function bashEvent(command: string): ToolBeforeEvent {
@@ -1307,7 +1348,7 @@ describe('github-cli-auth plugin — git path', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
-  test('no App minter: authenticated git passes through so git fails honestly', async () => {
+  test('no App minter: a github push blocks with actionable guidance instead of failing mute', async () => {
     delete process.env.GH_TOKEN
     let resolverCalled = false
     const hook = await hookFor(async () => {
@@ -1318,9 +1359,195 @@ describe('github-cli-auth plugin — git path', () => {
 
     const result = await hook(event, hookCtx)
 
-    expect(result).toBeUndefined()
+    expect(result).toMatchObject({ block: true })
+    const reason = (result as { reason: string }).reason
+    // The operator remedy, plus the two blocked retries the reason must steer off.
+    expect(reason).toContain('channels.github')
+    expect(reason).toContain('gh auth setup-git')
+    expect(reason).toContain('gh auth login --hostname github.com')
+    expect(reason).toContain('typeclaw start')
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
     expect(resolverCalled).toBe(false)
+  })
+
+  test('no App minter: a github read still passes through so public repos keep working', async () => {
+    delete process.env.GH_TOKEN
+    const hook = await hookFor(tokenResolver('ghs_minted'), false)
+
+    for (const command of [
+      'git clone https://github.com/acme/widgets.git',
+      'git fetch https://github.com/acme/widgets.git main',
+      'git ls-remote https://github.com/acme/widgets.git',
+    ]) {
+      const event = bashEvent(command)
+
+      const result = await hook(event, hookCtx)
+
+      expect(result).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    }
+  })
+
+  test('.env PAT + no App minter: brokers a github push through askpass and suppresses ambient aliases', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-'))
+    const pat = 'ghp_declared_push'
+    try {
+      writeFileSync(join(agentDir, '.env'), `GH_TOKEN=${pat}\n`)
+      process.env.GH_TOKEN = pat
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toBeUndefined()
+      const env = gitEnv(event)
+      expect(env.TYPECLAW_GIT_TOKEN).toBe(pat)
+      expect(env.TYPECLAW_GIT_EXPECTED_REPO).toBe('acme/widgets')
+      expect(env.GIT_ASKPASS).toBe(askpassPath)
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toEqual(['GH_TOKEN', 'GITHUB_TOKEN'])
+      expect(String(event.args.command)).not.toContain(pat)
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('declared name, runtime-replaced value: blocks — a name does not authenticate a value', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-mismatch-'))
+    try {
+      // given `.env` declares one PAT but something at runtime (PAT-mode channel
+      // auth seeds process.env.GH_TOKEN) replaced the live value with another
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared_value\n')
+      process.env.GH_TOKEN = 'ghp_runtime_only_value'
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toMatchObject({ block: true })
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+      expect(JSON.stringify(result)).not.toContain('ghp_runtime_only_value')
+      expect(JSON.stringify(result)).not.toContain('ghp_declared_value')
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('declared GITHUB_TOKEN with a runtime-replaced value also blocks', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-mismatch-alias-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GITHUB_TOKEN=ghp_declared_alias\n')
+      delete process.env.GH_TOKEN
+      process.env.GITHUB_TOKEN = 'ghp_runtime_alias'
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toMatchObject({ block: true })
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('.env PAT + no App minter: github reads remain unbrokered pass-through', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-read-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared_read\n')
+      process.env.GH_TOKEN = 'ghp_declared_read'
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+
+      for (const command of [
+        'git clone https://github.com/acme/widgets.git',
+        'git fetch https://github.com/acme/widgets.git main',
+      ]) {
+        const event = bashEvent(command)
+        const result = await hook(event, { ...hookCtx, agentDir })
+
+        expect(result).toBeUndefined()
+        expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+        expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+      }
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('.env PAT + no App minter: a role without PAT permission still blocks push', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-pat-denied-'))
+    const pat = 'ghp_declared_denied'
+    try {
+      writeFileSync(join(agentDir, '.env'), `GH_TOKEN=${pat}\n`)
+      process.env.GH_TOKEN = pat
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, { agentDir })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toMatchObject({ block: true })
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('.env token with an unrecognized class is never brokered to git push', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-token-unknown-'))
+    const token = 'unrecognized_declared_token'
+    try {
+      writeFileSync(join(agentDir, '.env'), `GH_TOKEN=${token}\n`)
+      process.env.GH_TOKEN = token
+      const hook = await hookFor(tokenResolver('ghs_unused'), false, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result).toMatchObject({ block: true })
+      expect(JSON.stringify(event.args[TYPECLAW_INTERNAL_BASH_ENV] ?? {})).not.toContain(token)
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('no App minter: a non-github push is left alone', async () => {
+    delete process.env.GH_TOKEN
+    const hook = await hookFor(tokenResolver('ghs_minted'), false)
+    const event = bashEvent('git push https://gitlab.com/acme/widgets.git main')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+
+  test('no App minter: a PAT never leaks into the blocked push reason', async () => {
+    process.env.GH_TOKEN = 'ghp_classic'
+    const hook = await hookFor(tokenResolver('ghs_minted'), false, { permissions: privilegedPermissions })
+    const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toMatchObject({ block: true })
+    expect(JSON.stringify(result)).not.toContain('ghp_classic')
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
   test('unavailable bridge (repo not in repos[]) blocks with the adapter reason', async () => {
@@ -1335,17 +1562,27 @@ describe('github-cli-auth plugin — git path', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
-  test('classic PAT is never brokered to git; an App token is minted instead', async () => {
-    process.env.GH_TOKEN = 'ghp_classic'
-    const hook = await hookFor(tokenResolver('ghs_minted'), true, { permissions: privilegedPermissions })
-    const event = bashEvent('git clone https://github.com/acme/widgets.git')
+  test('.env PAT + App minter: a github push uses the App token instead', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-git-app-wins-'))
+    try {
+      writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared\n')
+      process.env.GH_TOKEN = 'ghp_declared'
+      const hook = await hookFor(tokenResolver('ghs_minted'), true, {
+        agentDir,
+        permissions: privilegedPermissions,
+      })
+      const event = bashEvent('git push https://github.com/acme/widgets.git main')
 
-    const result = await hook(event, hookCtx)
+      const result = await hook(event, { ...hookCtx, agentDir })
 
-    expect(result).toBeUndefined()
-    const env = gitEnv(event)
-    expect(env.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
-    expect(JSON.stringify(env)).not.toContain('ghp_classic')
+      expect(result).toBeUndefined()
+      const env = gitEnv(event)
+      expect(env.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
+      expect(JSON.stringify(env)).not.toContain('ghp_declared')
+      expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toBeUndefined()
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
   })
 
   test('PAT with no App minter: authenticated git passes through, PAT never reaches git', async () => {
@@ -1408,6 +1645,959 @@ describe('github-cli-auth plugin — git path', () => {
   })
 })
 
+describe.skipIf(process.platform === 'win32')('github-cli-auth plugin — trusted gh store push path', () => {
+  const authKeys = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST'] as const
+  let agentDir: string
+  let fakeBin: string
+  let observedFile: string
+  let askpassPath: string
+  let originalPath: string | undefined
+  let originalAuthEnv: Partial<Record<(typeof authKeys)[number], string>>
+
+  const gitEnv = (event: ToolBeforeEvent): Record<string, string> =>
+    (event.args[TYPECLAW_INTERNAL_BASH_ENV] ?? {}) as Record<string, string>
+
+  const runDeferredPreparation = async (event: ToolBeforeEvent): Promise<DeferredBashPreparationResult> => {
+    const prepare = event.args[TYPECLAW_INTERNAL_BASH_PREPARE]
+    if (typeof prepare !== 'function') throw new Error('missing deferred bash preparation')
+    const prepared = await (prepare as () => Promise<DeferredBashPreparationResult>)()
+    event.args.command = prepared.command
+    event.args[TYPECLAW_INTERNAL_BASH_ENV] = { ...gitEnv(event), ...prepared.env }
+    return prepared
+  }
+
+  const runGit = (cwd: string, args: string[]): void => {
+    const result = spawnSync('git', args, {
+      cwd,
+      env: { ...process.env, GIT_MASTER: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    if (result.status !== 0) throw new Error('failed to prepare test repository')
+  }
+
+  const seedBranch = (path: string, branch: string, message = 'test'): string => {
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Alice',
+      GIT_AUTHOR_EMAIL: 'alice@example.com',
+      GIT_COMMITTER_NAME: 'Alice',
+      GIT_COMMITTER_EMAIL: 'alice@example.com',
+    }
+    const tree = spawnSync('git', ['mktree'], {
+      cwd: path,
+      input: '',
+      encoding: 'utf8',
+      env: { ...env, GIT_MASTER: '1' },
+    })
+    if (tree.status !== 0) throw new Error('failed to create test tree')
+    const commit = spawnSync('git', ['commit-tree', tree.stdout.trim(), '-m', message], {
+      cwd: path,
+      encoding: 'utf8',
+      env: { ...env, GIT_MASTER: '1' },
+    })
+    if (commit.status !== 0) throw new Error('failed to create test commit')
+    const oid = commit.stdout.trim()
+    runGit(path, ['update-ref', `refs/heads/${branch}`, oid])
+    runGit(path, ['symbolic-ref', 'HEAD', `refs/heads/${branch}`])
+    return oid
+  }
+
+  const seedChildCommit = (path: string, branch: string, parent: string, message = 'child'): string => {
+    const env = {
+      ...process.env,
+      GIT_MASTER: '1',
+      GIT_AUTHOR_NAME: 'Alice',
+      GIT_AUTHOR_EMAIL: 'alice@example.com',
+      GIT_COMMITTER_NAME: 'Alice',
+      GIT_COMMITTER_EMAIL: 'alice@example.com',
+    }
+    const tree = spawnSync('git', ['mktree'], { cwd: path, input: '', encoding: 'utf8', env })
+    if (tree.status !== 0) throw new Error('failed to create test tree')
+    const commit = spawnSync('git', ['commit-tree', tree.stdout.trim(), '-p', parent, '-m', message], {
+      cwd: path,
+      encoding: 'utf8',
+      env,
+    })
+    if (commit.status !== 0) throw new Error('failed to create child test commit')
+    const oid = commit.stdout.trim()
+    runGit(path, ['update-ref', `refs/heads/${branch}`, oid])
+    runGit(path, ['symbolic-ref', 'HEAD', `refs/heads/${branch}`])
+    return oid
+  }
+
+  const initRepo = (path: string, remote = 'https://github.com/example/project.git', bare = false): void => {
+    mkdirSync(path, { recursive: true })
+    runGit(path, bare ? ['init', '--bare', '-q'] : ['init', '-q'])
+    runGit(path, ['remote', 'add', 'origin', remote])
+  }
+
+  const initSha256Repo = (path: string, remote = 'https://github.com/example/project.git'): void => {
+    mkdirSync(path, { recursive: true })
+    runGit(path, ['init', '--object-format=sha256', '-q'])
+    runGit(path, ['remote', 'add', 'origin', remote])
+  }
+
+  const sourceRepo = (): string => join(agentDir, 'mounts', 'source')
+  const storeEvent = (
+    command = 'git -C mounts/source push origin topic',
+    sessionId = 'store-session',
+  ): ToolBeforeEvent => ({
+    tool: 'bash',
+    sessionId,
+    callId: 'store-call',
+    args: { command },
+  })
+  const observed = (): string => readFileSync(observedFile, 'utf8')
+  const storeWasInvoked = (): boolean => {
+    try {
+      readFileSync(observedFile)
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
+    }
+  }
+
+  beforeEach(() => {
+    agentDir = mkdtempSync(join(tmpdir(), 'tc-gh-store-hook-'))
+    fakeBin = join(agentDir, 'bin')
+    observedFile = join(agentDir, 'gh-observed')
+    askpassPath = join(agentDir, 'typeclaw-git-askpass')
+    mkdirSync(fakeBin)
+    writeFileSync(
+      join(fakeBin, 'gh'),
+      `#!/bin/sh
+{
+  printf 'args=%s\\n' "$*"
+  printf 'GH_CONFIG_DIR=%s\\n' "$GH_CONFIG_DIR"
+  printf 'GH_TOKEN=%s\\n' "\${GH_TOKEN+x}"
+  printf 'GITHUB_TOKEN=%s\\n' "\${GITHUB_TOKEN+x}"
+  printf 'GH_ENTERPRISE_TOKEN=%s\\n' "\${GH_ENTERPRISE_TOKEN+x}"
+  printf 'GITHUB_ENTERPRISE_TOKEN=%s\\n' "\${GITHUB_ENTERPRISE_TOKEN+x}"
+  printf 'GH_HOST=%s\\n' "\${GH_HOST+x}"
+} > "$TYPECLAW_TEST_GH_OBSERVED"
+case "$TYPECLAW_TEST_GH_MODE" in
+  missing) exit 0 ;;
+  failing) printf '%s\\n' "$TYPECLAW_TEST_GH_TOKEN"; exit 7 ;;
+  multiline) printf 'first\\nsecond\\n'; exit 0 ;;
+  nul) printf 'bad\\000value'; exit 0 ;;
+  oversized) i=0; while [ "$i" -lt 20000 ]; do printf x; i=$((i + 1)); done; exit 0 ;;
+  *) printf '%s\\n' "$TYPECLAW_TEST_GH_TOKEN" ;;
+esac
+`,
+    )
+    chmodSync(join(fakeBin, 'gh'), 0o755)
+    initRepo(sourceRepo())
+    seedBranch(sourceRepo(), 'topic')
+
+    originalPath = process.env.PATH
+    originalAuthEnv = {}
+    for (const key of authKeys) {
+      if (process.env[key] !== undefined) originalAuthEnv[key] = process.env[key]
+      delete process.env[key]
+    }
+    process.env.PATH = `${fakeBin}:${originalPath ?? ''}`
+    process.env.TYPECLAW_TEST_GH_OBSERVED = observedFile
+    process.env.TYPECLAW_TEST_GH_TOKEN = 'store_secret_value'
+    delete process.env.TYPECLAW_TEST_GH_MODE
+    setGhTokenCommandRunnerForTests(async ({ cmd, env }) => {
+      const presence = (key: string): string => (env[key] === undefined ? '' : 'x')
+      writeFileSync(
+        observedFile,
+        `args=${cmd.slice(1).join(' ')}\n` +
+          `GH_CONFIG_DIR=${env.GH_CONFIG_DIR ?? ''}\n` +
+          `GH_TOKEN=${presence('GH_TOKEN')}\n` +
+          `GITHUB_TOKEN=${presence('GITHUB_TOKEN')}\n` +
+          `GH_ENTERPRISE_TOKEN=${presence('GH_ENTERPRISE_TOKEN')}\n` +
+          `GITHUB_ENTERPRISE_TOKEN=${presence('GITHUB_ENTERPRISE_TOKEN')}\n` +
+          `GH_HOST=${presence('GH_HOST')}\n`,
+      )
+      const mode = process.env.TYPECLAW_TEST_GH_MODE
+      if (mode === 'missing') return { exitCode: 0, stdout: '' }
+      if (mode === 'failing') return { exitCode: 7, stdout: process.env.TYPECLAW_TEST_GH_TOKEN ?? '' }
+      if (mode === 'multiline') return { exitCode: 0, stdout: 'first\nsecond\n' }
+      if (mode === 'nul') return { exitCode: 0, stdout: 'bad\0value' }
+      if (mode === 'oversized') return { exitCode: 0, stdout: 'x'.repeat(20_000) }
+      return { exitCode: 0, stdout: `${process.env.TYPECLAW_TEST_GH_TOKEN ?? ''}\n` }
+    })
+    process.env.TYPECLAW_GIT_ASKPASS_PATH = askpassPath
+    resetGitAskPassHelperForTests()
+  })
+
+  afterEach(() => {
+    if (originalPath === undefined) delete process.env.PATH
+    else process.env.PATH = originalPath
+    for (const key of authKeys) {
+      const value = originalAuthEnv[key]
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    delete process.env.TYPECLAW_TEST_GH_OBSERVED
+    delete process.env.TYPECLAW_TEST_GH_TOKEN
+    delete process.env.TYPECLAW_TEST_GH_MODE
+    setGhTokenCommandRunnerForTests(undefined)
+    delete process.env.TYPECLAW_GIT_ASKPASS_PATH
+    resetGitAskPassHelperForTests()
+    rmSync(agentDir, { recursive: true, force: true })
+  })
+
+  test('configured push resolves the trusted store with isolated env and repository-bound askpass', async () => {
+    for (const key of authKeys) process.env[key] = 'ambient_value'
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent()
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(result).toBeUndefined()
+    expect(observed()).toBe(
+      'args=auth token --hostname github.com\n' +
+        'GH_CONFIG_DIR=/home/agent/.config/gh\n' +
+        'GH_TOKEN=\n' +
+        'GITHUB_TOKEN=\n' +
+        'GH_ENTERPRISE_TOKEN=\n' +
+        'GITHUB_ENTERPRISE_TOKEN=\n' +
+        'GH_HOST=\n',
+    )
+    const env = gitEnv(event)
+    expect(env.TYPECLAW_GIT_TOKEN).toBe('store_secret_value')
+    expect(env.TYPECLAW_GIT_EXPECTED_REPO).toBe('example/project')
+    expect(env.GIT_ASKPASS).toBe(askpassPath)
+    expect(Object.entries(env).filter(([, value]) => value.includes('store_secret_value'))).toEqual([
+      ['TYPECLAW_GIT_TOKEN', 'store_secret_value'],
+    ])
+    expect(String(event.args.command)).not.toContain('store_secret_value')
+    expect(event.args.command).toBe('git -C mounts/source push origin topic')
+    expect(typeof event.args[TYPECLAW_INTERNAL_BASH_PREPARE]).toBe('function')
+    expect(JSON.stringify(result) ?? '').not.toContain('store_secret_value')
+    expect(event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]).toEqual(expect.arrayContaining([...authKeys]))
+  })
+
+  test('rewrites a default push through a clean bare repository with hostile source config excluded', async () => {
+    const source = sourceRepo()
+    const oid = seedBranch(source, 'main')
+    const marker = join(agentDir, 'credential-helper-ran')
+    const include = join(agentDir, 'hostile.gitconfig')
+    writeFileSync(
+      include,
+      '[http]\n\tproxy = http://included.invalid:8080\n[credential]\n\thelper = !touch ' + marker + '\n',
+    )
+    runGit(source, ['config', 'http.proxy', 'http://local.invalid:8080'])
+    runGit(source, ['config', 'http.sslVerify', 'false'])
+    runGit(source, ['config', 'credential.helper', `!touch ${marker}`])
+    runGit(source, ['config', 'core.askPass', join(agentDir, 'hostile-askpass')])
+    runGit(source, ['config', 'url.file:///tmp/exfil/.insteadOf', 'git@github.com:'])
+    runGit(source, ['config', 'include.path', include])
+    runGit(source, ['config', 'includeIf.gitdir:/**.path', include])
+    runGit(source, ['config', 'branch.main.remote', 'origin'])
+    runGit(source, ['config', 'branch.main.merge', 'refs/heads/main'])
+    const sessionId = `store-clean-${randomUUID()}`
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push', sessionId)
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(result).toBeUndefined()
+    const prepared = await runDeferredPreparation(event)
+    const command = String(event.args.command)
+    expect(command).toMatch(
+      /^\/usr\/bin\/git --git-dir \/tmp\/typeclaw-gh-store-push-[A-Za-z0-9]+ push https:\/\/github\.com\/example\/project\.git refs\/heads\/main:refs\/heads\/main$/,
+    )
+    const env = gitEnv(event)
+    expect(env.GIT_DIR).toMatch(/^\/tmp\/typeclaw-gh-store-push-/)
+    expect(env.GIT_ALTERNATE_OBJECT_DIRECTORIES).toBe(realpathSync(join(source, '.git', 'objects')))
+    expect(env.GIT_CONFIG_GLOBAL).toBe('/dev/null')
+    expect(env.GIT_CONFIG_SYSTEM).toBe('/dev/null')
+    expect(env.GIT_CONFIG_NOSYSTEM).toBe('1')
+    expect(env.GIT_CONFIG_PARAMETERS).toBe('')
+    expect(env.GIT_ALLOW_PROTOCOL).toBe('https')
+
+    const configResult = spawnSync('/usr/bin/git', ['config', '--show-origin', '--list'], {
+      cwd: agentDir,
+      encoding: 'utf8',
+      env: { ...process.env, ...env, TYPECLAW_GIT_TOKEN: 'test-token' },
+    })
+    expect(configResult.status).toBe(0)
+    expect(configResult.stdout).not.toContain(source)
+    expect(configResult.stdout).not.toContain(include)
+    expect(configResult.stdout).not.toContain('local.invalid')
+    expect(configResult.stdout).not.toContain('included.invalid')
+    expect(configResult.stdout).not.toContain('file:///tmp/exfil')
+    expect(configResult.stdout).toContain('command line:\thttp.followredirects=false')
+    expect(configResult.stdout).toContain('command line:\thttp.sslverify=true')
+    expect(configResult.stdout).toContain('command line:\thttp.proxy=')
+    expect(configResult.stdout).toContain('command line:\tcredential.helper=')
+    expect(configResult.stdout).toContain(`command line:\tcore.askpass=${askpassPath}`)
+
+    const credentialResult = spawnSync('/usr/bin/git', ['credential', 'fill'], {
+      cwd: agentDir,
+      encoding: 'utf8',
+      input: 'protocol=https\nhost=github.com\npath=example/project.git\n\n',
+      env: { ...process.env, ...env, TYPECLAW_GIT_TOKEN: 'test-token' },
+    })
+    expect(credentialResult.status).toBe(0)
+    expect(existsSync(marker)).toBe(false)
+
+    expect(prepared.mount).toMatchObject({ type: 'ro-bind', dest: env.GIT_DIR })
+    expect(prepared.mount.source.startsWith(sessionTmpDir(sessionId))).toBe(false)
+    const backingDir = prepared.mount.type === 'ro-bind' ? prepared.mount.source : ''
+    const cleanHead = spawnSync('/usr/bin/git', ['--git-dir', backingDir, 'rev-parse', 'refs/heads/main'], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_ALTERNATE_OBJECT_DIRECTORIES: env.GIT_ALTERNATE_OBJECT_DIRECTORIES },
+    })
+    expect(cleanHead.status).toBe(0)
+    expect(cleanHead.stdout.trim()).toBe(oid)
+    await prepared.cleanup()
+    expect(existsSync(backingDir)).toBe(false)
+  })
+
+  test('implicit simple push without complete upstream metadata blocks before store resolution', async () => {
+    seedBranch(sourceRepo(), 'main')
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push')
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(result).toMatchObject({ block: true })
+    expect(storeWasInvoked()).toBe(false)
+    expect(event.args[TYPECLAW_INTERNAL_BASH_PREPARE]).toBeUndefined()
+  })
+
+  test.each([
+    { name: 'remote mismatch', remote: 'upstream', merge: 'refs/heads/main', mode: 'simple' },
+    { name: 'branch-name mismatch', remote: 'origin', merge: 'refs/heads/review', mode: 'simple' },
+    { name: 'upstream remote mismatch', remote: 'upstream', merge: 'refs/heads/review', mode: 'upstream' },
+  ])('implicit $name blocks before store resolution', async ({ remote, merge, mode }) => {
+    seedBranch(sourceRepo(), 'main')
+    runGit(sourceRepo(), ['config', 'push.default', mode])
+    runGit(sourceRepo(), ['config', 'remote.pushDefault', 'origin'])
+    runGit(sourceRepo(), ['config', 'branch.main.remote', remote])
+    runGit(sourceRepo(), ['config', 'branch.main.merge', merge])
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push')
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(result).toMatchObject({ block: true })
+    expect(storeWasInvoked()).toBe(false)
+  })
+
+  test('push.default=current reconstructs the current branch without upstream metadata', async () => {
+    seedBranch(sourceRepo(), 'main')
+    runGit(sourceRepo(), ['config', 'push.default', 'current'])
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push')
+
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+    const prepared = await runDeferredPreparation(event)
+
+    expect(prepared.command).toContain('refs/heads/main:refs/heads/main')
+    await prepared.cleanup()
+  })
+
+  test('preserves an explicit refspec in the clean transport', async () => {
+    const oid = seedBranch(sourceRepo(), 'topic')
+    const sessionId = `store-refspec-${randomUUID()}`
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin topic:refs/heads/review', sessionId)
+
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+    const prepared = await runDeferredPreparation(event)
+
+    expect(String(event.args.command)).toMatch(
+      /push https:\/\/github\.com\/example\/project\.git refs\/heads\/topic:refs\/heads\/review$/,
+    )
+    const env = gitEnv(event)
+    const backingDir = prepared.mount.type === 'ro-bind' ? prepared.mount.source : ''
+    const ref = spawnSync('/usr/bin/git', ['--git-dir', backingDir, 'rev-parse', 'refs/heads/topic'], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_ALTERNATE_OBJECT_DIRECTORIES: env.GIT_ALTERNATE_OBJECT_DIRECTORIES },
+    })
+    expect(ref.status).toBe(0)
+    expect(ref.stdout.trim()).toBe(oid)
+    await prepared.cleanup()
+  })
+
+  test('refuses preparation when a source ref changes after authorization', async () => {
+    seedBranch(sourceRepo(), 'topic')
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin topic')
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+
+    const replacement = seedBranch(sourceRepo(), 'replacement', 'replacement')
+    runGit(sourceRepo(), ['update-ref', 'refs/heads/topic', replacement])
+
+    await expect(runDeferredPreparation(event)).rejects.toThrow()
+  })
+
+  test('refuses preparation when the configured push destination changes after authorization', async () => {
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent()
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+
+    runGit(sourceRepo(), ['remote', 'set-url', '--push', 'origin', 'https://github.com/example/other.git'])
+
+    await expect(runDeferredPreparation(event)).rejects.toThrow()
+  })
+
+  test('refuses preparation when configured push refspecs change after authorization', async () => {
+    seedBranch(sourceRepo(), 'topic')
+    seedBranch(sourceRepo(), 'replacement')
+    runGit(sourceRepo(), ['config', 'remote.origin.push', 'topic:refs/heads/topic'])
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin')
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+
+    runGit(sourceRepo(), ['config', '--replace-all', 'remote.origin.push', 'replacement:refs/heads/topic'])
+
+    await expect(runDeferredPreparation(event)).rejects.toThrow()
+  })
+
+  test('preserves a shallow boundary so a missing parent is not traversed by the clean transport', async () => {
+    const source = sourceRepo()
+    const parent = seedBranch(source, 'topic', 'parent')
+    const child = seedChildCommit(source, 'topic', parent)
+    const shallowPath = join(source, '.git', 'shallow')
+    writeFileSync(shallowPath, `${child}\n`)
+    rmSync(join(source, '.git', 'objects', parent.slice(0, 2), parent.slice(2)))
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin topic')
+
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+    const prepared = await runDeferredPreparation(event)
+    const backingDir = prepared.mount.type === 'ro-bind' ? prepared.mount.source : ''
+    const env = {
+      ...process.env,
+      GIT_MASTER: '1',
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: realpathSync(join(source, '.git', 'objects')),
+    }
+    const traversal = spawnSync('/usr/bin/git', ['--git-dir', backingDir, 'rev-list', 'refs/heads/topic'], {
+      encoding: 'utf8',
+      env,
+    })
+
+    expect(readFileSync(join(backingDir, 'shallow'), 'utf8')).toBe(`${child}\n`)
+    expect(traversal.status).toBe(0)
+    expect(traversal.stdout.trim()).toBe(child)
+    await prepared.cleanup()
+  })
+
+  test('refuses preparation when shallow metadata changes after authorization', async () => {
+    const source = sourceRepo()
+    const child = seedBranch(source, 'topic')
+    const shallowPath = join(source, '.git', 'shallow')
+    writeFileSync(shallowPath, `${child}\n`)
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin topic')
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+
+    writeFileSync(shallowPath, `${'0'.repeat(child.length)}\n`)
+
+    await expect(runDeferredPreparation(event)).rejects.toThrow()
+  })
+
+  test.each(['malformed', 'symlinked'] as const)(
+    'rejects %s shallow metadata before store resolution',
+    async (kind) => {
+      const source = sourceRepo()
+      const child = seedBranch(source, 'topic')
+      const shallowPath = join(source, '.git', 'shallow')
+      if (kind === 'malformed') {
+        writeFileSync(shallowPath, 'not-an-object-id\n')
+      } else {
+        const outside = join(agentDir, 'outside-shallow')
+        writeFileSync(outside, `${child}\n`)
+        symlinkSync(outside, shallowPath)
+      }
+      const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+      const event = storeEvent('git -C mounts/source push origin topic')
+
+      expect(await hook(event, { ...hookCtx, agentDir })).toMatchObject({ block: true })
+      expect(storeWasInvoked()).toBe(false)
+      expect(event.args[TYPECLAW_INTERNAL_BASH_PREPARE]).toBeUndefined()
+    },
+  )
+
+  test('resolves an unqualified tag source without assuming refs/heads', async () => {
+    const oid = seedBranch(sourceRepo(), 'topic')
+    runGit(sourceRepo(), ['update-ref', 'refs/tags/release', oid])
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin release')
+
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+    const prepared = await runDeferredPreparation(event)
+
+    expect(prepared.command).toContain('refs/tags/release:refs/tags/release')
+    await prepared.cleanup()
+  })
+
+  test('infers an unqualified tag destination in the tag namespace', async () => {
+    const oid = seedBranch(sourceRepo(), 'topic')
+    runGit(sourceRepo(), ['update-ref', 'refs/tags/release', oid])
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin release:newrelease')
+
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+    const prepared = await runDeferredPreparation(event)
+
+    expect(prepared.command).toContain('refs/tags/release:refs/tags/newrelease')
+    await prepared.cleanup()
+  })
+
+  test('allows a qualified deletion and refuses an unqualified deletion before store resolution', async () => {
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const qualified = storeEvent('git -C mounts/source push origin :refs/heads/obsolete')
+
+    expect(await hook(qualified, { ...hookCtx, agentDir })).toBeUndefined()
+    const prepared = await runDeferredPreparation(qualified)
+    expect(prepared.command).toContain(':refs/heads/obsolete')
+    await prepared.cleanup()
+
+    rmSync(observedFile, { force: true })
+    const unqualified = storeEvent('git -C mounts/source push origin :obsolete')
+    expect(await hook(unqualified, { ...hookCtx, agentDir })).toMatchObject({ block: true })
+    expect(storeWasInvoked()).toBe(false)
+  })
+
+  test('refuses an ambiguous unqualified source before store resolution', async () => {
+    const oid = seedBranch(sourceRepo(), 'release')
+    runGit(sourceRepo(), ['update-ref', 'refs/tags/release', oid])
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin release')
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(result).toMatchObject({ block: true })
+    expect(storeWasInvoked()).toBe(false)
+  })
+
+  test('resolves a linked worktree through its canonical common object directory', async () => {
+    rmSync(sourceRepo(), { recursive: true, force: true })
+    const commonRepo = join(agentDir, 'mounts', 'common')
+    initRepo(commonRepo)
+    const oid = seedBranch(commonRepo, 'topic')
+    runGit(commonRepo, ['worktree', 'add', '--detach', sourceRepo(), 'topic'])
+    const sessionId = `store-worktree-${randomUUID()}`
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin topic', sessionId)
+
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+    const prepared = await runDeferredPreparation(event)
+
+    const env = gitEnv(event)
+    expect(env.GIT_ALTERNATE_OBJECT_DIRECTORIES).toBe(realpathSync(join(commonRepo, '.git', 'objects')))
+    const backingDir = prepared.mount.type === 'ro-bind' ? prepared.mount.source : ''
+    const ref = spawnSync('/usr/bin/git', ['--git-dir', backingDir, 'rev-parse', 'refs/heads/topic'], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_ALTERNATE_OBJECT_DIRECTORIES: env.GIT_ALTERNATE_OBJECT_DIRECTORIES },
+    })
+    expect(ref.status).toBe(0)
+    expect(ref.stdout.trim()).toBe(oid)
+    await prepared.cleanup()
+  })
+
+  test('an unresolvable push source fails closed before resolving the store', async () => {
+    const sessionId = `store-missing-${randomUUID()}`
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin missing', sessionId)
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(result).toMatchObject({ block: true })
+    expect(storeWasInvoked()).toBe(false)
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    expect(
+      existsSync(sessionTmpDir(sessionId)) ? readdirSync(sessionTmpDir(sessionId), { recursive: true }) : [],
+    ).toEqual([])
+    rmSync(sessionTmpDir(sessionId), { recursive: true, force: true })
+  })
+
+  test('App and authoritative declared PAT paths win without invoking the store', async () => {
+    const appHook = await hookFor(tokenResolver('app_scoped_token'), true, { agentDir })
+    const appEvent = storeEvent()
+    expect(await appHook(appEvent, { ...hookCtx, agentDir })).toBeUndefined()
+    expect(gitEnv(appEvent).TYPECLAW_GIT_TOKEN).toBe('app_scoped_token')
+    expect(storeWasInvoked()).toBe(false)
+
+    writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared_value\n')
+    process.env.GH_TOKEN = 'ghp_declared_value'
+    const patHook = await hookFor(tokenResolver('unused_app_token'), false, {
+      agentDir,
+      permissions: privilegedPermissions,
+    })
+    const patEvent = storeEvent()
+    expect(await patHook(patEvent, { ...hookCtx, agentDir })).toBeUndefined()
+    expect(gitEnv(patEvent).TYPECLAW_GIT_TOKEN).toBe('ghp_declared_value')
+    expect(storeWasInvoked()).toBe(false)
+  })
+
+  test('an invalid declared token blocks without invoking or disclosing the store', async () => {
+    writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=invalid_declared_value\n')
+    process.env.GH_TOKEN = 'invalid_declared_value'
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent()
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(result).toMatchObject({ block: true })
+    expect(storeWasInvoked()).toBe(false)
+    expect(JSON.stringify(result)).not.toContain('invalid_declared_value')
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+
+  test('a declared PAT denied to the role blocks without falling through to the store', async () => {
+    writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared_denied\n')
+    process.env.GH_TOKEN = 'ghp_declared_denied'
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent()
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(result).toMatchObject({ block: true })
+    expect(storeWasInvoked()).toBe(false)
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+
+  test('configured remotes are eligible across repository locations and remote names', async () => {
+    const nested = join(sourceRepo(), 'nested')
+    initRepo(nested)
+    seedBranch(nested, 'topic')
+    const subdirectory = join(sourceRepo(), 'subdirectory')
+    mkdirSync(subdirectory)
+    const workspace = join(agentDir, 'workspace', 'repo')
+    initRepo(workspace)
+    seedBranch(workspace, 'topic')
+    const tmpSessionId = `store-tmp-${process.pid}-${randomUUID()}`
+    const tmpBacking = join(sessionTmpDir(tmpSessionId), 'repo')
+    initRepo(tmpBacking)
+    seedBranch(tmpBacking, 'topic')
+    runGit(sourceRepo(), ['remote', 'add', 'upstream', 'https://github.com/example/project.git'])
+
+    const cases: Array<{
+      name: string
+      command: string
+      sessionId?: string
+    }> = [
+      {
+        name: 'mount path',
+        command: 'git -C mounts/source push origin topic',
+      },
+      { name: 'repository subdirectory', command: 'git -C mounts/source/subdirectory push origin topic' },
+      { name: 'nested repository', command: 'git -C mounts/source/nested push origin topic' },
+      { name: 'workspace repository', command: 'git -C workspace/repo push origin topic' },
+      {
+        name: 'model-facing tmp session repository',
+        command: 'git -C /tmp/repo push origin topic',
+        sessionId: tmpSessionId,
+      },
+      {
+        name: 'non-origin configured remote',
+        command: 'git -C mounts/source push upstream topic',
+      },
+    ]
+
+    try {
+      for (const item of cases) {
+        rmSync(observedFile, { force: true })
+        const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+        const event = storeEvent(item.command, item.sessionId)
+        const result = await hook(event, { ...hookCtx, agentDir })
+        expect(result, item.name).toBeUndefined()
+        expect(storeWasInvoked(), item.name).toBe(true)
+        const prepared = await runDeferredPreparation(event)
+        expect(prepared.command, item.name).toContain('push https://github.com/example/project.git')
+        expect(prepared.command, item.name).not.toContain('store_secret_value')
+        expect(JSON.stringify(result) ?? '', item.name).not.toContain('store_secret_value')
+        await prepared.cleanup()
+      }
+    } finally {
+      rmSync(sessionTmpDir(tmpSessionId), { recursive: true, force: true })
+    }
+  })
+
+  test('uses the sandbox-visible object path for a repository under the session /tmp bind', async () => {
+    const sessionId = `store-tmp-objects-${process.pid}-${randomUUID()}`
+    const sessionTmp = sessionTmpDir(sessionId)
+    const source = join(sessionTmp, 'repo')
+    initRepo(source)
+    const oid = seedBranch(source, 'topic')
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C /tmp/repo push origin topic', sessionId)
+
+    try {
+      expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+      const prepared = await runDeferredPreparation(event)
+      const env = gitEnv(event)
+
+      expect(env.GIT_ALTERNATE_OBJECT_DIRECTORIES).toBe('/tmp/repo/.git/objects')
+      const sandboxed = buildSandboxedCommand(prepared.command, {
+        mounts: [{ type: 'bind', source: sessionTmp, dest: '/tmp' }, prepared.mount],
+        env: { set: prepared.env },
+      })
+      const alternateIndex = sandboxed.argv.indexOf('GIT_ALTERNATE_OBJECT_DIRECTORIES')
+      expect(sandboxed.argv.slice(alternateIndex - 1, alternateIndex + 2)).toEqual([
+        '--setenv',
+        'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+        '/tmp/repo/.git/objects',
+      ])
+      const sessionMountIndex = sandboxed.argv.indexOf(sessionTmp)
+      expect(sandboxed.argv.slice(sessionMountIndex - 1, sessionMountIndex + 2)).toEqual(['--bind', sessionTmp, '/tmp'])
+
+      const backingDir = prepared.mount.type === 'ro-bind' ? prepared.mount.source : ''
+      const ref = spawnSync('/usr/bin/git', ['--git-dir', backingDir, 'rev-parse', 'refs/heads/topic'], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GIT_MASTER: '1',
+          GIT_ALTERNATE_OBJECT_DIRECTORIES: realpathSync(join(source, '.git', 'objects')),
+        },
+      })
+      expect(ref.status).toBe(0)
+      expect(ref.stdout.trim()).toBe(oid)
+      await prepared.cleanup()
+    } finally {
+      rmSync(sessionTmp, { recursive: true, force: true })
+    }
+  })
+
+  test('accepts Linux-style physical provenance without remapping the session backing path twice', async () => {
+    const sessionId = `store-linux-provenance-${process.pid}-${randomUUID()}`
+    const source = join(sessionTmpDir(sessionId), 'repo')
+    initRepo(source)
+    seedBranch(source, 'topic')
+
+    try {
+      const plan = await planGithubStorePush(
+        {
+          kind: 'inject',
+          repoSlug: 'example/project',
+          access: 'write',
+          pushProvenance: {
+            kind: 'configured-remote',
+            remote: 'origin',
+            pushUrls: ['https://github.com/example/project.git'],
+            repoSlugs: ['example/project'],
+            worktreeTopLevel: source,
+            sourceCwd: '/tmp/repo',
+            refspecs: ['topic'],
+            setUpstream: false,
+            complete: true,
+          },
+        },
+        { agentDir, sessionId, askpassPath },
+      )
+
+      expect(plan).not.toBeNull()
+      expect(plan?.worktreeRoot.path).toBe(realpathSync(source))
+      expect(plan?.sourceCwdSandboxPath).toBe('/tmp/repo')
+      expect(plan?.objectsSandboxPath).toBe('/tmp/repo/.git/objects')
+    } finally {
+      rmSync(sessionTmpDir(sessionId), { recursive: true, force: true })
+    }
+  })
+
+  test('rejects a virtual /tmp repository symlink that escapes the physical session root', async () => {
+    const sessionId = `store-tmp-symlink-${process.pid}-${randomUUID()}`
+    const sessionTmp = sessionTmpDir(sessionId)
+    const outside = join(agentDir, 'outside-session-repo')
+    initRepo(outside)
+    seedBranch(outside, 'topic')
+    mkdirSync(sessionTmp, { recursive: true })
+    symlinkSync(outside, join(sessionTmp, 'repo'))
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C /tmp/repo push origin topic', sessionId)
+
+    try {
+      expect(await hook(event, { ...hookCtx, agentDir })).toMatchObject({ block: true })
+      expect(storeWasInvoked()).toBe(false)
+      expect(event.args[TYPECLAW_INTERNAL_BASH_PREPARE]).toBeUndefined()
+    } finally {
+      rmSync(sessionTmp, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects a session id that escapes the shared session root', async () => {
+    const escapedName = `typeclaw-escaped-${process.pid}-${randomUUID()}`
+    const sessionId = `../../tmp/${escapedName}`
+    const escapedRoot = join('/tmp', escapedName)
+    const source = join(escapedRoot, 'repo')
+    initRepo(source)
+    seedBranch(source, 'topic')
+
+    try {
+      const plan = await planGithubStorePush(
+        {
+          kind: 'inject',
+          repoSlug: 'example/project',
+          access: 'write',
+          pushProvenance: {
+            kind: 'configured-remote',
+            remote: 'origin',
+            pushUrls: ['https://github.com/example/project.git'],
+            repoSlugs: ['example/project'],
+            worktreeTopLevel: source,
+            sourceCwd: '/tmp/repo',
+            refspecs: ['topic'],
+            setUpstream: false,
+            complete: true,
+          },
+        },
+        { agentDir, sessionId, askpassPath },
+      )
+
+      expect(plan).toBeNull()
+    } finally {
+      rmSync(escapedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('preserves SHA-256 object format in the reconstructed bare repository', async () => {
+    rmSync(sourceRepo(), { recursive: true, force: true })
+    initSha256Repo(sourceRepo())
+    const oid = seedBranch(sourceRepo(), 'topic')
+    const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const event = storeEvent('git -C mounts/source push origin topic')
+
+    expect(await hook(event, { ...hookCtx, agentDir })).toBeUndefined()
+    const prepared = await runDeferredPreparation(event)
+    const backingDir = prepared.mount.type === 'ro-bind' ? prepared.mount.source : ''
+    const format = spawnSync('/usr/bin/git', ['--git-dir', backingDir, 'rev-parse', '--show-object-format'], {
+      encoding: 'utf8',
+      env: { ...process.env, GIT_MASTER: '1' },
+    })
+    const ref = spawnSync('/usr/bin/git', ['--git-dir', backingDir, 'rev-parse', 'refs/heads/topic'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GIT_MASTER: '1',
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: realpathSync(join(sourceRepo(), '.git', 'objects')),
+      },
+    })
+
+    expect(format.status).toBe(0)
+    expect(format.stdout.trim()).toBe('sha256')
+    expect(ref.status).toBe(0)
+    expect(ref.stdout.trim()).toBe(oid)
+    await prepared.cleanup()
+  })
+
+  test('explicit URLs, reads, set-upstream pushes, and incomplete provenance never invoke the store', async () => {
+    const bare = join(agentDir, 'mounts', 'bare')
+    initRepo(bare, 'https://github.com/example/project.git', true)
+    const cases = [
+      { name: 'explicit URL', command: 'git push https://github.com/example/project.git topic' },
+      { name: 'read operation', command: 'git -C mounts/source fetch origin' },
+      { name: 'set upstream', command: 'git -C mounts/source push -u origin topic' },
+      { name: 'incomplete top-level', command: 'git -C mounts/bare push origin topic' },
+    ]
+
+    for (const item of cases) {
+      rmSync(observedFile, { force: true })
+      const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+      const event = storeEvent(item.command)
+      const result = await hook(event, { ...hookCtx, agentDir })
+      expect(storeWasInvoked(), item.name).toBe(false)
+      expect(event.args[TYPECLAW_INTERNAL_BASH_PREPARE], item.name).toBeUndefined()
+      expect(JSON.stringify(event.args), item.name).not.toContain('store_secret_value')
+      expect(JSON.stringify(result) ?? '', item.name).not.toContain('store_secret_value')
+    }
+  })
+
+  test('multiple push URLs use App tokens per repository, one PAT for all repositories, and reject the store', async () => {
+    runGit(sourceRepo(), ['remote', 'set-url', '--add', '--push', 'origin', 'https://github.com/example/project.git'])
+    runGit(sourceRepo(), ['remote', 'set-url', '--add', '--push', 'origin', 'https://github.com/example/other.git'])
+    const resolved: string[] = []
+    const appHook = await hookFor(
+      async (repo) => {
+        resolved.push(repo)
+        return { kind: 'token', token: repo.endsWith('/project') ? 'app_project_secret' : 'app_other_secret' }
+      },
+      true,
+      { agentDir },
+    )
+    const appEvent = storeEvent()
+
+    const appResult = await appHook(appEvent, { ...hookCtx, agentDir })
+
+    expect(appResult).toBeUndefined()
+    expect(resolved).toEqual(['example/project', 'example/other'])
+    expect(gitEnv(appEvent).TYPECLAW_GIT_CREDENTIALS).toContain('example/project\tapp_project_secret')
+    expect(gitEnv(appEvent).TYPECLAW_GIT_CREDENTIALS).toContain('example/other\tapp_other_secret')
+    expect(String(appEvent.args.command)).not.toContain('app_project_secret')
+    expect(JSON.stringify(appResult) ?? '').not.toContain('app_other_secret')
+    expect(storeWasInvoked()).toBe(false)
+
+    writeFileSync(join(agentDir, '.env'), 'GH_TOKEN=ghp_declared_multi\n')
+    process.env.GH_TOKEN = 'ghp_declared_multi'
+    const patHook = await hookFor(tokenResolver('unused_app_token'), false, {
+      agentDir,
+      permissions: privilegedPermissions,
+    })
+    const patEvent = storeEvent()
+    const patResult = await patHook(patEvent, { ...hookCtx, agentDir })
+
+    expect(patResult).toBeUndefined()
+    expect(gitEnv(patEvent).TYPECLAW_GIT_CREDENTIALS).toContain('example/project\tghp_declared_multi')
+    expect(gitEnv(patEvent).TYPECLAW_GIT_CREDENTIALS).toContain('example/other\tghp_declared_multi')
+    expect(String(patEvent.args.command)).not.toContain('ghp_declared_multi')
+    expect(JSON.stringify(patResult) ?? '').not.toContain('ghp_declared_multi')
+    expect(storeWasInvoked()).toBe(false)
+
+    rmSync(join(agentDir, '.env'), { force: true })
+    delete process.env.GH_TOKEN
+    const storeHook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+    const storeEventWithMultiplePushUrls = storeEvent()
+    const storeResult = await storeHook(storeEventWithMultiplePushUrls, { ...hookCtx, agentDir })
+
+    expect(storeResult).toMatchObject({ block: true })
+    if (storeResult !== undefined && 'reason' in storeResult) expect(storeResult.reason).toContain('credential store')
+    expect(storeWasInvoked()).toBe(false)
+    expect(storeEventWithMultiplePushUrls.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+
+  test('multi-repository App resolution fails atomically when any destination is unavailable', async () => {
+    runGit(sourceRepo(), ['remote', 'set-url', '--add', '--push', 'origin', 'https://github.com/example/project.git'])
+    runGit(sourceRepo(), ['remote', 'set-url', '--add', '--push', 'origin', 'https://github.com/example/other.git'])
+    const resolved: string[] = []
+    const hook = await hookFor(
+      async (repo) => {
+        resolved.push(repo)
+        return repo === 'example/project'
+          ? { kind: 'token', token: 'partial_secret' }
+          : { kind: 'unavailable', reason: 'down' }
+      },
+      true,
+      { agentDir },
+    )
+    const event = storeEvent()
+
+    const result = await hook(event, { ...hookCtx, agentDir })
+
+    expect(resolved).toEqual(['example/project', 'example/other'])
+    expect(result).toMatchObject({ block: true, reason: 'down' })
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    expect(JSON.stringify(result)).not.toContain('partial_secret')
+    expect(String(event.args.command)).not.toContain('partial_secret')
+    expect(storeWasInvoked()).toBe(false)
+  })
+
+  test('missing, failing, and malformed store output blocks without disclosure', async () => {
+    for (const mode of ['missing', 'failing', 'multiline', 'nul', 'oversized']) {
+      rmSync(observedFile, { force: true })
+      process.env.TYPECLAW_TEST_GH_MODE = mode
+      const hook = await hookFor(tokenResolver('unused_app_token'), false, { agentDir })
+      const event = storeEvent()
+
+      const result = await hook(event, { ...hookCtx, agentDir })
+
+      expect(result, mode).toMatchObject({ block: true })
+      expect(storeWasInvoked(), mode).toBe(true)
+      expect(JSON.stringify(result), mode).not.toContain('store_secret_value')
+      expect(JSON.stringify(event.args), mode).not.toContain('store_secret_value')
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV], mode).toBeUndefined()
+    }
+  })
+})
+
 describe('github-cli-auth plugin — review verdict lease is released on a tool.before block', () => {
   const originalFetch = globalThis.fetch
 
@@ -1438,10 +2628,30 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
   afterEach(() => {
     globalThis.fetch = originalFetch
     __resetReviewVerdictGuardForTest()
+    __resetReviewObserverForTest()
   })
 
   function reviewBashEvent(command: string, callId: string): ToolBeforeEvent {
     return { tool: 'bash', sessionId: 's', callId, args: { command } }
+  }
+
+  function roundReviewBashEvent(command: string, callId: string, thread: string): ToolBeforeEvent {
+    return {
+      ...reviewBashEvent(command, callId),
+      origin: {
+        kind: 'channel',
+        adapter: 'github',
+        workspace: 'acme/widgets',
+        chat: 'pr:5',
+        thread,
+        githubReviewRound: {
+          workspace: 'acme/widgets',
+          prNumber: 5,
+          headSha: 'sha-5',
+          carrierThread: '101',
+        },
+      },
+    }
   }
 
   // A review-submission command whose VERDICT is detected (so guard() claims the
@@ -1451,6 +2661,7 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
   // will post" when the blocked one never will.
   const STRANDING_REVIEW = 'cd /agent && gh api -X POST repos/acme/widgets/pulls/5/reviews -f event=APPROVE'
   const CLEAN_REVIEW = 'gh api -X POST repos/acme/widgets/pulls/5/reviews -f event=APPROVE'
+  const DISMISS_REVIEW = 'gh api -X PUT repos/acme/widgets/pulls/5/reviews/700/dismissals -f message="fixed"'
 
   test('a shape-blocked review submission releases the lease (succeeded:false) so a later session can still submit', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
@@ -1492,6 +2703,210 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
     // first submission releases early)
     expect(second).toMatchObject({ block: true })
   })
+
+  test('blocks a non-carrier round verdict before token minting or GitHub reads', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    let tokenCalls = 0
+    let fetchCalls = 0
+    globalThis.fetch = Object.assign(
+      async () => {
+        fetchCalls += 1
+        return new Response('{}', { status: 200 })
+      },
+      { preconnect: () => {} },
+    )
+    const hook = await hookFor(async () => {
+      tokenCalls += 1
+      return { kind: 'token', token: 'ghs_minted' }
+    })
+
+    const blocked = await hook(roundReviewBashEvent(CLEAN_REVIEW, 'round-call', '202'), hookCtx)
+
+    expect(blocked).toMatchObject({ block: true, reason: expect.stringContaining('designated') })
+    expect(tokenCalls).toBe(0)
+    expect(fetchCalls).toBe(0)
+  })
+
+  test('blocks a non-carrier round dismissal before token minting or GitHub reads', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    let tokenCalls = 0
+    let fetchCalls = 0
+    globalThis.fetch = Object.assign(
+      async () => {
+        fetchCalls += 1
+        return new Response('{}', { status: 200 })
+      },
+      { preconnect: () => {} },
+    )
+    const hook = await hookFor(async () => {
+      tokenCalls += 1
+      return { kind: 'token', token: 'ghs_minted' }
+    })
+
+    const blocked = await hook(roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-non-carrier', '202'), hookCtx)
+
+    expect(blocked).toMatchObject({ block: true, reason: expect.stringContaining('designated') })
+    expect(tokenCalls).toBe(0)
+    expect(fetchCalls).toBe(0)
+  })
+
+  test('records a dismissal only after mutation success and authoritative non-blocking verification', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    stubDismissedReviewFetch()
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const seen: unknown[] = []
+    setReviewObserver((review) => seen.push(review))
+
+    const event = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-success', '101')
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-success',
+        result: { content: [{ type: 'text', text: '{"id":700,"state":"DISMISSED"}' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+
+    expect(seen).toEqual([{ sessionId: 's', workspace: 'acme/widgets', prNumber: 5, verdict: 'DISMISSED' }])
+  })
+
+  test('leaves the round pending when dismissal mutation fails', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    stubDismissedReviewFetch()
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const seen: unknown[] = []
+    setReviewObserver((review) => seen.push(review))
+    const event = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-failed', '101')
+    expect(await before(event, hookCtx)).toBeUndefined()
+    const round = event.origin?.kind === 'channel' ? event.origin.githubReviewRound : undefined
+    if (round === undefined) throw new Error('round missing')
+
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-failed',
+        result: { content: [{ type: 'text', text: 'gh: Validation Failed (HTTP 422)' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+
+    expect(seen).toEqual([])
+    expect(isGithubReviewRoundComplete(round)).toBe(false)
+  })
+
+  // The mutation's own output is attacker-adjacent evidence: `gh` can print a
+  // DISMISSED payload for a review that did not actually clear the standing block
+  // (wrong review id, a race, a partial GraphQL response). Completing the round on
+  // that alone re-strands every sibling close-out — the exact deadlock this path
+  // exists to prevent — so the authoritative re-read is the load-bearing check,
+  // not the mutation echo.
+  test('leaves the round pending when the mutation reports success but the block is still live', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    stubStillBlockingReviewFetch()
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const seen: unknown[] = []
+    setReviewObserver((review) => seen.push(review))
+    const event = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-unverified', '101')
+    expect(await before(event, hookCtx)).toBeUndefined()
+    const round = event.origin?.kind === 'channel' ? event.origin.githubReviewRound : undefined
+    if (round === undefined) throw new Error('round missing')
+
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-unverified',
+        result: { content: [{ type: 'text', text: '{"id":700,"state":"DISMISSED"}' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+
+    expect(seen).toEqual([])
+    expect(isGithubReviewRoundComplete(round)).toBe(false)
+  })
+
+  test('an unverified dismissal does not latch the round, so a retry completes it', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    // First authoritative read still reports the block; the second reports it
+    // cleared. If the failed first attempt latched dismissalAttempted, the retry
+    // would be rejected as round-ineligible and the round would strand.
+    stubReviewStateSequence(['CHANGES_REQUESTED', 'DISMISSED'])
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const seen: unknown[] = []
+    setReviewObserver((review) => seen.push(review))
+
+    const first = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-retry-1', '101')
+    expect(await before(first, hookCtx)).toBeUndefined()
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-retry-1',
+        result: { content: [{ type: 'text', text: '{"id":700,"state":"DISMISSED"}' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+    expect(seen).toEqual([])
+
+    const retry = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-retry-2', '101')
+    expect(await before(retry, hookCtx)).toBeUndefined()
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-retry-2',
+        result: { content: [{ type: 'text', text: '{"id":700,"state":"DISMISSED"}' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+
+    expect(seen).toEqual([{ sessionId: 's', workspace: 'acme/widgets', prNumber: 5, verdict: 'DISMISSED' }])
+  })
+
+  function stubReviewStateSequence(states: readonly string[]): void {
+    let call = 0
+    globalThis.fetch = Object.assign(
+      async (input: string | URL | Request) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+        if (url.includes('/pulls/5/reviews')) {
+          const state = states[Math.min(call, states.length - 1)]
+          call += 1
+          return new Response(JSON.stringify([{ state, user: { login: 'review-bot[bot]', type: 'Bot' } }]), {
+            status: 200,
+          })
+        }
+        const body = url.includes('/pulls/5') ? { head: { sha: 'sha-5' } } : null
+        return new Response(JSON.stringify(body), { status: body === null ? 404 : 200 })
+      },
+      { preconnect: () => {} },
+    )
+  }
+
+  function stubDismissedReviewFetch(): void {
+    stubReviewStateSequence(['DISMISSED'])
+  }
+
+  function stubStillBlockingReviewFetch(): void {
+    stubReviewStateFetch('CHANGES_REQUESTED')
+  }
+
+  function stubReviewStateFetch(state: string): void {
+    globalThis.fetch = Object.assign(
+      async (input: string | URL | Request) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+        const body = url.includes('/pulls/5/reviews')
+          ? [{ state, user: { login: 'review-bot[bot]', type: 'Bot' } }]
+          : url.includes('/pulls/5')
+            ? { head: { sha: 'sha-5' } }
+            : null
+        return new Response(JSON.stringify(body), { status: body === null ? 404 : 200 })
+      },
+      { preconnect: () => {} },
+    )
+  }
 })
 
 describe('github-cli-auth plugin — git in the sandbox /tmp bind', () => {

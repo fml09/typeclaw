@@ -65,9 +65,10 @@ The default GitHub event allowlist already covers reviews. If you want to narrow
   **private** repo the agent also needs **Contents: read** — the runtime-owned exact-SHA review fetch (and any raw
   file-tree access) of a private repo fails with 403/404 without it; **Metadata: read** alone lets the App _see_ the
   repo but not read its files. Model-driven review, commenting, and triage do not require **Contents: write**, so keep
-  that permission disabled for this recipe. If a finding needs a fix, a host-stage operator checks out the repository,
-  makes the authenticated push, publishes the branch, and creates the pull request using host credentials. The wizard's
-  permission note lists exactly what to enable.
+  that permission disabled for this recipe. If a finding needs a fix, a host-stage operator performs checkout and pull-
+  request creation. The agent performs an eligible push to a configured GitHub remote through the broker, using GitHub
+  App auth, an authorized declared PAT, or the automatically refreshed trusted host `gh` store. The wizard's permission
+  note lists exactly what to enable.
 </Callout>
 
 <Callout type="warn" title="The preflight won't catch a missing Contents grant">
@@ -116,6 +117,8 @@ You don't script any of this. The review request lands, the agent reads the diff
 
 Conversational comments go back through the channel automatically. A **formal review** — approve, request-changes, or inline line comments — is submitted through the first-class `post_github_review` tool. The adapter resolves the live PR head, validates each line anchor, moves out-of-diff findings into the review body, submits one review, and verifies the resulting review id and state. Formal verdicts share one process-wide coordinator with authenticated `gh` review commands, so concurrent per-PR submissions are serialized. An identical approval is deduplicated; when an identical changes-request is already effective, TypeClaw keeps that existing block authoritative and posts the new summary and findings as one PR conversation comment instead of creating another blocking review. TypeClaw credits the current-turn verdict ledger only from the verified effective state; policy-downgraded approvals and duplicate-review comment fallbacks count as output, never as approvals or new changes-request verdicts.
 
+When a push re-opens a review the bot already blocked, the follow-up fans out one session per unresolved thread and designates a single carrier eligible to submit that round's verdict, so siblings draining in parallel cannot land conflicting verdicts. The carrier may post one same-state `REQUEST_CHANGES` for the new head — the duplicate rule that would normally downgrade it to a comment is lifted for exactly that case, since otherwise a "concerns remain" re-review could never conclude. With `review.approve: false` the carrier dismisses its prior blocking review rather than posting a `COMMENT`, which does not clear a block. Resolving a thread is never gated on carriership — only on GitHub's authoritative review state — so a thread whose concern is addressed still closes out once the block is gone or the round's verdict has landed.
+
 The model should not inspect credential files or construct a direct REST or GraphQL `gh api` formal-review request.
 Review-producing GraphQL mutations are denied before token minting. The guard inspects the shell-normalized `query`
 field, including adjacent quoted fragments, so they cannot bypass the coordinator and verified ledger. If submission
@@ -124,7 +127,7 @@ stale/transient GitHub responses, and operator policy that downgraded an approva
 
 ## Lock down who can trigger it
 
-Inbound GitHub authors resolve to a role like any other channel. Keep public participants on `guest` with just `channel.respond`, and reserve privileged model-driven actions such as scheduling cron for `owner`. Repository checkout, authenticated push, branch publication, and pull-request creation remain host-stage operator actions regardless of role. To pair yourself as `owner`, run `typeclaw role claim --as owner` and follow the prompt — or, if you're already paired, ask the agent to grant a role via its `grant_role` tool from the TUI or a DM. The review path itself only needs read access plus the ability to post, so a stranger requesting the decoy gets a review but cannot trigger privileged model actions or host-stage repository publication. See [/concepts/permissions-model](/docs/concepts/permissions-model) for why provenance is enforced at the tool boundary.
+Inbound GitHub authors resolve to a role like any other channel. Keep public participants on `guest` with just `channel.respond`, and reserve privileged model-driven actions such as scheduling cron for `owner`. Repository checkout and pull-request creation remain host-stage operator actions. An eligible push to an operator-configured GitHub remote is instead performed by the agent through the repository-bound credential broker, subject to the caller's role and Git guards. To pair yourself as `owner`, run `typeclaw role claim --as owner` and follow the prompt — or, if you're already paired, ask the agent to grant a role via its `grant_role` tool from the TUI or a DM. The review path itself only needs read access plus the ability to post, so a stranger requesting the decoy gets a review but cannot trigger privileged model actions or repository publication. See [/concepts/permissions-model](/docs/concepts/permissions-model) for why provenance is enforced at the tool boundary.
 
 ---
 

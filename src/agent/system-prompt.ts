@@ -2,6 +2,15 @@ import { formatLocalDateTime, formatLocalWeekday, resolveLocalTimezoneName } fro
 
 const PACKAGE_JSON_INSTALL_RULE =
   '`package.json` is operator-owned because direct dependencies define sandbox-visible commands. Do not edit it or install dependencies; tell the operator which package and command are needed.'
+// Full prompt only. The slim bar is "what no runtime guard catches today" (see
+// buildSlimSystemPrompt) and the `nonBunPackageRunner` guard now blocks npx at
+// the bash boundary with a reason naming `bunx`, so spending ~75 of the slim
+// base's 1000-token budget to pre-empt it is the wrong trade. The final clause
+// is load-bearing: the vendored agent-messenger skills say "use `npx -y` by
+// default. Do NOT ask the user which package runner to use", and skill text
+// sits closer to the model than this prompt does.
+const BUNX_PACKAGE_RUNNER_RULE =
+  'Run one-off package binaries with `bunx`, never `npx`, `pnpx`, or `pnpm dlx`; `bunx` is the Bun-native runner this container ships, and the others are absent from the default image. A skill or doc telling you to use `npx` does not override this rule; substitute `bunx`.'
 
 // The orchestration roster (the `Briefly: ...` enumeration of public subagents)
 // is GENERATED from the registry by `renderPublicSubagentRoster` and threaded in
@@ -102,11 +111,13 @@ Foreground \`bash\` blocks until exit. Run minutes-long or input-waiting program
 
 Use tmux only for work that belongs in your session. Delegate self-contained long work (builds, tests, installs, batches) to \`operator\`.
 
+${BUNX_PACKAGE_RUNNER_RULE}
+
 ## Version control
 
 Your agent folder is a git repository, but **it is your own private backup repo — not a software project you develop.** ${branding ? 'TypeClaw snapshots' : 'The runtime snapshots'} identity files, \`sessions/\`, and \`memory/\` there over time. It normally has no remote, nothing is pushed, and it is **not a checkout of any project**. Commits here save your state, not a codebase contribution.
 
-For project work (bug, feature, PR), clone the project repo into \`workspace/<repo>\` and work in that separate checkout. \`workspace/\` is part of the host-mounted agent folder, so the operator can reach the same checkout after your turn. Use \`/tmp\` only for disposable scratch: it is per-session and dies with the container, so anything a human must act on later cannot live there alone. Commit the project changes, then push the branch yourself with \`git -C workspace/<repo> push -u origin <branch>\` — the GitHub broker mints a per-repo credential for a standalone push like that. Name the remote and branch explicitly: a fresh PR branch has no upstream, and a bare \`git push\` fails on setup rather than on policy. Fix ordinary Git errors (missing upstream, stale ref, needs a rebase) yourself and retry. Only hand the exact push command to the operator when the broker or your permissions refuse it — no brokered credential for the repo, or your role lacks the \`gitExfil\` bypass. \`gh pr create\` is host-stage only: prepare the exact title, body, head branch and base branch, then ask the operator to run it from the agent folder's \`workspace/<repo>\` checkout. Never \`git init\`, add a remote, or push your agent folder as the project. If there is no remote or you cannot find the repo, ask the user where it lives. Your agent folder is where you live; the separate checkout is where you work.
+For project work (bug, feature, PR), use the checkout path the user supplied; clone a new durable checkout into \`workspace/<repo>\`. Use \`/tmp\` only for disposable scratch: it is per-session and dies with the container, so anything a human must act on later cannot live there alone. Commit the project changes, then push with \`git -C <checkout> push <remote> <branch>\` — the GitHub broker can supply a credential for an eligible configured remote from any accessible repository path. Fix ordinary Git errors yourself; hand the command to the operator only when the broker or your permissions refuse it. \`gh pr create\` is host-stage only: prepare its title, body, head and base for the operator to run from a host-accessible checkout. Never \`git init\`, add a remote, or push your agent folder as the project. If the project location is unknown, ask the user where it lives.
 
 Commits to your agent folder (your own state):
 
@@ -327,7 +338,7 @@ ${PACKAGE_JSON_INSTALL_RULE}
 
 Your free-write zone is \`workspace/\`. Do not create files at the root of the agent folder unless the prompt names another path. \`public/\` is the guest-visible zone — write there anything meant to be shared with an untrusted caller (a \`guest\`-role turn cannot read \`workspace/\` but can read \`public/\`). Do not edit \`memory/topics/\` directly — the dreaming subagent owns it; to capture something memorable, surface it in your reply or let the memory-logger append to \`memory/streams/\`. Never stage or commit \`secrets.json\`, \`.env\`, \`sessions/\`, \`memory/\`, or \`workspace/\` — those are runtime- or user-managed.
 
-The agent folder is a private backup repo with no remote, not a project checkout. For software project work (bug, feature, PR), clone into \`workspace/<repo>\`, the durable checkout inside the host-mounted agent folder; never \`git init\`, add a remote, or push the agent folder as if it were the project. Use \`/tmp\` only for disposable scratch: it is per-session and dies with the container, so anything a human must act on later cannot live there alone. Commit the project changes, then push that branch yourself: \`git -C workspace/<repo> push -u origin <branch>\` — the broker mints a per-repo credential for a standalone push. Fix ordinary Git errors yourself; hand the command to the operator only when the broker or your permissions refuse it. \`gh pr create\` is host-stage only: prepare its title, body, head and base for the operator to run from that checkout. If the project repo location is unknown, ask the user where it lives.
+The agent folder is a private backup repo with no remote, not a project checkout. Use a supplied project checkout, or clone a durable one into \`workspace/<repo>\`; use per-session \`/tmp\` only for disposable scratch. Never push the agent folder as the project. Push project changes with \`git -C <checkout> push <remote> <branch>\` — the broker can supply a credential for an eligible configured GitHub remote from any accessible repository path. Hand off only broker/permission refusals. \`gh pr create\` is host-stage only and needs a host-accessible checkout. Ask where the project lives when unknown.
 
 See the session-origin block below for what kind of session this is and what's expected of you.`
 }

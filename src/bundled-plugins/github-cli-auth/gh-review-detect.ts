@@ -39,12 +39,27 @@ export type GhReviewDetectInput = {
 // `cd /agent && gh api -X POST repos/o/r/pulls/224/reviews …` used the
 // slash-less form and was missed by the slash-anchored pattern.
 const REVIEWS_ENDPOINT = /(?:^|\/)repos\/([^/\s]+)\/([^/\s]+)\/pulls\/(\d+)\/reviews\b/
+const DISMISSAL_ENDPOINT = /(?:^|\/)repos\/([^/\s]+)\/([^/\s]+)\/pulls\/(\d+)\/reviews\/\d+\/dismissals\b/
 
 export function detectReviewSubmission(input: GhReviewDetectInput): DetectedReview | null {
   const fileContents = input.inputFileContents ?? null
   for (const segment of ghSegments(input.command)) {
     const detected = detectInGhSegment(segment, fileContents)
     if (detected !== null) return detected
+  }
+  return null
+}
+
+export function detectReviewDismissal(command: string): ReviewSubmissionAttempt | null {
+  for (const args of ghSegments(command)) {
+    if (args[1] !== 'api' || !isPutMethod(args)) continue
+    const endpoint = args.find((arg) => DISMISSAL_ENDPOINT.test(arg))
+    if (endpoint === undefined) continue
+    const match = DISMISSAL_ENDPOINT.exec(endpoint)
+    if (match === null) continue
+    const prNumber = Number(match[3])
+    if (!Number.isSafeInteger(prNumber)) return null
+    return { workspace: `${match[1]}/${match[2]}`, prNumber }
   }
   return null
 }
@@ -207,6 +222,21 @@ function isPostMethod(args: readonly string[]): boolean {
   return false
 }
 
+function isPutMethod(args: readonly string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === undefined) continue
+    if ((arg === '-X' || arg === '--method') && (args[i + 1] ?? '').toUpperCase() === 'PUT') return true
+    if (
+      (arg.startsWith('-X=') || arg.startsWith('--method=')) &&
+      arg.slice(arg.indexOf('=') + 1).toUpperCase() === 'PUT'
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 function detectApiReview(args: readonly string[], fileContents: string | null): DetectedReview | null {
   const endpoint = args.find((a) => REVIEWS_ENDPOINT.test(a))
   if (endpoint === undefined) return null
@@ -267,10 +297,22 @@ function detectPrReview(args: readonly string[]): DetectedReview | null {
         ? 'REQUEST_CHANGES'
         : null
   if (verdict === null) return null
-  const workspace = repoFromFlag(args)
-  const prNumber = prNumberArg(args)
+  const urlTarget = prUrlTarget(args)
+  const workspace = repoFromFlag(args) ?? urlTarget?.workspace ?? null
+  const prNumber = prNumberArg(args) ?? urlTarget?.prNumber ?? null
   if (workspace === null || prNumber === null) return null
   return { workspace, prNumber, verdict, source: 'pr-review' }
+}
+
+function prUrlTarget(args: readonly string[]): { workspace: string; prNumber: number } | null {
+  for (const arg of args) {
+    const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(arg)
+    if (match === null) continue
+    const prNumber = Number(match[3])
+    if (!Number.isSafeInteger(prNumber)) return null
+    return { workspace: `${match[1]}/${match[2]}`, prNumber }
+  }
+  return null
 }
 
 function repoFromFlag(args: readonly string[]): string | null {

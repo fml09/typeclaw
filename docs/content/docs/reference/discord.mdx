@@ -84,7 +84,7 @@ Discord chats fall into two internal workspace shapes:
 | `@dm`              | 1:1 direct messages                |
 | `<guildId>`        | Server channels (numeric guild id) |
 
-In role match rules, DMs are addressed by the canonical `dm` **bucket** scope, not the internal `@dm` workspace value: `discord:*` for everything, `discord:dm/*` for any DM, `discord:<guildId>` for one server, or `discord:<guildId>/<channelId>` for a concrete server channel. See the [match-rule DSL](/docs/reference/match-rule-dsl).
+In role match rules, DMs are addressed by the canonical `dm` **bucket** scope, not the internal `@dm` workspace value: `discord:*` for everything, `discord:dm/*` for any DM, `discord:<guildId>` for one server, or `discord:<guildId>/<channelId>` for a concrete server channel. A concrete parent-channel scope also covers its resolved child threads; a scope naming a thread ID remains exact. See the [match-rule DSL](/docs/reference/match-rule-dsl).
 
 ## Quirks
 

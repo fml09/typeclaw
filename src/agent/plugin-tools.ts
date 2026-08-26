@@ -75,6 +75,7 @@ import {
   SandboxPolicyError,
   SandboxDegradedProcError,
   SandboxProcProbeUnverifiedError,
+  type SandboxMount,
   type DependencyBinReconciliation,
   subtractMasked,
   verifyHiddenMaskTargets,
@@ -109,8 +110,18 @@ let sharedLoopGuard: LoopGuard = createLoopGuard()
 // is stripped from client-supplied args before tool.before so only trusted
 // hooks can set it.
 export const TYPECLAW_INTERNAL_BASH_ENV = '__typeclawBashEnv'
+export const TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV = '__typeclawBashWithholdEnv'
+export const TYPECLAW_INTERNAL_BASH_PREPARE = '__typeclawBashPrepare'
 
 type BashEnvOverlay = Record<string, string>
+type BashEnvWithhold = string[]
+export type DeferredBashPreparationResult = {
+  command: string
+  env?: Record<string, string>
+  mount: Extract<SandboxMount, { type: 'ro-bind' }>
+  cleanup: () => Promise<void>
+}
+export type DeferredBashPreparation = () => Promise<DeferredBashPreparationResult>
 const SECRET_BASH_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN'])
 
 // Transport classifier for the TRUSTED hook-injected overlay only (e.g.
@@ -125,6 +136,7 @@ function isOverlaySecretName(name: string): boolean {
 
 type BashSpawnEnvContext = {
   overlay?: BashEnvOverlay
+  withhold?: BashEnvWithhold
   // Exact env for the outer bwrap process on a sandboxed call. When present, the
   // spawn hook uses it verbatim rather than the live inherited env, so a secret
   // that appears in process.env between policy build and spawn stays out of the
@@ -144,18 +156,34 @@ function readBashEnvOverlay(args: Record<string, unknown>): BashEnvOverlay | und
   return Object.keys(overlay).length > 0 ? overlay : undefined
 }
 
+function readBashEnvWithhold(args: Record<string, unknown>): BashEnvWithhold | undefined {
+  const raw = args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
+  if (!Array.isArray(raw) || !raw.every((name) => typeof name === 'string')) return undefined
+  const names = [...new Set(raw)]
+  return names.length > 0 ? names : undefined
+}
+
+function readBashPreparation(args: Record<string, unknown>): DeferredBashPreparation | undefined {
+  const raw = args[TYPECLAW_INTERNAL_BASH_PREPARE]
+  return typeof raw === 'function' ? (raw as DeferredBashPreparation) : undefined
+}
+
 function bashSpawnHookWithOverlay(context: BashSpawnContext): BashSpawnContext {
   const store = bashEnvStore.getStore()
   if (store?.sandboxSpawnEnv !== undefined) return { ...context, env: { ...store.sandboxSpawnEnv } }
-  return { ...context, env: sanitizeBashSpawnEnvironment(context.env, store?.overlay) }
+  return { ...context, env: sanitizeBashSpawnEnvironment(context.env, store?.overlay, store?.withhold) }
 }
 
 export function sanitizeBashSpawnEnvironment(
   inherited: NodeJS.ProcessEnv | undefined,
   overlay: BashEnvOverlay | undefined,
+  withhold: readonly string[] = [],
 ): NodeJS.ProcessEnv {
   const env = { ...inherited }
   for (const name of SECRET_BASH_ENV_NAMES) delete env[name]
+  for (const name of withhold) delete env[name]
+  // A trusted overlay deliberately replaces ambient state for this command, so
+  // it wins when the same name is also withheld.
   if (overlay !== undefined) Object.assign(env, overlay)
   return env
 }
@@ -586,9 +614,11 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         tool.name === 'bash' && typeof mutableArgs.command === 'string' ? mutableArgs.command : undefined
       normalizeDefaultTreeRoot(tool.name, mutableArgs)
       const liveOrigin = opts.getOrigin?.()
-      // Defense-in-depth: strip any pre-existing internal env-overlay key
-      // before hooks run so only trusted tool.before hooks can set it.
+      // Defense-in-depth: strip pre-existing internal env-control keys before
+      // hooks run so only trusted tool.before hooks can set them.
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_PREPARE]
       const blockResult = await opts.hooks.runToolBefore({
         tool: tool.name,
         sessionId: opts.sessionId,
@@ -604,7 +634,11 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       // the bash tool destructures them, so the overlay never reaches logs,
       // loop-detection state, or pi's execute.
       const bashEnvOverlay = readBashEnvOverlay(mutableArgs)
+      const bashEnvWithhold = readBashEnvWithhold(mutableArgs)
+      const bashPreparation = readBashPreparation(mutableArgs)
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_PREPARE]
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
         fireLoopAbort(opts.getAbort, 'loop_guard:block')
@@ -667,6 +701,8 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               opts.agentDir,
               opts.sessionId,
               bashEnvOverlay,
+              bashEnvWithhold,
+              bashPreparation,
               sandboxBoundary,
             )
           }
@@ -691,9 +727,12 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
           })
           await preparedSandboxRuntime?.verify()
           const spawnEnvContext: BashSpawnEnvContext | undefined =
-            bashEnvOverlay !== undefined || preparedSandboxRuntime?.spawnEnv !== undefined
+            bashEnvOverlay !== undefined ||
+            bashEnvWithhold !== undefined ||
+            preparedSandboxRuntime?.spawnEnv !== undefined
               ? {
                   ...(bashEnvOverlay !== undefined ? { overlay: bashEnvOverlay } : {}),
+                  ...(bashEnvWithhold !== undefined ? { withhold: bashEnvWithhold } : {}),
                   ...(preparedSandboxRuntime?.spawnEnv !== undefined
                     ? { sandboxSpawnEnv: preparedSandboxRuntime.spawnEnv }
                     : {}),
@@ -726,7 +765,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       // no-op for every message/tool outside the allowlist, so abort, sandbox,
       // and policy errors pass through untouched. Mutating the message in place
       // preserves the error's subclass and stack for the rethrow.
-      if (executionError instanceof Error && signal?.aborted !== true) {
+      if (cleanupError === undefined && executionError instanceof Error && signal?.aborted !== true) {
         executionError.message = remediateToolErrorMessage(tool.name, executionError.message)
         const incidentFact = classifyToolOutcome({ tool: tool.name, error: executionError })
         if (incidentFact !== null) {
@@ -769,7 +808,13 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
           }
         }
       }
-      let finalError = executionError ?? cleanupError
+      let finalError =
+        executionError !== undefined && cleanupError !== undefined
+          ? new Error(
+              `${executionError instanceof Error ? executionError.message : String(executionError)}\n\n` +
+                `Cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+            )
+          : (executionError ?? cleanupError)
       if (finalError !== undefined) {
         // The builtin reports command failures as execution errors rather than
         // result details. Once the sandbox was prepared, annotate every such
@@ -892,10 +937,12 @@ async function applyBashSandbox(
   agentDir: string,
   sessionId: string,
   envOverlay: BashEnvOverlay | undefined,
+  envWithhold: BashEnvWithhold | undefined,
+  deferredPreparation: DeferredBashPreparation | undefined,
   boundary: BashSandboxBoundary,
 ): Promise<PreparedBashSandbox> {
-  const command = mutableArgs.command
-  if (typeof command !== 'string') {
+  const originalCommand = mutableArgs.command
+  if (typeof originalCommand !== 'string') {
     return {
       verify: async () => {},
       cleanup: async () => {},
@@ -903,43 +950,57 @@ async function applyBashSandbox(
     }
   }
 
-  const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
-  const envNames = resolveExposableBashEnvNames(agentDir)
-  const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, envOverlay)
-  const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
-  await boundary.ensureAvailable()
-  const sessionTmp = await ensureSessionTmpDir(sessionId)
-  const dependencyBins = await reconcileDependencyBinWrappers({ agentDir, sessionTmp })
-  const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
-    dirs,
-    files,
-  })
-  const writableRoot = canWriteAgentRootInSandbox(permissions, origin)
-  const baseProtectedZones =
-    writableRoot || writable.dirs.includes(join(agentDir, '.git'))
-      ? subtractMasked(await resolveProtectedZones(agentDir), { dirs, files })
-      : { dirs: [], files: [] }
-  const protectedZones = {
-    dirs: baseProtectedZones.dirs,
-    files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles])],
+  let preparation: DeferredBashPreparationResult | undefined
+  let privilegedRuntime: Awaited<ReturnType<typeof resolvePrivilegedSandboxRuntime>> | undefined
+  const cleanup = async (): Promise<void> => {
+    const tasks: Promise<void>[] = []
+    if (privilegedRuntime !== undefined) {
+      tasks.push((boundary.cleanupRuntime ?? cleanupPrivilegedSandboxRuntime)(privilegedRuntime))
+    }
+    if (preparation !== undefined) tasks.push(preparation.cleanup())
+    const outcomes = await Promise.allSettled(tasks)
+    const failure = outcomes.find((outcome) => outcome.status === 'rejected')
+    if (failure?.status === 'rejected') throw failure.reason
   }
-  const writableDirSet = new Set(writable.dirs)
-  const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'
-  const symlinks = resolveSandboxSymlinks(agentDir, config.sandbox.symlinks, sandboxHome).filter((op) =>
-    writableDirSet.has(op.target),
-  )
-  const { strategy: proc, degradeReason } = await resolveProcStrategy()
-  if (proc === 'tmpfs' && commandNeedsRealProc(command)) {
-    throw degradeReason === 'unverified' ? new SandboxProcProbeUnverifiedError() : new SandboxDegradedProcError()
-  }
-  const privilegedRuntime = await (boundary.resolveRuntime ?? resolvePrivilegedSandboxRuntime)({
-    agentDir,
-    command,
-    env: sandboxEnvOverlay,
-  })
-  const cleanup = async (): Promise<void> =>
-    (boundary.cleanupRuntime ?? cleanupPrivilegedSandboxRuntime)(privilegedRuntime)
   try {
+    preparation = await deferredPreparation?.()
+    const command = preparation?.command ?? originalCommand
+    const preparedEnvOverlay = preparation?.env === undefined ? envOverlay : { ...envOverlay, ...preparation.env }
+    const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
+    const envNames = resolveExposableBashEnvNames(agentDir)
+    const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, preparedEnvOverlay)
+    const effectiveEnvWithhold = (envWithhold ?? []).filter((name) => !Object.hasOwn(sandboxEnvOverlay ?? {}, name))
+    const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
+    await boundary.ensureAvailable()
+    const sessionTmp = await ensureSessionTmpDir(sessionId)
+    const dependencyBins = await reconcileDependencyBinWrappers({ agentDir, sessionTmp })
+    const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
+      dirs,
+      files,
+    })
+    const writableRoot = canWriteAgentRootInSandbox(permissions, origin)
+    const baseProtectedZones =
+      writableRoot || writable.dirs.includes(join(agentDir, '.git'))
+        ? subtractMasked(await resolveProtectedZones(agentDir), { dirs, files })
+        : { dirs: [], files: [] }
+    const protectedZones = {
+      dirs: baseProtectedZones.dirs,
+      files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles])],
+    }
+    const writableDirSet = new Set(writable.dirs)
+    const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'
+    const symlinks = resolveSandboxSymlinks(agentDir, config.sandbox.symlinks, sandboxHome).filter((op) =>
+      writableDirSet.has(op.target),
+    )
+    const { strategy: proc, degradeReason } = await resolveProcStrategy()
+    if (proc === 'tmpfs' && commandNeedsRealProc(command)) {
+      throw degradeReason === 'unverified' ? new SandboxProcProbeUnverifiedError() : new SandboxDegradedProcError()
+    }
+    privilegedRuntime = await (boundary.resolveRuntime ?? resolvePrivilegedSandboxRuntime)({
+      agentDir,
+      command,
+      env: sandboxEnvOverlay,
+    })
     await verifyHiddenMaskTargets(maskTargets)
     const { commandString, spawnEnv } = boundary.buildCommand(command, {
       mounts: [
@@ -950,6 +1011,7 @@ async function applyBashSandbox(
         // read-only without adding any broader filesystem exposure.
         { type: 'ro-bind', source: dependencyBins.wrapperDir, dest: DEPENDENCY_BIN_SANDBOX_DIR },
         ...(privilegedRuntime?.mounts ?? []),
+        ...(preparation === undefined ? [] : [preparation.mount]),
       ],
       ...(writableRoot
         ? { writableRoot: { dir: agentDir }, masks: maskTargets, protected: protectedZones }
@@ -959,7 +1021,9 @@ async function applyBashSandbox(
       cwd: agentDir,
       proc,
       procSelfExe: resolveProcSelfExe(),
-      ...spreadSandboxEnv(buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, envNames.exposable)),
+      ...spreadSandboxEnv(
+        buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, envNames.exposable, envWithhold),
+      ),
     })
     mutableArgs.command = commandString
     // The overlay carries command-scoped secret VALUES (e.g. a per-repo GH_TOKEN)
@@ -968,12 +1032,13 @@ async function applyBashSandbox(
     // to complete the exact bwrap-parent env.
     const mergedSpawnEnv =
       spawnEnv !== undefined && sandboxEnvOverlay !== undefined ? { ...spawnEnv, ...sandboxEnvOverlay } : spawnEnv
+    const runtimeForResult = privilegedRuntime
     return {
-      verify: async () => (boundary.verifyRuntime ?? verifyPrivilegedSandboxRuntime)(privilegedRuntime),
+      verify: async () => (boundary.verifyRuntime ?? verifyPrivilegedSandboxRuntime)(runtimeForResult),
       cleanup,
       spawnEnv: mergedSpawnEnv,
       dependencyBins,
-      withheld: { paths: maskTargets, envNames: envNames.withheld },
+      withheld: { paths: maskTargets, envNames: [...new Set([...envNames.withheld, ...effectiveEnvWithhold])] },
     }
   } catch (error) {
     await cleanup()
@@ -1022,12 +1087,19 @@ export function buildSandboxEnvPolicy(
   overlay: BashEnvOverlay | undefined,
   runtimeEnv: Record<string, string> | undefined,
   exposableEnvNames: readonly string[] = [],
-): { inherit?: string[]; set?: Record<string, string> } {
-  const set = { ...runtimeEnv }
+  withhold: readonly string[] = [],
+): { inherit?: string[]; set?: Record<string, string>; withhold?: string[] } {
+  const requestedWithhold = new Set(withhold)
+  const overlayNames = new Set(Object.keys(overlay ?? {}))
+  // The overlay is a deliberate command-scoped replacement, while withholding
+  // only removes ambient values; an overlay therefore wins for the same name.
+  const effectiveWithhold = [...requestedWithhold].filter((name) => !overlayNames.has(name))
+  const effectiveWithholdSet = new Set(effectiveWithhold)
+  const set = Object.fromEntries(Object.entries(runtimeEnv ?? {}).filter(([key]) => !requestedWithhold.has(key)))
   const inherit: string[] = []
   const inheritSeen = new Set<string>()
   const pushInherit = (key: string): void => {
-    if (Object.hasOwn(set, key) || inheritSeen.has(key)) return
+    if (effectiveWithholdSet.has(key) || Object.hasOwn(set, key) || inheritSeen.has(key)) return
     inheritSeen.add(key)
     inherit.push(key)
   }
@@ -1048,12 +1120,19 @@ export function buildSandboxEnvPolicy(
   // /tmp/.X11-unix bind is needed: Chrome reaches Xvfb over the netns-scoped
   // abstract X11 socket while bash keeps network:'inherit'.
   const display = process.env['DISPLAY']
-  if (display !== undefined && display !== '' && !Object.hasOwn(set, 'DISPLAY') && !inheritSeen.has('DISPLAY')) {
+  if (
+    display !== undefined &&
+    display !== '' &&
+    !effectiveWithholdSet.has('DISPLAY') &&
+    !Object.hasOwn(set, 'DISPLAY') &&
+    !inheritSeen.has('DISPLAY')
+  ) {
     set['DISPLAY'] = display
   }
   return {
     ...(inherit.length > 0 ? { inherit } : {}),
     ...(Object.keys(set).length > 0 ? { set } : {}),
+    ...(effectiveWithhold.length > 0 ? { withhold: effectiveWithhold } : {}),
   }
 }
 

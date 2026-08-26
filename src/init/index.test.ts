@@ -10,7 +10,7 @@ import * as z from 'zod'
 import { configSchema, dockerfileSchema } from '@/config/config'
 import type { DockerExec } from '@/container'
 
-import { buildDockerfile } from './dockerfile'
+import { buildDockerfile, BUN_BASE_IMAGE } from './dockerfile'
 import { buildGitignore } from './gitignore'
 import {
   defaultRunHatching,
@@ -1260,7 +1260,7 @@ describe('writeDockerAssets', () => {
     await writeDockerAssets(root)
 
     const dockerfile = await readFile(join(root, 'Dockerfile'), 'utf8')
-    expect(dockerfile).toContain('FROM oven/bun:1-slim')
+    expect(dockerfile).toContain(`FROM ${BUN_BASE_IMAGE}`)
     expect(dockerfile).toContain('WORKDIR /agent')
     expect(dockerfile).toContain('typeclaw')
   })

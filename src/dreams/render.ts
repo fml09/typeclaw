@@ -1,4 +1,4 @@
-import { styleText } from 'node:util'
+import { styled } from '@/shared'
 
 import type { DreamCategory, DreamEntry, DreamEntryDetail } from './types'
 
@@ -8,7 +8,7 @@ type ColorName = 'dim' | 'cyan' | 'green' | 'yellow' | 'magenta' | 'gray'
 
 function tint(opts: RenderOptions, color: ColorName, text: string): string {
   if (!opts.color) return text
-  return styleText(color, text)
+  return styled(color, text)
 }
 
 const CATEGORY_LABELS: Record<DreamCategory, string> = {

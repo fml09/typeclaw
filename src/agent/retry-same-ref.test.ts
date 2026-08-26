@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import type { AgentSession } from './index'
 import {
   promptWithSameRefRetryOnly,
+  RESPONSIVE_OVERLOAD_RETRIES,
   retryBackoffMs,
   retryTurnAfterCompletedToolResult,
   retryTurnOnPersistentSession,
@@ -146,6 +147,26 @@ describe('retryTurnAfterCompletedToolResult', () => {
     expect(order).toEqual(['backoff-start', 'random', 'authorize', 'continue'])
   })
 
+  test('honors an explicit delay instead of the ordinary jitter curve', async () => {
+    const order: string[] = []
+    const { session } = sessionWith([{ role: 'toolResult' }, { role: 'assistant', stopReason: 'error' }], async () => {
+      order.push('continue')
+    })
+
+    expect(
+      await retryTurnAfterCompletedToolResult(session, {
+        attempt: 0,
+        delayMs: 0,
+        random: () => {
+          order.push('random')
+          return 0
+        },
+        authorize: () => true,
+      }),
+    ).toBe(true)
+    expect(order).toEqual(['continue'])
+  })
+
   test('fails closed without mutation for unsafe transcript tails', async () => {
     const unsafeTails = [
       [{ role: 'toolResult' }],
@@ -232,7 +253,7 @@ describe('RETRIES_PER_REF', () => {
   })
 })
 
-type PromptScript = Array<'soft-transient' | 'hard-transient' | 'hard-auth' | 'success'>
+type PromptScript = Array<'soft-transient' | 'soft-overload' | 'hard-transient' | 'hard-auth' | 'success'>
 
 function promptFake(script: PromptScript) {
   const listeners = new Set<(event: { type: string; message?: unknown }) => void>()
@@ -247,10 +268,11 @@ function promptFake(script: PromptScript) {
       messages.push({ role: 'assistant', stopReason: 'error' })
       throw new Error('socket hang up')
     }
-    if (behavior === 'soft-transient') {
+    if (behavior === 'soft-transient' || behavior === 'soft-overload') {
       messages.push({ role: 'assistant', stopReason: 'error' })
+      const errorMessage = behavior === 'soft-overload' ? 'server_is_overloaded' : 'ECONNRESET'
       for (const cb of listeners)
-        cb({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'ECONNRESET' } })
+        cb({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage } })
       return
     }
     messages.push({ role: 'assistant', stopReason: 'stop' })
@@ -302,6 +324,21 @@ describe('promptWithSameRefRetryOnly', () => {
     const fake = promptFake(['success'])
     await promptWithSameRefRetryOnly(fake.session, 'hi')
     expect(fake.attempts()).toBe(1)
+  })
+
+  test('rides out an overload on the default policy — there is no ref to fail over to', async () => {
+    const fake = promptFake(['soft-overload', 'success'])
+    const result = await promptWithSameRefRetryOnly(fake.session, 'hi', undefined, { overloadBackoffMs: () => 0 })
+    expect(result.success).toBe(true)
+    expect(fake.attempts()).toBe(2)
+    expect(fake.userMessages()).toBe(1)
+  })
+
+  test('gives up on a sustained overload once the responsive budget is spent', async () => {
+    const fake = promptFake(['soft-overload'])
+    const result = await promptWithSameRefRetryOnly(fake.session, 'hi', undefined, { overloadBackoffMs: () => 0 })
+    expect(result.success).toBe(false)
+    expect(fake.attempts()).toBe(RESPONSIVE_OVERLOAD_RETRIES + 1)
   })
 
   test('surfaces the original hard error when the retry recipe cannot apply (no phantom success)', async () => {

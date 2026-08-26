@@ -2,13 +2,21 @@ import { ACKNOWLEDGE_GUARDS, type GuardBlock, isGuardAcknowledged } from '../gua
 
 export const GUARD_GLOBAL_INSTALL = 'globalInstall'
 export const GUARD_NON_BUN_PACKAGE_MANAGER = 'nonBunPackageManager'
+export const GUARD_NON_BUN_PACKAGE_RUNNER = 'nonBunPackageRunner'
 
-// Only install managers are blocked. The ephemeral runners npx/pnpx (and bunx,
-// which is `bun`) are intentionally absent: they run a tool once without
-// touching the dependency tree or writing a competing lockfile, so they don't
-// undermine the bun-standardization this set protects. classify() skips any
-// command word not in here, so leaving them out is what allows them.
+// Install managers write competing lockfiles and install trees, so they are
+// steered to bun.
 const NON_BUN_MANAGERS = new Set(['npm', 'pnpm', 'yarn'])
+// The runners were previously allowed on the argument that they leave no
+// lockfile or install tree behind. True, but that argument only covers
+// dependency-tree pollution — it says nothing about which command word runs,
+// and in practice "allowed" became "default": the vendored agent-messenger
+// skills instruct the agent to use `npx -y` and explicitly not to deliberate
+// about the runner, so nothing downstream ever got to prefer bunx. They stay
+// reachable through their own acknowledgement rather than being allowed
+// outright. `pnpm dlx` and `bun x` are two-word forms: the former already
+// blocks as a manager, the latter is bun and is fine.
+const NON_BUN_RUNNERS = new Set(['npx', 'pnpx'])
 const INSTALL_SUBCOMMANDS = new Set(['install', 'i', 'add'])
 
 export function checkBunHygieneGuard(options: { tool: string; args: Record<string, unknown> }): GuardBlock | undefined {
@@ -18,13 +26,23 @@ export function checkBunHygieneGuard(options: { tool: string; args: Record<strin
   const command = args.command
   if (typeof command !== 'string') return undefined
 
-  const verdict = classify(command)
-  if (verdict === undefined) return undefined
-  if (verdict.kind === 'global-install') return blockGlobalInstall(verdict.label, args)
-  return blockNonBunManager(verdict.manager, args)
+  for (const verdict of classify(command)) {
+    const block = blockFor(verdict, args)
+    if (block !== undefined) return block
+  }
+  return undefined
 }
 
-type Verdict = { kind: 'global-install'; label: string } | { kind: 'non-bun'; manager: string }
+function blockFor(verdict: Verdict, args: Record<string, unknown>): GuardBlock | undefined {
+  if (verdict.kind === 'global-install') return blockGlobalInstall(verdict.label, args)
+  if (verdict.kind === 'non-bun') return blockNonBunManager(verdict.manager, args)
+  return blockNonBunRunner(verdict.runner, args)
+}
+
+type Verdict =
+  | { kind: 'global-install'; label: string }
+  | { kind: 'non-bun'; manager: string }
+  | { kind: 'non-bun-runner'; runner: string }
 
 // Why a segment model instead of one big regex: every gap in a raw-string match
 // is a shell-structure gap. Splitting into segments first means a global flag on
@@ -33,24 +51,44 @@ type Verdict = { kind: 'global-install'; label: string } | { kind: 'non-bun'; ma
 // stripped uniformly, and `--global=false` is inspected as a real token. The
 // global-install verdict wins over the plain non-bun verdict (it's the more
 // specific violation, and acknowledging it is meant to let the whole thing run).
-function classify(command: string): Verdict | undefined {
-  let fallback: Verdict | undefined
+// Verdicts come back in precedence order and the caller stops at the first one
+// that is not acknowledged. Falling through matters: `npm install && npx tsc`
+// has two independent problems, so acknowledging the manager must still leave
+// the runner blocked rather than clearing the whole command.
+function classify(command: string): Verdict[] {
+  let globalVerdict: Verdict | undefined
+  let managerVerdict: Verdict | undefined
+  let runnerVerdict: Verdict | undefined
   for (const segment of splitSegments(command)) {
     const words = segment.map(normalizeWord)
-    const manager = leadingCommandWord(words)
-    if (manager === undefined) continue
+    const commandWord = leadingCommandWord(words)
+    if (commandWord === undefined) continue
+
+    if (NON_BUN_RUNNERS.has(commandWord)) {
+      runnerVerdict ??= { kind: 'non-bun-runner', runner: commandWord }
+      continue
+    }
 
     // `bun` is the allowed manager, but a `bun add -g` still installs to ~/.bun
     // (outside /agent) and is wiped on restart, so it is a global install too —
     // just never a plain non-bun violation.
-    const isBun = manager === 'bun'
-    if (!isBun && !NON_BUN_MANAGERS.has(manager)) continue
+    const isBun = commandWord === 'bun'
+    if (!isBun && !NON_BUN_MANAGERS.has(commandWord)) continue
 
-    const label = globalInstallLabel(manager, words)
-    if (label !== undefined) return { kind: 'global-install', label }
-    if (!isBun) fallback ??= { kind: 'non-bun', manager }
+    // A global install subsumes the manager verdict for ITS OWN segment only:
+    // acknowledging `npm install -g x` is meant to let that install run without
+    // demanding a second acknowledgement for the same words. Scoping it to the
+    // segment is what stops it from clearing violations elsewhere in the
+    // command — an early return here let `bun add -g foo && npx tsc` through on
+    // a lone globalInstall acknowledgement.
+    const label = globalInstallLabel(commandWord, words)
+    if (label !== undefined) {
+      globalVerdict ??= { kind: 'global-install', label }
+      continue
+    }
+    if (!isBun) managerVerdict ??= { kind: 'non-bun', manager: commandWord }
   }
-  return fallback
+  return [globalVerdict, managerVerdict, runnerVerdict].filter((verdict): verdict is Verdict => verdict !== undefined)
 }
 
 // Split on real command separators (`;`, `&&`, `||`, `|`, `&`, newline, `\r`)
@@ -316,8 +354,22 @@ function blockNonBunManager(manager: string, args: Record<string, unknown>): Gua
     block: true,
     reason: [
       `Guard \`${GUARD_NON_BUN_PACKAGE_MANAGER}\` blocked \`${manager}\`. This container standardizes on bun for dependency management.`,
-      'Use `bun install` / `bun add <pkg>` instead of npm/pnpm/yarn. Ephemeral runners (`bunx`, `npx`, `pnpx`) are allowed for one-off tool execution.',
+      'Use `bun install` / `bun add <pkg>` instead of npm/pnpm/yarn, and use `bunx <pkg>` for one-off tool execution.',
       `Retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_NON_BUN_PACKAGE_MANAGER}: true\` if this package manager is genuinely required (e.g. a project pinned to a different lockfile).`,
+    ].join(' '),
+  }
+}
+
+function blockNonBunRunner(runner: string, args: Record<string, unknown>): GuardBlock | undefined {
+  if (isGuardAcknowledged(args, GUARD_NON_BUN_PACKAGE_RUNNER)) return undefined
+
+  return {
+    block: true,
+    reason: [
+      `Guard \`${GUARD_NON_BUN_PACKAGE_RUNNER}\` blocked \`${runner}\`.`,
+      'This container standardizes on bun for package execution: `bunx` is the Bun-native equivalent and the package runner the image actually ships. `npx`/`pnpx` are absent from the default image, and where a custom image supplies them they carry npm/pnpm semantics rather than bun ones.',
+      'Use `bunx <pkg>` for one-off package binaries.',
+      `Retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_NON_BUN_PACKAGE_RUNNER}: true\` only if this non-bun runner is genuinely required.`,
     ].join(' '),
   }
 }

@@ -235,6 +235,81 @@ describe('github review-thread resolver', () => {
     expect(seen.mutations).toEqual([])
   })
 
+  it('serializes concurrent close-outs on one thread so only the leader mutates', async () => {
+    // given: a live thread whose state flips once the mutation lands, so a
+    // follower that looks it up AFTER the leader observes it already resolved
+    const state = { resolved: false, mutations: 0 }
+    const fetchImpl = Object.assign(
+      async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { query: string }
+        if (body.query.includes('resolveReviewThread(input')) {
+          state.mutations += 1
+          state.resolved = true
+          return new Response(
+            JSON.stringify({ data: { resolveReviewThread: { thread: { id: 'PRRT_C', isResolved: true } } } }),
+            { status: 200 },
+          )
+        }
+        return new Response(
+          JSON.stringify(
+            threadsPayload({
+              threads: [{ id: 'PRRT_C', isResolved: state.resolved, rootCommentId: 700, rootAuthorLogin: 'bot[bot]' }],
+              hasNextPage: false,
+              endCursor: null,
+            }),
+          ),
+          { status: 200 },
+        )
+      },
+      { preconnect: () => {} },
+    )
+    const resolve = resolverFor(fetchImpl)
+
+    // when: two sessions close the same thread out at the same time
+    const [first, second] = await Promise.all([resolve(req(700)), resolve(req(700))])
+
+    // then: exactly one mutation ran and the follower reports the no-op, so the
+    // caller suppresses its duplicate acknowledgement
+    expect(state.mutations).toBe(1)
+    expect([first, second].filter((r) => r.ok && r.alreadyResolved !== true)).toHaveLength(1)
+    expect([first, second].filter((r) => r.ok && r.alreadyResolved === true)).toHaveLength(1)
+  })
+
+  it('releases the per-thread lock when a resolve throws', async () => {
+    let calls = 0
+    const fetchImpl = Object.assign(
+      async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { query: string }
+        calls += 1
+        if (calls === 1) throw new Error('boom')
+        if (body.query.includes('resolveReviewThread(input')) {
+          return new Response(
+            JSON.stringify({ data: { resolveReviewThread: { thread: { id: 'PRRT_L', isResolved: true } } } }),
+            { status: 200 },
+          )
+        }
+        return new Response(
+          JSON.stringify(
+            threadsPayload({
+              threads: [{ id: 'PRRT_L', isResolved: false, rootCommentId: 800, rootAuthorLogin: 'bot[bot]' }],
+              hasNextPage: false,
+              endCursor: null,
+            }),
+          ),
+          { status: 200 },
+        )
+      },
+      { preconnect: () => {} },
+    )
+    const resolve = resolverFor(fetchImpl)
+
+    const failed = await resolve(req(800))
+    const recovered = await resolve(req(800))
+
+    expect(failed.ok).toBe(false)
+    expect(recovered.ok).toBe(true)
+  })
+
   it('paginates past the first page to find a thread that sits later', async () => {
     const seen = { mutations: [] as string[], queryCount: 0 }
     const resolve = resolverFor(

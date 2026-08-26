@@ -31,6 +31,31 @@ case "$1" in
   *//github.com/*|*//github.com\\'*|*//*@github.com/*|*//*@github.com\\'*) : ;;
   *) exit 1 ;;
 esac
+if [ -n "$TYPECLAW_GIT_CREDENTIALS" ]; then
+  prompt=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  selected_token=''
+  while IFS='	' read -r repo token; do
+    case "$prompt" in
+      *//github.com/"$repo"\\'*|*//github.com/"$repo".git\\'*|*//*@github.com/"$repo"\\'*|*//*@github.com/"$repo".git\\'*) selected_token=$token; break ;;
+    esac
+  done <<TYPECLAW_GIT_CREDENTIALS_EOF
+$TYPECLAW_GIT_CREDENTIALS
+TYPECLAW_GIT_CREDENTIALS_EOF
+  [ -n "$selected_token" ] || exit 1
+  case "$1" in
+    *Username*) printf '%s\\n' 'x-access-token' ;;
+    *) printf '%s\\n' "$selected_token" ;;
+  esac
+  exit 0
+fi
+if [ -n "$TYPECLAW_GIT_EXPECTED_REPO" ]; then
+  expected_repo=$(printf '%s' "$TYPECLAW_GIT_EXPECTED_REPO" | tr '[:upper:]' '[:lower:]')
+  prompt=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$prompt" in
+    *//github.com/"$expected_repo"\\'*|*//github.com/"$expected_repo".git\\'*|*//*@github.com/"$expected_repo"\\'*|*//*@github.com/"$expected_repo".git\\'*) : ;;
+    *) exit 1 ;;
+  esac
+fi
 case "$1" in
   *Username*) printf '%s\\n' 'x-access-token' ;;
   *) printf '%s\\n' "$TYPECLAW_GIT_TOKEN" ;;

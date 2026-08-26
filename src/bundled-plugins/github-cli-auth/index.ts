@@ -1,10 +1,17 @@
-import { TYPECLAW_INTERNAL_BASH_ENV } from '@/agent/plugin-tools'
+import {
+  TYPECLAW_INTERNAL_BASH_ENV,
+  TYPECLAW_INTERNAL_BASH_PREPARE,
+  TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV,
+} from '@/agent/plugin-tools'
 import type { SessionOrigin } from '@/agent/session-origin'
+import { recordVerifiedDismissal } from '@/channels/github-review-turn-ledger'
 import {
   configureReviewVerdictCoordinator,
   createSharedReviewVerdictGuard,
+  guardGithubReviewRoundDismissal,
+  releaseGithubReviewRoundDismissal,
 } from '@/channels/github-review-verdict-coordinator'
-import { hasEnvKey } from '@/init/env-file'
+import { hasEnvKey, readEnvFile } from '@/init/env-file'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
 import { definePlugin } from '@/plugin'
 
@@ -15,6 +22,14 @@ import {
   effectiveGhTokensForAuthenticatedUserEndpoint,
   usesGhApiGraphqlEndpoint,
 } from './gh-command'
+import { detectReviewDismissal } from './gh-review-detect'
+import {
+  cleanupPreparedGithubStorePush,
+  GH_STORE_AMBIENT_AUTH_KEYS,
+  planGithubStorePush,
+  prepareGithubStorePush,
+  resolveGithubCliStoreToken,
+} from './gh-store'
 import { ensureGitAskPassHelper, resolveSandboxGitAskPassPath } from './git-askpass'
 import {
   analyzeGitCommand,
@@ -22,14 +37,16 @@ import {
   defaultGitResolvers,
   resolveGhDefaultRepoFromCwd,
 } from './git-command'
+import { buildGitCredentialEnv, type GitRepoCredential } from './git-credential-env'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
-import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
+import { commitReviewIfSucceeded, dismissalMutationSucceeded, noteReviewCommand } from './review-recorder'
 import { classifyGhToken, shouldMintAppToken } from './token-class'
 
 export default definePlugin({
   plugin: async (ctx) => {
     const resolveTokenForRepo = ctx.github.resolveTokenForRepo
     const hasAppTokenResolver = ctx.github.hasAppTokenResolver
+    const trustedGitTransportEnv: NodeJS.ProcessEnv = { ...process.env }
 
     // Every model-driven bash masks the canonical credential files. A role may
     // still USE a PAT through this runtime-owned overlay, which injects one
@@ -77,6 +94,39 @@ export default definePlugin({
       return undefined
     }
 
+    // Stricter than sandboxInheritedGhToken(), and deliberately not merged with it.
+    // `gh` only needs to know WHICH token the sandbox will hand it, so the live
+    // value is the right answer there. Brokering to git asserts something stronger
+    // — that the operator deliberately exposed THIS value — and a declared NAME
+    // does not authenticate a live VALUE: PAT-mode channel auth overwrites
+    // process.env.GH_TOKEN at runtime (channels/adapters/github/index.ts), so a
+    // declared name can carry a credential the operator never wrote to `.env`.
+    // Compare against the same literal `readEnvFile` parse Docker's --env-file
+    // injects, and fail closed on any mismatch.
+    const declaredGhTokenForGitBroker = (): { envName: 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string } | undefined => {
+      const inherited = sandboxInheritedGhToken()
+      if (inherited === undefined) return undefined
+      const declared = readEnvFile(ctx.agentDir).get(inherited.envName)
+      if (declared === undefined || declared === '' || declared !== inherited.value) return undefined
+      return inherited
+    }
+
+    const declaredGitCredentialState = ():
+      | { kind: 'absent' }
+      | { kind: 'invalid' }
+      | { kind: 'pat'; envName: 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string } => {
+      const inherited = declaredGhTokenForGitBroker()
+      if (inherited === undefined) {
+        return hasEnvKey(ctx.agentDir, 'GH_TOKEN') || hasEnvKey(ctx.agentDir, 'GITHUB_TOKEN')
+          ? { kind: 'invalid' }
+          : { kind: 'absent' }
+      }
+      const tokenClass = classifyGhToken(inherited.value)
+      return tokenClass === 'cross-owner' || tokenClass === 'fine-grained-pat'
+        ? { kind: 'pat', ...inherited }
+        : { kind: 'invalid' }
+    }
+
     // A process-only PAT (runtime/App-seeded process.env, NOT declared in `.env`)
     // is stripped by --clearenv for this role, and a PAT is not re-mintable per
     // repo, so there is no token to inject. Tell the AGENT (model-visible block)
@@ -91,6 +141,26 @@ export default definePlugin({
       'guard, not missing auth: a broad, long-lived runtime PAT must not be reachable from a low-trust ' +
       'sandbox. Configure GitHub App auth (channels.github) for per-repo, short-lived tokens that work ' +
       'for sandboxed roles, or declare the PAT in `.env` to deliberately expose it to model bash.'
+
+    // Deliberately claims only what this process can prove: a resolver is absent.
+    // It cannot tell PAT-configured from App-configured-but-adapter-down, so it
+    // names both remedies instead of guessing one. The closing lines exist because
+    // a mute refusal here is indistinguishable from broken auth, so the caller
+    // retries credential-management commands that are themselves blocked.
+    const missingAppAuthForPushReason =
+      'Pushing to github.com needs an eligible credential and validated destination, and TypeClaw has nothing it can give this git command. ' +
+      'Operator remedy: declare `GH_TOKEN` in the agent `.env` and restart, configure GitHub App auth under ' +
+      '`channels.github` for per-repo short-lived tokens, or authenticate host `gh` with ' +
+      '`gh auth login --hostname github.com`; the next real `typeclaw start` or `typeclaw restart` automatically captures ' +
+      'that active account into the trusted-runtime store (a start against an already-running container is a no-op). ' +
+      'If App auth is already configured, the adapter failed to start — check ' +
+      '`typeclaw logs`. Do not retry with ' +
+      '`gh auth setup-git`, a credential helper, or a tokenized remote URL: those are blocked and the ' +
+      'credential files are masked in this sandbox.'
+    const multiPushStoreReason =
+      'The trusted GitHub CLI credential store can fund exactly one configured push repository. ' +
+      'This remote has multiple GitHub push destinations; use an authoritative declared PAT or GitHub App auth, ' +
+      'or configure exactly one push URL.'
 
     let warnedSandboxedPatWithheld = false
     const warnSandboxedPatWithheldOnce = (): void => {
@@ -122,15 +192,17 @@ export default definePlugin({
       const result = await resolveTokenForRepo(workspace)
       return result.kind === 'token' ? result.token : null
     }
+    const resolveEffectiveApproval = createGithubEffectiveApprovalResolver({
+      resolveToken,
+      selfLogin: ctx.github.getAppSelfLogin ?? (() => null),
+      isAppAuth: hasAppTokenResolver,
+    })
     configureReviewVerdictCoordinator({
-      resolveEffectiveApproval: createGithubEffectiveApprovalResolver({
-        resolveToken,
-        selfLogin: ctx.github.getAppSelfLogin ?? (() => null),
-        isAppAuth: hasAppTokenResolver,
-      }),
+      resolveEffectiveApproval,
       resolveHeadSha: createGithubHeadShaResolver({ resolveToken }),
     })
     const verdictGuard = createSharedReviewVerdictGuard()
+    const pendingDismissals = new Map<string, { workspace: string; prNumber: number }>()
 
     type HookResult = void | { block: true; reason: string }
 
@@ -205,22 +277,42 @@ export default definePlugin({
         }
       }
 
-      const review = await noteReviewCommand({ callId: event.callId, command })
       // guard() holds the lease expecting tool.after to release it. A later
       // tool.before block means tool.after never fires, so blockAfterLease()
       // releases the lease with succeeded:false. The static command analyzer runs
       // above and never claims a lease for a command it will reject.
       let leaseClaimed = false
+      let dismissalLeaseClaimed = false
       const blockAfterLease = async (block: HookResult & { block: true }): Promise<HookResult> => {
         if (leaseClaimed) await verdictGuard.release({ callId: event.callId, succeeded: false })
+        if (dismissalLeaseClaimed) releaseGithubReviewRoundDismissal(event.callId, false)
+        pendingDismissals.delete(event.callId)
         return block
       }
+      const dismissal = detectReviewDismissal(command)
+      if (dismissal !== null) {
+        const block = await guardGithubReviewRoundDismissal({
+          callId: event.callId,
+          workspace: dismissal.workspace,
+          prNumber: dismissal.prNumber,
+          ...(event.origin?.kind === 'channel' && event.origin.githubReviewRound !== undefined
+            ? { round: event.origin.githubReviewRound, thread: event.origin.thread }
+            : {}),
+        })
+        if (block !== null) return block
+        dismissalLeaseClaimed = event.origin?.kind === 'channel' && event.origin.githubReviewRound !== undefined
+        pendingDismissals.set(event.callId, dismissal)
+      }
+      const review = await noteReviewCommand({ callId: event.callId, command })
       if (review.detected !== null) {
         const block = await verdictGuard.guard({
           callId: event.callId,
           workspace: review.detected.workspace,
           prNumber: review.detected.prNumber,
           verdict: review.detected.verdict,
+          ...(event.origin?.kind === 'channel' && event.origin.githubReviewRound !== undefined
+            ? { round: event.origin.githubReviewRound, thread: event.origin.thread }
+            : {}),
         })
         if (block !== null) return block
         leaseClaimed = true
@@ -353,7 +445,7 @@ export default definePlugin({
     }
 
     const handleGitCommand = async (params: {
-      event: { args: Record<string, unknown> }
+      event: { callId: string; args: Record<string, unknown>; origin?: SessionOrigin }
       command: string
       agentDir: string
       sessionId: string
@@ -366,12 +458,100 @@ export default definePlugin({
       if (decision.kind === 'pass-through') return
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
 
-      // Only a per-repo GitHub App token is brokered to git — never a PAT (git,
-      // unlike gh, runs repo-local hooks/helpers, and a PAT is not repo-confined).
-      // With no App minter, pass through so git fails honestly.
-      if (!hasAppTokenResolver()) return
-      const result = await resolveTokenForRepo(decision.repoSlug)
-      if (result.kind === 'unavailable') return { block: true, reason: result.reason }
+      const buildGitCredentialOverlay = async (
+        credentials: readonly GitRepoCredential[],
+        existing: unknown,
+        options: { expectedRemote?: string; pushUrls?: readonly string[]; trustedEnv?: NodeJS.ProcessEnv } = {},
+      ): Promise<Record<string, string>> => {
+        const askpass = await ensureGitAskPassHelper(resolveSandboxGitAskPassPath())
+        const overlay = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
+        return {
+          ...overlay,
+          ...buildGitCredentialEnv(credentials, askpass, options),
+        }
+      }
+      const destinationRepos =
+        decision.pushProvenance?.kind === 'configured-remote'
+          ? decision.pushProvenance.repoSlugs
+          : [decision.repoSlug.toLocaleLowerCase()]
+
+      if (!hasAppTokenResolver()) {
+        const declared = declaredGitCredentialState()
+        if (
+          // The analyzer emits write access only for its push subcommand grammar.
+          decision.access === 'write' &&
+          declared.kind === 'pat' &&
+          canUsePat(event.origin)
+        ) {
+          event.args[TYPECLAW_INTERNAL_BASH_ENV] = await buildGitCredentialOverlay(
+            destinationRepos.map((repoSlug) => ({ repoSlug, token: declared.value })),
+            event.args[TYPECLAW_INTERNAL_BASH_ENV],
+            {
+              expectedRemote:
+                decision.pushProvenance?.kind === 'configured-remote' ? decision.pushProvenance.remote : undefined,
+              pushUrls:
+                decision.pushProvenance?.kind === 'configured-remote' ? decision.pushProvenance.pushUrls : undefined,
+              trustedEnv: trustedGitTransportEnv,
+            },
+          )
+          // Withhold wins only when the same ambient names are absent from the overlay.
+          event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV] = ['GH_TOKEN', 'GITHUB_TOKEN']
+          if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
+          return
+        }
+        if (decision.access !== 'write') return
+        if (declared.kind !== 'absent') return { block: true, reason: missingAppAuthForPushReason }
+        if (destinationRepos.length !== 1) return { block: true, reason: multiPushStoreReason }
+
+        const askpass = await ensureGitAskPassHelper(resolveSandboxGitAskPassPath())
+        const plan = await planGithubStorePush(decision, { agentDir, sessionId, askpassPath: askpass })
+        if (plan === null) return { block: true, reason: missingAppAuthForPushReason }
+        const storeToken = await resolveGithubCliStoreToken()
+        if (storeToken === null) return { block: true, reason: missingAppAuthForPushReason }
+        const credentialEnv = await buildGitCredentialOverlay(
+          [{ repoSlug: plan.repo, token: storeToken }],
+          event.args[TYPECLAW_INTERNAL_BASH_ENV],
+          { expectedRemote: plan.remote, trustedEnv: {} },
+        )
+        event.args[TYPECLAW_INTERNAL_BASH_ENV] = credentialEnv
+        const inheritedNames = [
+          ...Object.keys(process.env),
+          ...Object.keys(credentialEnv),
+          'SSH_ASKPASS',
+          'SSH_AUTH_SOCK',
+          'HTTP_PROXY',
+          'HTTPS_PROXY',
+          'ALL_PROXY',
+          'http_proxy',
+          'https_proxy',
+          'all_proxy',
+        ]
+        event.args[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV] = [
+          ...new Set([
+            ...GH_STORE_AMBIENT_AUTH_KEYS,
+            ...inheritedNames.filter(
+              (name) => name.startsWith('GIT_') || name.startsWith('SSH_') || /proxy/i.test(name),
+            ),
+          ]),
+        ]
+        event.args[TYPECLAW_INTERNAL_BASH_PREPARE] = async () => {
+          const prepared = await prepareGithubStorePush(plan)
+          if (prepared === null) throw new Error(missingAppAuthForPushReason)
+          return {
+            command: prepared.command,
+            env: prepared.env,
+            mount: prepared.mount,
+            cleanup: async () => await cleanupPreparedGithubStorePush(prepared.backingGitDir),
+          }
+        }
+        return
+      }
+      const credentials: GitRepoCredential[] = []
+      for (const repoSlug of destinationRepos) {
+        const result = await resolveTokenForRepo(repoSlug)
+        if (result.kind === 'unavailable') return { block: true, reason: result.reason }
+        credentials.push({ repoSlug, token: result.token })
+      }
 
       // Deliver the token via GIT_ASKPASS (env, never argv/config). The analyzer
       // already constrained this to a single bare github git command, so the token
@@ -382,26 +562,17 @@ export default definePlugin({
       // belong in a separate agent (see docs/internals/sandbox.mdx).
       // Sandboxed bash: the helper must be on a sandbox-visible path (baked /usr),
       // not the unsandboxed /tmp default the tmpfs would hide.
-      const askpass = await ensureGitAskPassHelper(resolveSandboxGitAskPassPath())
-      const existing = event.args[TYPECLAW_INTERNAL_BASH_ENV]
-      const overlay = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
-      event.args[TYPECLAW_INTERNAL_BASH_ENV] = {
-        ...overlay,
-        GIT_ASKPASS: askpass,
-        TYPECLAW_GIT_TOKEN: result.token,
-        GIT_TERMINAL_PROMPT: '0',
-        GIT_CONFIG_COUNT: '4',
-        GIT_CONFIG_KEY_0: 'core.hooksPath',
-        GIT_CONFIG_VALUE_0: '/dev/null',
-        GIT_CONFIG_KEY_1: 'credential.helper',
-        GIT_CONFIG_VALUE_1: '',
-        // Both ssh remote spellings fold to https so the askpass credential applies:
-        // the scp short form (git@github.com:owner/repo) and the ssh:// URL form.
-        GIT_CONFIG_KEY_2: 'url.https://github.com/.insteadOf',
-        GIT_CONFIG_VALUE_2: 'git@github.com:',
-        GIT_CONFIG_KEY_3: 'url.https://github.com/.insteadOf',
-        GIT_CONFIG_VALUE_3: 'ssh://git@github.com/',
-      }
+      event.args[TYPECLAW_INTERNAL_BASH_ENV] = await buildGitCredentialOverlay(
+        credentials,
+        event.args[TYPECLAW_INTERNAL_BASH_ENV],
+        {
+          expectedRemote:
+            decision.pushProvenance?.kind === 'configured-remote' ? decision.pushProvenance.remote : undefined,
+          pushUrls:
+            decision.pushProvenance?.kind === 'configured-remote' ? decision.pushProvenance.pushUrls : undefined,
+          trustedEnv: trustedGitTransportEnv,
+        },
+      )
       if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
       return
     }
@@ -425,6 +596,33 @@ export default definePlugin({
         },
         'tool.after': async (event) => {
           checkGraphqlAuthNudge({ tool: event.tool, result: event.result })
+          const dismissal = pendingDismissals.get(event.callId)
+          pendingDismissals.delete(event.callId)
+          if (dismissal !== undefined) {
+            // Only an AUTHORITATIVELY verified dismissal may latch the round's
+            // one-attempt marker. Latching on a failed mutation — or on a
+            // succeeded mutation whose verifying read errored, where we cannot
+            // tell whether the block cleared — bars every retry AND suppresses
+            // carrier failover, stranding the round with all siblings gated
+            // forever. Unverified therefore releases the latch so the next
+            // attempt can re-read authoritative state.
+            let verified = false
+            try {
+              if (dismissalMutationSucceeded(event.result)) {
+                const effective = await resolveEffectiveApproval(dismissal)
+                if (effective.ok && effective.effective === 'DISMISSED') {
+                  recordVerifiedDismissal({
+                    sessionId: event.sessionId,
+                    workspace: dismissal.workspace,
+                    prNumber: dismissal.prNumber,
+                  })
+                  verified = true
+                }
+              }
+            } finally {
+              releaseGithubReviewRoundDismissal(event.callId, verified)
+            }
+          }
           const review = commitReviewIfSucceeded({
             sessionId: event.sessionId,
             callId: event.callId,

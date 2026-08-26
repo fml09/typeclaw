@@ -37,6 +37,7 @@ export type SandboxProcStrategy = 'tmpfs' | 'none' | 'real-proc' | 'proc-bind'
 export type SandboxEnvPolicy = {
   set?: Record<string, string>
   passthrough?: string[]
+  withhold?: string[]
   // Preserve these names from bwrap's parent environment without rendering
   // their values in argv. The builder switches from --clearenv to explicit
   // --unsetenv for every other inherited name. Reserved for command-scoped

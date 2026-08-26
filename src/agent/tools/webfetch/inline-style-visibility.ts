@@ -2,7 +2,7 @@ export type InlineStyleVisibility = 'hidden' | 'visible' | 'uncertain'
 
 const MAX_RAW_INLINE_STYLE_CHARS = 64 * 1024
 const MAX_CSS_NESTING_DEPTH = 32
-const RELEVANT_PROPERTIES = new Set(['content-visibility', 'display', 'visibility', 'opacity'])
+export const VISIBILITY_PROPERTIES = new Set(['content-visibility', 'display', 'visibility', 'opacity'])
 const CSS_NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/iu
 const CSS_PERCENTAGE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?%$/iu
 const VISIBLE_DISPLAY_VALUES = new Set([
@@ -54,7 +54,7 @@ export function classifyRawInlineStyleVisibility(style: string): InlineStyleVisi
       continue
     }
     const property = asciiFold(decodedProperty.value.trim())
-    if (!RELEVANT_PROPERTIES.has(property)) continue
+    if (!VISIBILITY_PROPERTIES.has(property)) continue
 
     const declaration = classifyDeclaration(property, rawValue)
     const prior = declarations.get(property)

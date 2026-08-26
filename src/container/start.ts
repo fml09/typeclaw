@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { accessSync, constants as fsConstants, existsSync } from 'node:fs'
+import { accessSync, constants as fsConstants, existsSync, realpathSync } from 'node:fs'
 import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
@@ -31,6 +31,11 @@ import { refreshPackageJson } from '@/init/packagejson'
 import { reconcilePluginDeps } from '@/init/reconcile-plugin-deps'
 import { runBunUpdate, type UpdateRunner } from '@/init/run-bun-install'
 import { linkWindowsDevTypeclaw, resolveBunLinkedPackage, type RunBunLink } from '@/init/windows-dev-link'
+import {
+  provisionGithubCliStore,
+  type GithubCliProvisionResult,
+  type ProvisionGithubCliStoreOptions,
+} from '@/secrets/provision-github-cli-store'
 import { isWindows } from '@/shared'
 import { hostLocaleIsCjk } from '@/shared/host-locale'
 
@@ -180,6 +185,9 @@ export type StartOptions = {
   hostIdentity?: { uid: number; gid: number } | null
   // Test seam for the host-stage writable-config preflight.
   assertConfigWritable?: (cwd: string) => void
+  provisionGithubCliStore?: (
+    options: ProvisionGithubCliStoreOptions,
+  ) => GithubCliProvisionResult | Promise<GithubCliProvisionResult>
   archiveLogs?: DockerLogArchiver
   operationLock?: WithAgentOperationLock
   operationLease?: AgentOperationLease
@@ -249,6 +257,7 @@ async function runStart({
   platform = process.platform,
   hostIdentity = currentHostIdentity(),
   assertConfigWritable = assertAgentConfigWritable,
+  provisionGithubCliStore: provisionGithubCliStoreForAgent = provisionGithubCliStore,
   archiveLogs = archiveContainerLogs,
 }: StartOptions): Promise<StartResult> {
   try {
@@ -316,6 +325,10 @@ async function runStart({
         reason: `Container ${containerName} became running during start preflight; refusing to migrate agent-messenger credentials or launch a replacement.`,
       }
     }
+
+    const githubCliDeniedRoots = resolveGithubCliDeniedRoots(cwd, await loadTypeclawConfig(cwd))
+    await refreshGithubCliStore(cwd, githubCliDeniedRoots, provisionGithubCliStoreForAgent)
+
     if (agentMessengerPolicy.migrate) {
       const agentMessengerMigration = await migrateAgentMessengerConfigDir(cwd)
       if (!agentMessengerMigration.ok) return { ok: false, reason: agentMessengerMigration.reason }
@@ -655,6 +668,33 @@ async function runStart({
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : String(error) }
   }
+}
+
+async function refreshGithubCliStore(
+  agentDir: string,
+  deniedRoots: readonly string[],
+  provision: (options: ProvisionGithubCliStoreOptions) => GithubCliProvisionResult | Promise<GithubCliProvisionResult>,
+): Promise<void> {
+  let refreshed = false
+  try {
+    refreshed = (await provision({ agentDir, deniedRoots })).ok
+  } catch {
+    refreshed = false
+  }
+  if (refreshed) return
+
+  process.stderr.write(
+    'typeclaw: warning: Could not refresh GitHub CLI credentials from the host. ' +
+      'Keeping the previously persisted credential store. Run `gh auth login --hostname github.com` on the host, ' +
+      'then restart TypeClaw.\n',
+  )
+}
+
+function resolveGithubCliDeniedRoots(cwd: string, config: Config): string[] {
+  return [
+    realpathSync(cwd),
+    ...config.mounts.filter((mount) => !mount.readOnly).map((mount) => expandMountPath(mount.path, cwd)),
+  ]
 }
 
 function commitMessageForAutoUpgrade(outcome: AutoUpgradeOutcome): string | null {

@@ -1,7 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 
 import { ACKNOWLEDGE_GUARDS } from '../guard/policy'
-import { GUARD_GLOBAL_INSTALL, GUARD_NON_BUN_PACKAGE_MANAGER, checkBunHygieneGuard } from './policy'
+import {
+  GUARD_GLOBAL_INSTALL,
+  GUARD_NON_BUN_PACKAGE_MANAGER,
+  GUARD_NON_BUN_PACKAGE_RUNNER,
+  checkBunHygieneGuard,
+} from './policy'
 
 function bash(command: string, extra: Record<string, unknown> = {}) {
   return checkBunHygieneGuard({ tool: 'bash', args: { command, ...extra } })
@@ -57,12 +62,12 @@ describe('checkBunHygieneGuard — non-bun package managers', () => {
     expect(result?.reason).toContain(GUARD_NON_BUN_PACKAGE_MANAGER)
   })
 
-  // npx/pnpx are ephemeral runners: allowed for one-off tool execution because
-  // they don't touch the dependency tree or write a competing lockfile.
   test.each(['npx create-next-app', 'pnpx cowsay hi', 'cd app && npx tsc', 'echo done; npx tsc'])(
-    'allows ephemeral runner %p',
+    'blocks non-bun runner %p',
     (command) => {
-      expect(bash(command)).toBeUndefined()
+      const result = bash(command)
+      expect(result?.block).toBe(true)
+      expect(result?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
     },
   )
 
@@ -81,6 +86,65 @@ describe('checkBunHygieneGuard — non-bun package managers', () => {
       [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true },
     })
     expect(acknowledged).toBeUndefined()
+  })
+
+  // The global-install verdict subsumes the manager verdict only within its own
+  // segment. Regression guard: classify() used to return early on the first
+  // global install, which dropped every later segment's verdict — so a lone
+  // globalInstall acknowledgement silently ran the runner segment too.
+  test('acknowledging a compound command global install still surfaces its runner violation', () => {
+    expect(bash('bun add -g foo && npx tsc')?.reason).toContain(GUARD_GLOBAL_INSTALL)
+
+    const globalAcknowledged = bash('bun add -g foo && npx tsc', {
+      [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true },
+    })
+    expect(globalAcknowledged?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
+
+    const bothAcknowledged = bash('bun add -g foo && npx tsc', {
+      [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true, [GUARD_NON_BUN_PACKAGE_RUNNER]: true },
+    })
+    expect(bothAcknowledged).toBeUndefined()
+  })
+
+  // Same scoping rule for a manager in a different segment: the global install
+  // clears its own segment, not the separate `pnpm install`.
+  test('acknowledging a global install still surfaces a manager violation elsewhere', () => {
+    const globalAcknowledged = bash('npm install -g typescript && pnpm install', {
+      [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true },
+    })
+    expect(globalAcknowledged?.reason).toContain(GUARD_NON_BUN_PACKAGE_MANAGER)
+  })
+
+  test('non-bun manager takes precedence over a non-bun runner', () => {
+    expect(bash('npm install && npx tsc')?.reason).toContain(GUARD_NON_BUN_PACKAGE_MANAGER)
+
+    const managerAcknowledged = bash('npm install && npx tsc', {
+      [ACKNOWLEDGE_GUARDS]: { [GUARD_NON_BUN_PACKAGE_MANAGER]: true },
+    })
+    expect(managerAcknowledged?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
+  })
+})
+
+describe('checkBunHygieneGuard — non-bun package runners', () => {
+  test('block reason explains bunx and the exact bypass', () => {
+    const result = bash('npx tsc')
+    expect(result?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
+    expect(result?.reason).toContain('Bun-native equivalent')
+    expect(result?.reason).toContain('absent from the default image')
+    expect(result?.reason).toContain('`bunx <pkg>`')
+    expect(result?.reason).toContain(`${ACKNOWLEDGE_GUARDS}.${GUARD_NON_BUN_PACKAGE_RUNNER}: true`)
+  })
+
+  test('acknowledging nonBunPackageRunner lets it through', () => {
+    expect(
+      bash('npx tsc', {
+        [ACKNOWLEDGE_GUARDS]: { [GUARD_NON_BUN_PACKAGE_RUNNER]: true },
+      }),
+    ).toBeUndefined()
+  })
+
+  test.each(['\\npx tsc', '"npx" tsc', 'FOO=bar npx tsc', 'sudo npx tsc'])('blocks obfuscated runner %p', (command) => {
+    expect(bash(command)?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
   })
 })
 
@@ -148,16 +212,19 @@ describe('checkBunHygieneGuard — leading assignment / preamble words', () => {
 
   // The wrapper's consumed argument must not be mistaken for the command word:
   // `sudo -u nobody ls` runs ls (allowed), not a manager.
-  test.each([
-    'nice -n 10 echo hi',
-    'sudo -u nobody ls -g',
-    'env -i sh',
-    'stdbuf -oL cat x',
-    'nice -n 10 npx create-next-app',
-    'sudo -u nobody pnpx cowsay hi',
-  ])('does not block wrapped non-manager command %p', (command) => {
-    expect(bash(command)).toBeUndefined()
-  })
+  test.each(['nice -n 10 echo hi', 'sudo -u nobody ls -g', 'env -i sh', 'stdbuf -oL cat x'])(
+    'does not block wrapped non-manager command %p',
+    (command) => {
+      expect(bash(command)).toBeUndefined()
+    },
+  )
+
+  test.each(['nice -n 10 npx create-next-app', 'sudo -u nobody pnpx cowsay hi'])(
+    'blocks wrapped non-bun runner %p',
+    (command) => {
+      expect(bash(command)?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
+    },
+  )
 })
 
 describe('checkBunHygieneGuard — newline is a command separator', () => {
@@ -267,9 +334,7 @@ describe('checkBunHygieneGuard — allowed commands', () => {
     'bun add -d typescript',
     'bunx tsc',
     'bunx create-next-app my-app',
-    'npx tsc',
-    'npx create-next-app my-app',
-    'pnpx cowsay hi',
+    'bun x cowsay hi',
     'bun run build',
     'ls -g',
     './npm-wrapper.sh',
@@ -280,6 +345,10 @@ describe('checkBunHygieneGuard — allowed commands', () => {
     'grep -rn npx src/',
   ])('allows %p', (command) => {
     expect(bash(command)).toBeUndefined()
+  })
+
+  test.each(['npx tsc', 'npx create-next-app my-app', 'pnpx cowsay hi'])('blocks non-bun runner %p', (command) => {
+    expect(bash(command)?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
   })
 })
 
