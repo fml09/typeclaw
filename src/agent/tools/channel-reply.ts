@@ -278,15 +278,17 @@ export function createChannelReplyTool({
         }
       }
 
-      const result = await router.send({
-        adapter: origin.adapter,
-        workspace: origin.workspace,
-        chat: origin.chat,
-        thread: origin.thread,
-        ...(text !== undefined ? { text } : {}),
-        ...(attachments !== undefined ? { attachments } : {}),
-      })
-
+      const result = await router.send(
+        {
+          adapter: origin.adapter,
+          workspace: origin.workspace,
+          chat: origin.chat,
+          thread: origin.thread,
+          ...(text !== undefined ? { text } : {}),
+          ...(attachments !== undefined ? { attachments } : {}),
+        },
+        { progressReply: keepTurnAlive ? 'status' : 'final' },
+      )
       if (!result.ok) {
         logger.warn(
           formatChannelToolFailure(

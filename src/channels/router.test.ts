@@ -2845,6 +2845,144 @@ describe('ChannelRouter auto-react on engage', () => {
     expect(result).toEqual({ ok: false, error: 'reaction api exploded', code: 'transient' })
   })
 })
+describe('ChannelRouter runtime progress', () => {
+  test('creates one progress message, edits it through safe phases, and finalizes it', async () => {
+    const dir = await tempDir()
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      progress: {
+        enabled: true,
+        updateIntervalMs: 750,
+        startReaction: 'eyes',
+        successReaction: 'white_check_mark',
+        errorReaction: 'x',
+      },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const outbound: OutboundMessage[] = []
+    const edits: string[] = []
+    const reactionEvents: string[] = []
+    const progressReactionRef: ReactionRef = { adapter: 'discord-bot', value: 'progress-reaction' }
+    const inboundReactionRef: ReactionRef = { adapter: 'discord-bot', value: 'inbound-reaction' }
+
+    router.registerOutbound('discord-bot', async (message) => {
+      outbound.push(message)
+      return {
+        ok: true,
+        messageId: 'progress-message',
+        messageIds: ['progress-message'],
+        reactionRef: { adapter: 'discord-bot', value: 'progress-message-target' },
+      }
+    })
+    router.registerEditMessage('discord-bot', async (request) => {
+      edits.push(request.text)
+      return { ok: true }
+    })
+    router.registerReaction('discord-bot', async (request) => {
+      reactionEvents.push(`add:${request.emoji}`)
+      return { ok: true, reactionRef: progressReactionRef }
+    })
+    router.registerRemoveReaction('discord-bot', async () => {
+      reactionEvents.push('remove')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ reactionRef: inboundReactionRef }))
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
+      })
+      sessions[0]!.setAssistantText('final answer')
+      const reply = createChannelReplyTool({ router, origin: inbound() })
+      await reply.execute(
+        'reply-call',
+        { text: 'final answer', more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    await waitFor(() => edits.includes('final answer'))
+    expect(outbound).toHaveLength(1)
+    expect(outbound[0]?.text).toBe('Processing…')
+    expect(edits).toContain('Thinking…')
+    expect(edits.at(-1)).toBe('final answer')
+    expect(reactionEvents).toEqual(['add:eyes', 'remove', 'add:white_check_mark'])
+    await router.stop()
+  })
+  test('sequences Kakao-like ACTION toggles before applying the final like', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      postReplyReaction: { enabled: true, emoji: 'like' },
+      progress: {
+        enabled: true,
+        updateIntervalMs: 750,
+        startReaction: 'like',
+        successReaction: 'like',
+        errorReaction: 'like',
+      },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const outbound: OutboundMessage[] = []
+    const edits: string[] = []
+    const reactionEvents: string[] = []
+    const reactionInstanceRef: ReactionRef = { adapter: 'kakaotalk', value: 'reaction-instance' }
+
+    router.registerOutbound('kakaotalk', async (message) => {
+      outbound.push(message)
+      return { ok: true, messageId: 'progress-message', messageIds: ['progress-message'] }
+    })
+    router.registerEditMessage('kakaotalk', async (request) => {
+      edits.push(request.text)
+      return { ok: true }
+    })
+    router.registerReaction('kakaotalk', async (request) => {
+      reactionEvents.push(`add:${request.emoji}`)
+      return { ok: true, reactionRef: reactionInstanceRef }
+    })
+    router.registerRemoveReaction('kakaotalk', async () => {
+      reactionEvents.push('remove')
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: 'hello',
+        externalMessageId: 'kakao-inbound',
+        isDm: true,
+        reactionRef: { adapter: 'kakaotalk', value: 'kakao-inbound-target' },
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
+      })
+      sessions[0]!.setAssistantText('final answer')
+      const reply = createChannelReplyTool({ router, origin: key })
+      await reply.execute(
+        'reply-call',
+        { text: 'final answer', more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+    }
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => edits.includes('final answer'))
+    expect(outbound).toHaveLength(1)
+    expect(edits.at(-1)).toBe('final answer')
+    expect(reactionEvents).toEqual(['add:like', 'remove', 'add:like'])
+    await router.stop()
+  })
+})
 
 describe('ChannelRouter editMessage', () => {
   const editReq = {

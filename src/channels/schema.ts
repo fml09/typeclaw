@@ -185,6 +185,16 @@ const postReplyReactionSchema = z.object({
   enabled: z.boolean().default(false),
   emoji: z.string().trim().min(1).max(32).default('like'),
 })
+// Runtime-owned progress message settings. When enabled, the router creates
+// one short status message after generation starts and edits that same
+// bot-authored message for safe lifecycle phases and the final reply.
+const progressSchema = z.object({
+  enabled: z.boolean().default(false),
+  updateIntervalMs: z.number().int().min(250).max(10_000).default(750),
+  startReaction: z.string().trim().min(1).max(32).optional(),
+  successReaction: z.string().trim().min(1).max(32).optional(),
+  errorReaction: z.string().trim().min(1).max(32).optional(),
+})
 
 // Deliberately non-strict: a stale on-disk file may still carry the
 // legacy `allow` field. Zod silently drops unknown keys here, which is
@@ -197,6 +207,7 @@ const adapterSchema = z.object({
   quotedReply: quotedReplySchema.optional(),
   inboundBatching: inboundBatchingSchema.optional(),
   postReplyReaction: postReplyReactionSchema.optional(),
+  progress: progressSchema.optional(),
 })
 
 export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [

@@ -112,6 +112,34 @@ describe('channelsSchema', () => {
   test('rejects an empty postReplyReaction emoji', () => {
     expect(() => channelsSchema.parse({ kakaotalk: { postReplyReaction: { enabled: true, emoji: ' ' } } })).toThrow()
   })
+  test('parses runtime-owned progress settings', () => {
+    const parsed = channelsSchema.parse({
+      kakaotalk: {
+        progress: {
+          enabled: true,
+          updateIntervalMs: 1000,
+          startReaction: 'like',
+          successReaction: 'like',
+          errorReaction: 'like',
+        },
+      },
+    })
+    expect(parsed.kakaotalk?.progress).toEqual({
+      enabled: true,
+      updateIntervalMs: 1000,
+      startReaction: 'like',
+      successReaction: 'like',
+      errorReaction: 'like',
+    })
+  })
+
+  test('progress settings default disabled and validate interval', () => {
+    expect(channelsSchema.parse({ kakaotalk: { progress: {} } }).kakaotalk?.progress).toEqual({
+      enabled: false,
+      updateIntervalMs: 750,
+    })
+    expect(() => channelsSchema.parse({ kakaotalk: { progress: { updateIntervalMs: 249 } } })).toThrow()
+  })
 
   test('accepts github channel config with webhookUrl omitted', () => {
     const parsed = channelsSchema.parse({ github: { repos: ['owner/repo'] } })

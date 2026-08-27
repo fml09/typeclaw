@@ -26,6 +26,7 @@ import {
   createOutboundCallback,
   createKakaoEditMessageCallback,
   createKakaoReactionCallback,
+  createKakaoRemoveReactionCallback,
   type KakaoTalkClient,
   type KakaoTalkListener,
 } from './kakaotalk'
@@ -86,6 +87,14 @@ class FakeClient implements KakaoTalkClient {
     log_id: 'L1',
     reaction_type: 1,
   }
+  removeReactionCalls: Array<{ chatId: string; logId: string; reactionType: number }> = []
+  removeReactionResult = {
+    success: true,
+    status_code: 0,
+    chat_id: '111',
+    log_id: 'L1',
+    reaction_type: 1,
+  }
   editMessageCalls: Array<{ chatId: string; logId: string; text: string }> = []
   editMessageResult = { success: true, status_code: 0, chat_id: '111', log_id: 'L1' }
   profileResult: KakaoProfile = {
@@ -136,6 +145,10 @@ class FakeClient implements KakaoTalkClient {
   async addReaction(chatId: string, logId: string, reactionType: number) {
     this.addReactionCalls.push({ chatId, logId, reactionType })
     return this.addReactionResult
+  }
+  async removeReaction(chatId: string, logId: string, reactionType: number) {
+    this.removeReactionCalls.push({ chatId, logId, reactionType })
+    return this.removeReactionResult
   }
 
   async editMessage(chatId: string, logId: string, text: string) {
@@ -576,8 +589,52 @@ describe('KakaoTalk mutation callbacks', () => {
       emoji: '+1',
     })
 
-    expect(result).toEqual({ ok: true })
+    expect(result).toEqual({
+      ok: true,
+      reactionRef: {
+        adapter: 'kakaotalk',
+        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionType: 1 }),
+      },
+    })
     expect(client.addReactionCalls).toEqual([{ chatId: '111', logId: '42', reactionType: 1 }])
+  })
+  test('removes only a reaction ref previously returned by the add callback', async () => {
+    const client = new FakeClient()
+    const callback = createKakaoRemoveReactionCallback(client)
+
+    const result = await callback({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      thread: null,
+      reactionRef: {
+        adapter: 'kakaotalk',
+        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionType: 1 }),
+      },
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(client.removeReactionCalls).toEqual([{ chatId: '111', logId: '42', reactionType: 1 }])
+  })
+
+  test('rejects a raw target ref for reaction removal', async () => {
+    const client = new FakeClient()
+    const callback = createKakaoRemoveReactionCallback(client)
+
+    const result = await callback({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      thread: null,
+      reactionRef,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'invalid KakaoTalk reaction removal ref',
+      code: 'not-found',
+    })
+    expect(client.removeReactionCalls).toEqual([])
   })
 
   test('rejects unverified KakaoTalk reaction names instead of guessing a type', async () => {
@@ -642,11 +699,15 @@ describe('KakaoTalk mutation callbacks', () => {
     const listener = new FakeListener()
     const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
     let reactionRegistered = false
+    let removeReactionRegistered = false
     let editRegistered = false
     let reactionUnregistered = false
+    let removeReactionUnregistered = false
     let editUnregistered = false
     const registerReaction = router.registerReaction.bind(router)
     const unregisterReaction = router.unregisterReaction.bind(router)
+    const registerRemoveReaction = router.registerRemoveReaction.bind(router)
+    const unregisterRemoveReaction = router.unregisterRemoveReaction.bind(router)
     const registerEditMessage = router.registerEditMessage.bind(router)
     const unregisterEditMessage = router.unregisterEditMessage.bind(router)
     router.registerReaction = (adapter, callback) => {
@@ -656,6 +717,14 @@ describe('KakaoTalk mutation callbacks', () => {
     router.unregisterReaction = (adapter, callback) => {
       if (adapter === 'kakaotalk') reactionUnregistered = true
       unregisterReaction(adapter, callback)
+    }
+    router.registerRemoveReaction = (adapter, callback) => {
+      if (adapter === 'kakaotalk') removeReactionRegistered = true
+      registerRemoveReaction(adapter, callback)
+    }
+    router.unregisterRemoveReaction = (adapter, callback) => {
+      if (adapter === 'kakaotalk') removeReactionUnregistered = true
+      unregisterRemoveReaction(adapter, callback)
     }
     router.registerEditMessage = (adapter, callback) => {
       if (adapter === 'kakaotalk') editRegistered = true
@@ -675,11 +744,13 @@ describe('KakaoTalk mutation callbacks', () => {
     await adapter.start()
 
     expect(reactionRegistered).toBe(true)
+    expect(removeReactionRegistered).toBe(true)
     expect(editRegistered).toBe(true)
 
     await adapter.stop()
 
     expect(reactionUnregistered).toBe(true)
+    expect(removeReactionUnregistered).toBe(true)
     expect(editUnregistered).toBe(true)
     await router.stop()
   })
@@ -705,7 +776,12 @@ describe('createKakaotalkAdapter — outbound', () => {
       chat: '111',
       text: 'hello',
     })
-    expect(result).toEqual({ ok: true, messageId: 'L1', messageIds: ['L1'] })
+    expect(result).toEqual({
+      ok: true,
+      messageId: 'L1',
+      messageIds: ['L1'],
+      reactionRef: { adapter: 'kakaotalk', value: JSON.stringify({ chatId: '111', logId: 'L1' }) },
+    })
     expect(client.sendMessageCalls).toEqual([{ chatId: '111', text: 'hello' }])
 
     await adapter.stop()

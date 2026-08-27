@@ -59,8 +59,20 @@ Adapters come in two shapes. **Bot adapters** authenticate as a platform bot/app
 | `inboundBatching.quietMs`   | all      | run the turn this many ms after the **latest** inbound; every inbound restarts the timer (0–30000)    |
 | `inboundBatching.maxWaitMs` | all      | force a flush once the oldest unprocessed message is this old, even under a steady stream (0–60000)   |
 | `postReplyReaction`         | all      | optional automatic reaction after a substantive reply; adapter-specific vocabulary applies            |
+| `progress`                  | all      | optional runtime-owned status message edited in place during an active turn                           |
 | `webhookPort`               | `github` | container-side port the webhook server listens on; default `8975`                                     |
 | `webhookUrl`                | `github` | optional override; when omitted, the URL comes from a channel-owned tunnel                            |
+
+`progress.enabled` enables a runtime-owned status message for adapters that
+return an outbound message id and support editing. The router creates the
+message only after generation produces a progress event, coalesces repeated
+events into coarse safe labels, and edits that same message with the terminal
+`channel_reply`. Raw model thinking is never forwarded to a channel.
+
+`progress.updateIntervalMs` limits intermediate edits. `startReaction`,
+`successReaction`, and `errorReaction` optionally define the reaction lifecycle
+on the triggering inbound. An adapter may reject a vocabulary item as
+unsupported; this never blocks the reply.
 
 Credentials live in `secrets.json#channels.<adapter>` ([/reference/secrets-json](/docs/reference/secrets-json)).
 

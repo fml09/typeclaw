@@ -86,6 +86,7 @@ import {
   saveChannelSessions,
   type ChannelSessionRecord,
 } from './persistence'
+import { CHANNEL_PROGRESS_FAILURE_TEXT, CHANNEL_PROGRESS_INITIAL_TEXT, progressTextForEvent } from './progress'
 import {
   ADAPTER_READ_CAPABILITIES,
   ADAPTER_WRITE_CAPABILITIES,
@@ -836,6 +837,15 @@ const githubReviewRoundWakeupReminder = (text: string, round: GithubReviewFollow
   githubReviewRoundKey: githubReviewRoundKey(round),
 })
 
+type ProgressMessageState = {
+  messageId: string
+  lastText: string
+  pendingText: string | null
+  lastEditAt: number
+  editTimer: ReturnType<typeof setTimeout> | null
+  editInFlight: Promise<void> | null
+}
+
 type LiveSession = {
   key: ChannelKey
   keyId: string
@@ -955,11 +965,20 @@ type LiveSession = {
   // stop clear ALL of them, not just the latest. An anchor is added when its
   // 'tick' dispatches and removed when its 'stop' clear dispatches.
   dirtyTypingThreads: Set<string>
-  // One engage-:eyes:-add promise per inbound coalesced into THIS turn, each
+  // One engage-reaction add promise per inbound coalesced into THIS turn, each
   // resolving to its removable per-instance ref (or null). A debounced turn can
-  // batch several inbounds that each got their own :eyes:, so every entry is
-  // removed after the reply. Empty on turns with no reactable inbound.
+  // batch several inbounds that each got a reaction; every entry is removed at
+  // terminal turn end. Runtime progress keeps these refs across its retry
+  // iterations so the working reaction remains visible while work continues.
   currentTurnEngageReactions: Array<Promise<ReactionRef | null>>
+  // Runtime-owned status message. It is created only after the model emits a
+  // safe progress event, then edited in place until channel_reply finalizes it.
+  progressMessage: ProgressMessageState | null
+  progressStartPromise: Promise<void> | null
+  progressPendingText: string | null
+  // A failed edit (e.g. Kakao's device-mode -203 response) disables the
+  // progress path for this live session; final replies fall back to a new post.
+  progressDisabled: boolean
   // Model-requested `channel_react` reactions for THIS turn, held until the turn
   // ends. Flushed to the adapter only if the agent actually replied this turn;
   // discarded on silence (skip_response / empty / errored turns) so the bot never
@@ -1314,6 +1333,7 @@ type LiveSession = {
   pendingTeardown: boolean
   unsubProviderErrors: (() => void) | null
   unsubTypingActivity: (() => void) | null
+  unsubProgressActivity: (() => void) | null
   unsubTodoOutcome: (() => void) | null
   // Serializes outcome persistence. The tail always fulfills so one disk
   // failure cannot poison every later turn; its value separately reports
@@ -1370,6 +1390,9 @@ export type SendOptions = {
   // set it explicitly because recovery prose fulfills promised work whereas
   // provider/fallback/control notices are meta output and must not.
   outputKind?: 'substantive' | 'status' | 'meta'
+  // channel_reply may reuse the runtime-owned progress message. 'status' edits
+  // it while the turn continues; 'final' replaces it with the terminal reply.
+  progressReply?: 'status' | 'final'
 }
 
 export const DUPLICATE_SEND_ERROR =
@@ -2484,6 +2507,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         currentTurnTypingThread: null,
         dirtyTypingThreads: new Set(),
         currentTurnEngageReactions: [],
+        progressMessage: null,
+        progressStartPromise: null,
+        progressPendingText: null,
+        progressDisabled: false,
         pendingTurnReactions: [],
         silentAckTurn: null,
         activeSilentAckReactions: [],
@@ -2542,6 +2569,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         pendingTeardown: false,
         unsubProviderErrors: null,
         unsubTypingActivity: null,
+        unsubProgressActivity: null,
         unsubTodoOutcome: null,
         todoOutcomeWrite: Promise.resolve(true),
       }
@@ -2580,6 +2608,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         enqueueTodoOutcomeWrite(live, outcomeArgs)
       })
+      live.unsubProgressActivity = subscribeProgressActivity(created.session, live)
       live.unsubTypingActivity = subscribeTypingActivity(created.session, live)
       installChannelReplyTerminalHook(live)
       installChannelOutputCap(live)
@@ -2888,6 +2917,188 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         reviveTypingActivity(live)
       }
     })
+  }
+  const progressConfigFor = (live: LiveSession): NonNullable<ChannelAdapterConfig['progress']> | undefined =>
+    options.configForAdapter(live.key.adapter)?.progress
+
+  const progressEnabledFor = (live: LiveSession): boolean =>
+    progressConfigFor(live)?.enabled === true && !live.progressDisabled
+
+  const sendProgressMessage = async (live: LiveSession): Promise<SendResult> => {
+    const callbacks = outboundCallbacks.get(live.key.adapter)
+    if (!callbacks || callbacks.size === 0) {
+      return { ok: false, error: `no adapter registered for "${live.key.adapter}"`, code: 'no-adapter' }
+    }
+    const message: OutboundMessage = {
+      adapter: live.key.adapter,
+      workspace: live.key.workspace,
+      chat: live.key.chat,
+      thread: live.key.thread,
+      text: CHANNEL_PROGRESS_INITIAL_TEXT,
+    }
+    let lastError: string | undefined
+    for (const callback of Array.from(callbacks)) {
+      try {
+        const result = await callback(message)
+        if (result.ok) return result
+        lastError = result.error
+      } catch (err) {
+        lastError = describeError(err)
+      }
+    }
+    return { ok: false, error: lastError ?? 'progress message was not delivered', code: 'callback-rejected' }
+  }
+
+  const applyProgressEdit = async (live: LiveSession, state: ProgressMessageState, text: string): Promise<void> => {
+    const result = await editMessage({
+      adapter: live.key.adapter,
+      workspace: live.key.workspace,
+      chat: live.key.chat,
+      thread: live.key.thread,
+      messageId: state.messageId,
+      text,
+    })
+    if (!result.ok) {
+      live.progressDisabled = true
+      if (live.progressMessage === state) live.progressMessage = null
+      live.progressPendingText = null
+      logger.info(`[channels] ${live.keyId}: progress edit disabled: ${result.error}`)
+      return
+    }
+    if (live.progressMessage === state) {
+      state.lastText = text
+      state.lastEditAt = now()
+    }
+  }
+
+  const scheduleProgressEdit = (live: LiveSession, state: ProgressMessageState): void => {
+    if (live.progressMessage !== state || live.progressDisabled || state.pendingText === null) return
+    if (state.editInFlight !== null || state.editTimer !== null) return
+    const intervalMs = progressConfigFor(live)?.updateIntervalMs ?? 750
+    const waitMs = Math.max(0, intervalMs - (now() - state.lastEditAt))
+    if (waitMs > 0) {
+      state.editTimer = setTimeout(() => {
+        state.editTimer = null
+        scheduleProgressEdit(live, state)
+      }, waitMs)
+      return
+    }
+    const text = state.pendingText
+    state.pendingText = null
+    const edit = applyProgressEdit(live, state, text).catch((err) => {
+      live.progressDisabled = true
+      logger.info(`[channels] ${live.keyId}: progress edit threw: ${describeError(err)}`)
+    })
+    state.editInFlight = edit
+    void edit.finally(() => {
+      if (state.editInFlight === edit) state.editInFlight = null
+      if (live.progressMessage === state && state.pendingText !== null) scheduleProgressEdit(live, state)
+    })
+  }
+
+  const ensureProgressMessage = (live: LiveSession): Promise<void> => {
+    if (!progressEnabledFor(live) || !live.promptInFlight || live.progressMessage !== null) return Promise.resolve()
+    if (live.progressStartPromise !== null) return live.progressStartPromise
+    const start = (async (): Promise<void> => {
+      const result = await sendProgressMessage(live)
+      if (live.destroyed) return
+      if (!result.ok || result.messageId === undefined) {
+        live.progressDisabled = true
+        logger.info(
+          `[channels] ${live.keyId}: progress message unavailable: ${result.ok ? 'adapter returned no message id' : result.error}`,
+        )
+        return
+      }
+      const state: ProgressMessageState = {
+        messageId: result.messageId,
+        lastText: CHANNEL_PROGRESS_INITIAL_TEXT,
+        pendingText: live.progressPendingText,
+        lastEditAt: now(),
+        editTimer: null,
+        editInFlight: null,
+      }
+      live.progressPendingText = null
+      live.progressMessage = state
+      if (state.pendingText === state.lastText) state.pendingText = null
+      scheduleProgressEdit(live, state)
+    })().catch((err) => {
+      live.progressDisabled = true
+      live.progressPendingText = null
+      logger.info(`[channels] ${live.keyId}: progress message threw: ${describeError(err)}`)
+    })
+    live.progressStartPromise = start
+    void start.finally(() => {
+      if (live.progressStartPromise === start) live.progressStartPromise = null
+    })
+    return start
+  }
+
+  const requestProgressUpdate = (live: LiveSession, text: string): void => {
+    if (!progressEnabledFor(live) || !live.promptInFlight) return
+    const state = live.progressMessage
+    if (state === null) {
+      if (live.progressPendingText !== text) live.progressPendingText = text
+      void ensureProgressMessage(live)
+      return
+    }
+    if (state.lastText === text || state.pendingText === text) return
+    state.pendingText = text
+    scheduleProgressEdit(live, state)
+  }
+
+  const subscribeProgressActivity = (session: AgentSession, live: LiveSession): (() => void) =>
+    session.subscribe((event: unknown) => {
+      if (!live.promptInFlight || live.destroyed) return
+      const text = progressTextForEvent(event)
+      if (text !== null) requestProgressUpdate(live, text)
+    })
+
+  const flushProgressEditNow = async (live: LiveSession, state: ProgressMessageState): Promise<void> => {
+    if (state.editTimer !== null) {
+      clearTimeout(state.editTimer)
+      state.editTimer = null
+    }
+    if (state.editInFlight !== null) await state.editInFlight
+    if (live.progressMessage !== state || live.progressDisabled || state.pendingText === null) return
+    const text = state.pendingText
+    state.pendingText = null
+    await applyProgressEdit(live, state, text)
+  }
+
+  const finishProgressMessage = async (live: LiveSession, text: string): Promise<boolean> => {
+    const start = live.progressStartPromise
+    if (start !== null) await start
+    const state = live.progressMessage
+    if (state === null || live.progressDisabled) return false
+    await flushProgressEditNow(live, state)
+    if (live.progressDisabled || live.progressMessage !== state) return false
+    if (state.lastText !== text) await applyProgressEdit(live, state, text)
+    const finished = live.progressMessage === state && !live.progressDisabled
+    if (finished) {
+      live.progressMessage = null
+      live.progressPendingText = null
+    }
+    return finished
+  }
+
+  const deliverProgressReply = async (
+    live: LiveSession,
+    text: string,
+    kind: 'status' | 'final',
+  ): Promise<Extract<SendResult, { ok: true }> | null> => {
+    if (!progressEnabledFor(live) || (live.progressMessage === null && live.progressStartPromise === null)) return null
+    if (live.progressStartPromise !== null) await live.progressStartPromise
+    const state = live.progressMessage
+    if (state === null || live.progressDisabled) return null
+    if (kind === 'status') {
+      state.pendingText = text
+      await flushProgressEditNow(live, state)
+      if (live.progressDisabled || live.progressMessage !== state) return null
+      return { ok: true, messageId: state.messageId, messageIds: [state.messageId] }
+    }
+    const messageId = state.messageId
+    if (!(await finishProgressMessage(live, text))) return null
+    return { ok: true, messageId, messageIds: [messageId] }
   }
 
   // After a successful `channel_reply`, the model has delivered its user-facing
@@ -3589,7 +3800,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.qualifyingWorkThisLogicalTurn = false
           live.promisedWorkOutstandingThisLogicalTurn = false
         } else if (live.lastTurnAuthorId !== null) {
-          live.currentTurnEngageReactions = []
+          if (!(progressConfigFor(live)?.enabled === true && progressConfigFor(live)?.startReaction !== undefined)) {
+            live.currentTurnEngageReactions = []
+          }
           // Reminder-only turn (batch.length === 0, reminders.length > 0):
           // restore the author identity from the prior turn so author-
           // scoped role resolution still works on this turn. The drain
@@ -3747,24 +3960,26 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         } finally {
           live.promptInFlight = false
           const sentReplyThisTurn = live.successfulChannelSends > successfulSendsBeforePrompt
-          // The eager :eyes: ack is a "looking at this" signal, not a "replied"
-          // one, so it comes off at turn end no matter the outcome — a reply, but
-          // also silence, skip_response, an empty turn, or a provider error
-          // (observe-after-engage). Leaving it only on the reply path stranded the
-          // ack permanently on messages the agent looked at but never answered.
-          const dropDone = dropEngageReactions(live, engageAddPromises)
-          // A DELIBERATE silent turn (skip_response / NO_REPLY) leaves a
-          // PERSISTENT :eyes: acking "seen, intentionally not replying". On a
-          // typing-less adapter it reuses the same message/emoji/actor as the
-          // transient engage :eyes:, and adapters that collapse that into one
-          // toggle would let a still-in-flight engage removal strip the ack — so
-          // the silent path AWAITS every engage removal reaching the adapter
-          // before adding the persistent one. Only silent turns pay that wait:
-          // normal/reply turns keep the engage drop fire-and-forget (`void`), so
-          // turn-end never blocks on the reaction API off the silent path.
-          if (live.silentAckTurn?.turnSeq === live.turnSeq) await dropDone
-          else void dropDone
-          reactOnSilentAck(live)
+          // The engage reaction is a transient "working" signal. A configured
+          // progress reaction must remain present across reminder-only retries,
+          // then be removed before the terminal reaction is added; Kakao uses
+          // ACTION as a toggle, so ordering is correctness-critical.
+          const retryQueuedThisTurn =
+            live.emptyTurnRetries > emptyTurnRetriesBeforePrompt ||
+            live.toolLeakRetries > toolLeakRetriesBeforePrompt ||
+            live.willingnessNudges > willingnessNudgesBeforePrompt
+          const progressConfig = progressConfigFor(live)
+          const progressReactionConfigured =
+            progressConfig?.enabled === true && progressConfig.startReaction !== undefined
+          const dropDone =
+            progressReactionConfigured && retryQueuedThisTurn
+              ? Promise.resolve()
+              : dropEngageReactions(live, engageAddPromises)
+          if (live.silentAckTurn?.turnSeq === live.turnSeq || (progressReactionConfigured && !retryQueuedThisTurn)) {
+            await dropDone
+          } else {
+            void dropDone
+          }
           // Held channel_react reactions apply only when the agent posted a
           // genuine reply this turn — NOT an empty-turn fallback or provider-
           // error notice, both of which send via source:'system' and bump
@@ -3776,17 +3991,53 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             sentReplyThisTurn &&
             live.emptyTurnFallbackTurn !== live.turnSeq &&
             assistantLeafStopReason(live.session) !== 'error'
+          const providerErrorThisTurn = assistantLeafStopReason(live.session) === 'error'
+          const progressFailureThisTurn =
+            !usableReplyThisTurn &&
+            !retryQueuedThisTurn &&
+            (providerErrorThisTurn || live.emptyTurnFallbackTurn === live.turnSeq)
+          if (!retryQueuedThisTurn && (live.progressMessage !== null || live.progressStartPromise !== null)) {
+            await finishProgressMessage(live, usableReplyThisTurn ? 'Done.' : CHANNEL_PROGRESS_FAILURE_TEXT)
+          }
           const postReplyReaction = options.configForAdapter(live.key.adapter)?.postReplyReaction
           const automaticReactionRef = live.currentTurnReactionRef
           const modelQueuedReaction = live.pendingTurnReactions.length > 0
+          const terminalReaction =
+            !retryQueuedThisTurn && !modelQueuedReaction
+              ? usableReplyThisTurn
+                ? progressConfig?.successReaction
+                : progressFailureThisTurn
+                  ? progressConfig?.errorReaction
+                  : undefined
+              : undefined
+          if (terminalReaction !== undefined && automaticReactionRef !== null) {
+            const result = await react({
+              adapter: live.key.adapter,
+              workspace: live.key.workspace,
+              chat: live.key.chat,
+              thread: live.key.thread,
+              reactionRef: automaticReactionRef,
+              emoji: terminalReaction,
+            })
+            if (!result.ok && result.code !== 'unsupported') {
+              logger.info(
+                `[channels] progress terminal reaction failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
+              )
+            }
+          }
+          reactOnSilentAck(live)
           if (usableReplyThisTurn) {
             flushPendingReactions(live)
             void dropSilentAckReactions(live)
             // An explicit post-reply reaction is sent only after a real reply
-            // and only when the model did not already choose one. This keeps
-            // KakaoTalk's automatic acknowledgement opt-in and avoids two
-            // reaction writes on the same turn.
-            if (!modelQueuedReaction && postReplyReaction?.enabled === true && automaticReactionRef !== null) {
+            // and only when the model did not already choose one. A configured
+            // progress success reaction already owns that terminal transition.
+            if (
+              terminalReaction === undefined &&
+              !modelQueuedReaction &&
+              postReplyReaction?.enabled === true &&
+              automaticReactionRef !== null
+            ) {
               void react({
                 adapter: live.key.adapter,
                 workspace: live.key.workspace,
@@ -3805,10 +4056,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           } else live.pendingTurnReactions = []
           // Either retry budget keeps the turn in flight, so a deferred provider
           // error must wait for the reminder-only iteration that actually ends it.
-          const retryQueuedThisTurn =
-            live.emptyTurnRetries > emptyTurnRetriesBeforePrompt ||
-            live.toolLeakRetries > toolLeakRetriesBeforePrompt ||
-            live.willingnessNudges > willingnessNudgesBeforePrompt
           await maybePostDeferredProviderError(
             live,
             sentReplyThisTurn && !live.promisedWorkOutstandingThisLogicalTurn,
@@ -4462,26 +4709,24 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return lastError ?? { ok: false, error: 'no reaction removal callback handled request', code: 'unsupported' }
   }
 
-  // Best-effort acknowledgment: drop an :eyes: on the triggering inbound the
-  // moment we decide to engage — but ONLY when the channel has no visible
-  // "typing…" indicator. Where typing renders (slack/discord/telegram) the
-  // heartbeat already signals "the bot is working", so the reaction would be
-  // redundant noise; the :eyes: is the fallback ack for typing-less channels
-  // (github, kakaotalk), replacing the old "On it" comment on GitHub.
-  // Fire-and-forget so a reaction failure (missing permission, the adapter not
-  // supporting reactions, a transient API error) can NEVER block engagement,
-  // enqueueing, or the agent's actual reply. No reactionRef = nothing reactable
-  // (synthetic inbounds, reaction-less adapters) = silent skip.
+  // Best-effort acknowledgment: drop a configured progress reaction on the
+  // triggering inbound when the adapter opts into runtime-owned progress.
+  // Without a configured progress reaction, preserve the historical fallback:
+  // :eyes: is used only when the adapter has no visible typing indicator.
+  // Fire-and-forget so a reaction failure can never block engagement.
   const autoReactOnEngage = (event: InboundMessage): Promise<ReactionRef | null> | null => {
     if (event.reactionRef === undefined) return null
-    if (typingCapableAdapters.has(event.adapter)) return null
+    const progress = options.configForAdapter(event.adapter)?.progress
+    const progressEmoji = progress?.enabled === true ? progress.startReaction : undefined
+    if (progressEmoji === undefined && typingCapableAdapters.has(event.adapter)) return null
+    const emoji = progressEmoji ?? ENGAGE_REACTION_EMOJI
     const addResult = react({
       adapter: event.adapter,
       workspace: event.workspace,
       chat: event.chat,
       thread: event.thread,
       reactionRef: event.reactionRef,
-      emoji: ENGAGE_REACTION_EMOJI,
+      emoji,
     })
     const addReactionRef = addResult.then((r) => (r.ok ? (r.reactionRef ?? null) : null)).catch(() => null)
     void addResult
@@ -5099,17 +5344,36 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     let messageId: string | undefined
     let messageIds: readonly string[] | undefined
     let reactionRef: ReactionRef | undefined
+    if (
+      opts?.progressReply !== undefined &&
+      text !== undefined &&
+      (msg.attachments?.length ?? 0) === 0 &&
+      live !== undefined &&
+      deliveryMatchesAccounting
+    ) {
+      const progressResult = await deliverProgressReply(live, text, opts.progressReply)
+      if (progressResult !== null) {
+        delivered = true
+        messageId = progressResult.messageId
+        messageIds = progressResult.messageIds
+        reactionRef = progressResult.reactionRef
+      }
+    }
     try {
-      for (const cb of snapshot) {
-        const result = await cb(msg)
-        if (result.ok) {
-          delivered = true
-          messageId = result.messageId
-          messageIds = result.messageIds
-          reactionRef = result.reactionRef
-          break
+      if (delivered) {
+        // The runtime-owned progress message was edited in place.
+      } else {
+        for (const cb of snapshot) {
+          const result = await cb(msg)
+          if (result.ok) {
+            delivered = true
+            messageId = result.messageId
+            messageIds = result.messageIds
+            reactionRef = result.reactionRef
+            break
+          }
+          lastError = result.error
         }
-        lastError = result.error
       }
     } finally {
       // Clear the in-flight reservation even if a callback threw, so a flaky
@@ -5890,11 +6154,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.currentTurnEngageReactions = []
     void dropContinuationReactions(live)
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
+    if (live.progressMessage?.editTimer !== null && live.progressMessage?.editTimer !== undefined) {
+      clearTimeout(live.progressMessage.editTimer)
+    }
+    live.progressMessage = null
+    live.progressPendingText = null
+    live.progressDisabled = true
     live.debounceTimer = null
     live.unsubProviderErrors?.()
     live.unsubProviderErrors = null
     live.unsubTypingActivity?.()
     live.unsubTypingActivity = null
+    live.unsubProgressActivity?.()
+    live.unsubProgressActivity = null
     live.unsubTodoOutcome?.()
     live.unsubTodoOutcome = null
     await stopTypingHeartbeat(live)

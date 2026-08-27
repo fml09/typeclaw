@@ -35,8 +35,10 @@ import type {
   OutboundMessage,
   ReactionCallback,
   ReactionResult,
+  RemoveReactionCallback,
   ResolvedChannelNames,
   SendResult,
+  ReactionRef,
   InboundAttachment,
 } from '@/channels/types'
 
@@ -60,9 +62,9 @@ import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEA
 // match the public surface get rejected. Declaring this as an interface lets
 // fakes satisfy it without inheriting private state. The cast on the const
 // below bridges the runtime class onto this interface.
-
 export interface KakaoTalkClient {
   addReaction: (chatId: string, logId: string, reactionType: number) => Promise<KakaoReactionResult>
+  removeReaction: (chatId: string, logId: string, reactionType: number) => Promise<KakaoReactionResult>
   editMessage: (chatId: string, logId: string, text: string) => Promise<KakaoEditResult>
   login(
     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: 'pc' | 'tablet' },
@@ -285,7 +287,12 @@ export function createOutboundCallback(deps: {
     // attachment and text went out the text log_id (last in `logIds`) is the
     // anchor; attachment-only sends fall back to the attachment log_id.
     const anchor = logIds.length > 0 ? logIds[logIds.length - 1] : undefined
-    return { ok: true, messageId: anchor, messageIds: logIds }
+    return {
+      ok: true,
+      messageId: anchor,
+      messageIds: logIds,
+      ...(anchor !== undefined ? { reactionRef: encodeKakaoReactionTarget({ chatId: msg.chat, logId: anchor }) } : {}),
+    }
   }
 }
 
@@ -294,14 +301,54 @@ type KakaoReactionTarget = {
   logId: string
 }
 
+type KakaoReactionRemovalTarget = KakaoReactionTarget & {
+  reactionType: number
+}
+
+function encodeKakaoReactionTarget(target: KakaoReactionTarget): ReactionRef {
+  return {
+    adapter: 'kakaotalk',
+    value: JSON.stringify(target),
+  }
+}
 function parseKakaoReactionTarget(value: string): KakaoReactionTarget | null {
   try {
     const parsed: unknown = JSON.parse(value)
     if (typeof parsed !== 'object' || parsed === null) return null
-    const target = parsed as { chatId?: unknown; logId?: unknown }
+    const target = parsed as { chatId?: unknown; logId?: unknown; op?: unknown }
+    if (target.op !== undefined) return null
     if (typeof target.chatId !== 'string' || target.chatId === '') return null
     if (typeof target.logId !== 'string' || target.logId === '') return null
     return { chatId: target.chatId, logId: target.logId }
+  } catch {
+    return null
+  }
+}
+
+function encodeKakaoReactionRemovalRef(target: KakaoReactionRemovalTarget): {
+  adapter: 'kakaotalk'
+  value: string
+} {
+  return {
+    adapter: 'kakaotalk',
+    value: JSON.stringify({ op: 'remove', ...target }),
+  }
+}
+
+function parseKakaoReactionRemovalTarget(value: string): KakaoReactionRemovalTarget | null {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const target = parsed as { op?: unknown; chatId?: unknown; logId?: unknown; reactionType?: unknown }
+    if (target.op !== 'remove') return null
+    if (typeof target.chatId !== 'string' || target.chatId === '') return null
+    if (typeof target.logId !== 'string' || target.logId === '') return null
+    if (!Number.isInteger(target.reactionType) || (target.reactionType as number) <= 0) return null
+    return {
+      chatId: target.chatId,
+      logId: target.logId,
+      reactionType: target.reactionType as number,
+    }
   } catch {
     return null
   }
@@ -338,6 +385,33 @@ export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'addRe
         return {
           ok: false,
           error: `KakaoTalk ACTION failed with status ${result.status_code}`,
+          code: 'transient',
+        }
+      }
+      return { ok: true, reactionRef: encodeKakaoReactionRemovalRef({ ...target, reactionType }) }
+    } catch (err) {
+      return { ok: false, error: describeError(err), code: 'transient' }
+    }
+  }
+}
+
+export function createKakaoRemoveReactionCallback(
+  client: Pick<KakaoTalkClient, 'removeReaction'>,
+): RemoveReactionCallback {
+  return async (req): Promise<ReactionResult> => {
+    if (req.adapter !== 'kakaotalk' || req.reactionRef.adapter !== 'kakaotalk') {
+      return { ok: false, error: 'reaction ref is not for kakaotalk', code: 'unsupported' }
+    }
+    const target = parseKakaoReactionRemovalTarget(req.reactionRef.value)
+    if (target === null || target.chatId !== req.chat) {
+      return { ok: false, error: 'invalid KakaoTalk reaction removal ref', code: 'not-found' }
+    }
+    try {
+      const result = await client.removeReaction(target.chatId, target.logId, target.reactionType)
+      if (!result.success) {
+        return {
+          ok: false,
+          error: `KakaoTalk ACTION reaction removal failed with status ${result.status_code}`,
           code: 'transient',
         }
       }
@@ -498,8 +572,10 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     formatChannelTag,
   })
   const reactionCallback = createKakaoReactionCallback(client)
+  const removeReactionCallback = createKakaoRemoveReactionCallback(client)
   const editMessageCallback = createKakaoEditMessageCallback(client)
   const reactionSupported = typeof client.addReaction === 'function'
+  const removeReactionSupported = typeof client.removeReaction === 'function'
   const editSupported = typeof client.editMessage === 'function'
 
   const typing = createKakaoTypingCallback({
@@ -778,6 +854,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       options.router.registerOutbound('kakaotalk', outboundCallback)
       options.router.registerTyping('kakaotalk', typing.callback)
       if (reactionSupported) options.router.registerReaction('kakaotalk', reactionCallback)
+      if (removeReactionSupported) options.router.registerRemoveReaction('kakaotalk', removeReactionCallback)
       if (editSupported) options.router.registerEditMessage('kakaotalk', editMessageCallback)
       options.router.setTypingCapability('kakaotalk', true)
       // KakaoTalk expires the indicator ~5s after the last packet, faster than
@@ -797,6 +874,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       options.router.unregisterOutbound('kakaotalk', outboundCallback)
       options.router.unregisterTyping('kakaotalk', typing.callback)
       if (editSupported) options.router.unregisterEditMessage('kakaotalk', editMessageCallback)
+      if (removeReactionSupported) options.router.unregisterRemoveReaction('kakaotalk', removeReactionCallback)
       if (reactionSupported) options.router.unregisterReaction('kakaotalk', reactionCallback)
       options.router.setTypingCapability('kakaotalk', false)
       typing.reset()
