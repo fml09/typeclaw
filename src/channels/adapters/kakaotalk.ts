@@ -406,6 +406,13 @@ export function createKakaoRemoveReactionCallback(
     if (target === null || target.chatId !== req.chat) {
       return { ok: false, error: 'invalid KakaoTalk reaction removal ref', code: 'not-found' }
     }
+    if (target.reactionType !== KAKAO_REACTION_TYPE.LIKE) {
+      return {
+        ok: false,
+        error: 'KakaoTalk reaction removal supports only the verified like reaction',
+        code: 'unsupported',
+      }
+    }
     try {
       const result = await client.removeReaction(target.chatId, target.logId, target.reactionType)
       if (!result.success) {

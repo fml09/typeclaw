@@ -636,6 +636,28 @@ describe('KakaoTalk mutation callbacks', () => {
     })
     expect(client.removeReactionCalls).toEqual([])
   })
+  test('rejects a removal ref containing an unverified reaction type', async () => {
+    const client = new FakeClient()
+    const callback = createKakaoRemoveReactionCallback(client)
+
+    const result = await callback({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      thread: null,
+      reactionRef: {
+        adapter: 'kakaotalk',
+        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionType: 2 }),
+      },
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'KakaoTalk reaction removal supports only the verified like reaction',
+      code: 'unsupported',
+    })
+    expect(client.removeReactionCalls).toEqual([])
+  })
 
   test('rejects unverified KakaoTalk reaction names instead of guessing a type', async () => {
     const callback = createKakaoReactionCallback(new FakeClient())
