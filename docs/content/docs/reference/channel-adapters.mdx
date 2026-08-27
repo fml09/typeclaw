@@ -76,6 +76,11 @@ events into coarse safe labels, and edits that same message with the terminal
 on the triggering inbound. An adapter may reject a vocabulary item as
 unsupported; this never blocks the reply.
 
+KakaoTalk's current Android/tablet `dtype=2` credential does not register the
+legacy `ACTION` reaction callback after a live status-0/no-visible-effect
+observation. The callback remains available for the verified macOS-compatible
+path only; an Android `REACT` implementation needs a captured fixture first.
+
 `reactionTrace.enabled` attaches a temporary KakaoTalk packet trace for
 reaction protocol discovery. It records up to `reactionTrace.maxEvents`
 inbound LOCO packets while redacting message contents and credentials.

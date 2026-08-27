@@ -2982,6 +2982,60 @@ describe('ChannelRouter runtime progress', () => {
     expect(reactionEvents).toEqual(['add:like', 'remove', 'add:like'])
     await router.stop()
   })
+  test('does not send terminal progress reactions when progress is disabled', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      postReplyReaction: { enabled: false, emoji: 'like' },
+      progress: {
+        enabled: false,
+        updateIntervalMs: 750,
+        startReaction: 'like',
+        successReaction: 'like',
+        errorReaction: 'like',
+      },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const outbound: OutboundMessage[] = []
+    const reactionEvents: string[] = []
+
+    router.setTypingCapability('kakaotalk', true)
+    router.registerOutbound('kakaotalk', async (message) => {
+      outbound.push(message)
+      return { ok: true, messageId: 'final-message', messageIds: ['final-message'] }
+    })
+    router.registerReaction('kakaotalk', async (request) => {
+      reactionEvents.push(`add:${request.emoji}`)
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: 'hello',
+        isDm: true,
+        reactionRef: { adapter: 'kakaotalk', value: 'inbound-target' },
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.setAssistantText('final answer')
+      const reply = createChannelReplyTool({ router, origin: key })
+      await reply.execute(
+        'reply-call',
+        { text: 'final answer', more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+    }
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => outbound.length === 1)
+    expect(outbound[0]?.text).toBe('final answer')
+    expect(reactionEvents).toEqual([])
+    await router.stop()
+  })
 })
 
 describe('ChannelRouter editMessage', () => {

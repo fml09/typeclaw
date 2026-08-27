@@ -30,7 +30,7 @@ import {
   type KakaoTalkClient,
   type KakaoTalkListener,
 } from './kakaotalk'
-import type { KakaoPushPacket } from './kakaotalk'
+import type { KakaoCredentialStore, KakaoPushPacket } from './kakaotalk'
 
 type EventKey = keyof KakaoTalkListenerEventMap
 
@@ -581,6 +581,56 @@ describe('createKakaotalkAdapter — start/stop lifecycle', () => {
     await router.stop()
   })
 })
+describe('createKakaotalkAdapter — legacy reaction capability', () => {
+  test('does not register ACTION reactions for an Android/tablet credential', async () => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const account = {
+      account_id: 'tablet-test',
+      oauth_token: 'token',
+      user_id: '999',
+      device_uuid: 'device',
+      device_type: 'tablet' as const,
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+    }
+    const credentialsStore = {
+      getAccount: async () => account,
+    } as unknown as KakaoCredentialStore
+    const logs: string[] = []
+    let reactionRegistered = false
+    let removeReactionRegistered = false
+    const registerReaction = router.registerReaction.bind(router)
+    const registerRemoveReaction = router.registerRemoveReaction.bind(router)
+    router.registerReaction = (adapter, callback) => {
+      if (adapter === 'kakaotalk') reactionRegistered = true
+      registerReaction(adapter, callback)
+    }
+    router.registerRemoveReaction = (adapter, callback) => {
+      if (adapter === 'kakaotalk') removeReactionRegistered = true
+      registerRemoveReaction(adapter, callback)
+    }
+
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+      credentialsStore,
+      logger: { info: (message) => logs.push(message), warn: () => {}, error: () => {} },
+    })
+
+    await adapter.start()
+    expect(reactionRegistered).toBe(false)
+    expect(removeReactionRegistered).toBe(false)
+    expect(logs).toContain('[kakaotalk] legacy ACTION reactions=disabled device_type=tablet')
+
+    await adapter.stop()
+    await router.stop()
+  })
+})
+
 describe('createKakaotalkAdapter — reaction packet tracing', () => {
   test('logs bounded reaction pushes with message and credential fields redacted', async () => {
     const client = new FakeClient()

@@ -4003,11 +4003,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           const automaticReactionRef = live.currentTurnReactionRef
           const modelQueuedReaction = live.pendingTurnReactions.length > 0
           const terminalReaction =
-            !retryQueuedThisTurn && !modelQueuedReaction
+            progressConfig?.enabled === true && !retryQueuedThisTurn && !modelQueuedReaction
               ? usableReplyThisTurn
-                ? progressConfig?.successReaction
+                ? progressConfig.successReaction
                 : progressFailureThisTurn
-                  ? progressConfig?.errorReaction
+                  ? progressConfig.errorReaction
                   : undefined
               : undefined
           if (terminalReaction !== undefined && automaticReactionRef !== null) {

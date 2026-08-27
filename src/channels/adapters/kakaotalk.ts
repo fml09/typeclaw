@@ -590,6 +590,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
   let inflightInbounds = 0
   let stopWaiters: Array<() => void> = []
   let reactionTraceCount = 0
+  let kakaoDeviceType: 'pc' | 'tablet' | null = null
   let reactionTraceUnsubscribe: (() => void) | null = null
 
   type RecoveryEpisode = {
@@ -641,8 +642,8 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
   const reactionCallback = createKakaoReactionCallback(client, activeReactions, logger)
   const removeReactionCallback = createKakaoRemoveReactionCallback(client, activeReactions, logger)
   const editMessageCallback = createKakaoEditMessageCallback(client, logger)
-  const reactionSupported = typeof client.addReaction === 'function'
-  const removeReactionSupported = typeof client.removeReaction === 'function'
+  let reactionSupported = false
+  let removeReactionSupported = false
   const editSupported = typeof client.editMessage === 'function'
 
   const typing = createKakaoTypingCallback({
@@ -771,6 +772,9 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     async start(): Promise<void> {
       if (started) return
       started = true
+      kakaoDeviceType = null
+      reactionSupported = false
+      removeReactionSupported = false
       reactionTraceCount = 0
 
       lastConnectedAt = null
@@ -788,6 +792,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
                 : 'no KakaoTalk account in secrets.json#channels.kakaotalk (run typeclaw init to authenticate)',
             )
           }
+          kakaoDeviceType = account.device_type
           await client.login({
             oauthToken: account.oauth_token,
             userId: account.user_id,
@@ -800,6 +805,17 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
           // ~/.config/agent-messenger.
           await client.login()
         }
+        // The verified ACTION reaction fixture is for the macOS-compatible
+        // path. The live Android/tablet dtype=2 session returned status 0
+        // without a visible reaction or SYNCACTION push, so do not advertise
+        // that legacy callback until an Android REACT fixture is verified.
+        const legacyActionReactionSupported = kakaoDeviceType !== 'tablet'
+        reactionSupported = legacyActionReactionSupported && typeof client.addReaction === 'function'
+        removeReactionSupported = legacyActionReactionSupported && typeof client.removeReaction === 'function'
+        logger.info(
+          `[kakaotalk] legacy ACTION reactions=${reactionSupported ? 'enabled' : 'disabled'} ` +
+            `device_type=${kakaoDeviceType ?? 'unknown'}`,
+        )
       } catch (err) {
         started = false
         logger.error(`[kakaotalk] login failed: ${describeError(err)}`)
