@@ -4,6 +4,7 @@ import {
   KakaoCredentialManager,
   KakaoTalkClient as RealKakaoTalkClient,
   KakaoTalkListener as RealKakaoTalkListener,
+  KAKAO_REACTION_TYPE,
   type AttachmentInput,
   type KakaoChat,
   type KakaoMarkReadResult,
@@ -12,10 +13,12 @@ import {
   type KakaoProfile,
   type KakaoReplyTarget,
   type KakaoSendResult,
+  type KakaoEditResult,
   type KakaoTalkListenerEventMap,
   type KakaoTalkPushEmoticonEvent,
   type KakaoTalkPushMessageEvent,
   type KakaoTypingResult,
+  type KakaoReactionResult,
 } from 'agent-messenger/kakaotalk'
 import type { KakaoAccountCredentials, KakaoConfig, PendingLoginState } from 'agent-messenger/kakaotalk'
 
@@ -49,25 +52,18 @@ import { createKakaoChannelResolver, type KakaoChannelResolver } from './kakaota
 import { classifyInbound, type InboundDropReason } from './kakaotalk-classify'
 import { createFetchAttachmentCallback } from './kakaotalk-fetch-attachment'
 import { toKakaoPlainText } from './kakaotalk-format'
-import {
-  KAKAO_LIKE_REACTION_TYPE,
-  kakaoMutationStatusCode,
-  rewriteKakaoMessage,
-  sendKakaoReaction,
-  type KakaoLocoClient,
-} from './kakaotalk-loco'
 import { createKakaoMembershipResolver } from './kakaotalk-membership'
 import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEARTBEAT_MS } from './kakaotalk-typing'
 
-// Structural duck-type of the upstream KakaoTalkClient class. The upstream
-// type is a class with private fields, and TypeScript treats those
-// nominally — test fakes that match the public surface get rejected.
-// Declaring this as an interface lets fakes satisfy it without inheriting
-// private state. The cast on the const below bridges the runtime class
-// onto this interface; the real upstream class satisfies every method.
+// Structural duck-type of agent-messenger's KakaoTalkClient class. The class
+// has private fields, and TypeScript treats those as nominal — test fakes that
+// match the public surface get rejected. Declaring this as an interface lets
+// fakes satisfy it without inheriting private state. The cast on the const
+// below bridges the runtime class onto this interface.
 
 export interface KakaoTalkClient {
-  acquireSession?: KakaoLocoClient['acquireSession']
+  addReaction: (chatId: string, logId: string, reactionType: number) => Promise<KakaoReactionResult>
+  editMessage: (chatId: string, logId: string, text: string) => Promise<KakaoEditResult>
   login(
     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: 'pc' | 'tablet' },
     accountId?: string,
@@ -314,22 +310,15 @@ function parseKakaoReactionTarget(value: string): KakaoReactionTarget | null {
 function kakaoReactionTypeFor(emoji: string): number | null {
   const normalized = emoji.trim().replace(/^:|:$/g, '').toLocaleLowerCase()
   if (normalized === 'like' || normalized === '+1' || normalized === 'thumbsup' || normalized === '👍') {
-    return KAKAO_LIKE_REACTION_TYPE
+    return KAKAO_REACTION_TYPE.LIKE
   }
   return null
 }
 
-export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'acquireSession'>): ReactionCallback {
+export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'addReaction'>): ReactionCallback {
   return async (req): Promise<ReactionResult> => {
     if (req.adapter !== 'kakaotalk' || req.reactionRef.adapter !== 'kakaotalk') {
       return { ok: false, error: 'reaction ref is not for kakaotalk', code: 'unsupported' }
-    }
-    if (client.acquireSession === undefined) {
-      return {
-        ok: false,
-        error: 'installed agent-messenger SDK does not expose the KakaoTalk LOCO session',
-        code: 'unsupported',
-      }
     }
     const target = parseKakaoReactionTarget(req.reactionRef.value)
     if (target === null || target.chatId !== req.chat) {
@@ -344,10 +333,13 @@ export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'acqui
       }
     }
     try {
-      const packet = await sendKakaoReaction(client, target.chatId, target.logId, reactionType)
-      const statusCode = kakaoMutationStatusCode(packet)
-      if (statusCode !== 0) {
-        return { ok: false, error: `KakaoTalk ACTION failed with status ${statusCode}`, code: 'transient' }
+      const result = await client.addReaction(target.chatId, target.logId, reactionType)
+      if (!result.success) {
+        return {
+          ok: false,
+          error: `KakaoTalk ACTION failed with status ${result.status_code}`,
+          code: 'transient',
+        }
       }
       return { ok: true }
     } catch (err) {
@@ -356,23 +348,15 @@ export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'acqui
   }
 }
 
-export function createKakaoEditMessageCallback(client: Pick<KakaoTalkClient, 'acquireSession'>): EditMessageCallback {
+export function createKakaoEditMessageCallback(client: Pick<KakaoTalkClient, 'editMessage'>): EditMessageCallback {
   return async (req) => {
-    if (client.acquireSession === undefined) {
-      return {
-        ok: false,
-        error: 'installed agent-messenger SDK does not expose the KakaoTalk LOCO session',
-        code: 'not-supported',
-      }
-    }
     try {
-      const packet = await rewriteKakaoMessage(client, req.chat, req.messageId, req.text)
-      const statusCode = kakaoMutationStatusCode(packet)
-      if (statusCode === 0) return { ok: true }
+      const result = await client.editMessage(req.chat, req.messageId, req.text)
+      if (result.success) return { ok: true }
       return {
         ok: false,
-        error: `KakaoTalk REWRITE failed with status ${statusCode}`,
-        code: statusCode === -203 ? 'not-supported' : 'not-found',
+        error: `KakaoTalk REWRITE failed with status ${result.status_code}`,
+        code: result.status_code === -203 ? 'not-supported' : 'not-found',
       }
     } catch (err) {
       return { ok: false, error: describeError(err), code: 'not-found' }
@@ -515,8 +499,8 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
   })
   const reactionCallback = createKakaoReactionCallback(client)
   const editMessageCallback = createKakaoEditMessageCallback(client)
-  const reactionSupported = typeof client.acquireSession === 'function'
-  const editSupported = typeof client.acquireSession === 'function'
+  const reactionSupported = typeof client.addReaction === 'function'
+  const editSupported = typeof client.editMessage === 'function'
 
   const typing = createKakaoTypingCallback({
     logger,

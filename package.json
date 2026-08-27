@@ -1,6 +1,6 @@
 {
   "name": "typeclaw",
-  "version": "0.50.0",
+  "version": "0.50.1",
   "homepage": "https://github.com/typeclaw/typeclaw#readme",
   "bugs": {
     "url": "https://github.com/typeclaw/typeclaw/issues"
@@ -50,8 +50,7 @@
     "@mariozechner/pi-tui": "^0.73.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mozilla/readability": "^0.6.0",
-    "agent-messenger": "^2.35.0",
-    "bson": "^6.10.4",
+    "agent-messenger": "github:fml09/agent-messenger#205990c",
     "cheerio": "^1.2.0",
     "citty": "^0.2.2",
     "cron-parser": "^5.5.0",
@@ -81,5 +80,8 @@
   },
   "engines": {
     "bun": ">=1.1.0"
-  }
+  },
+  "trustedDependencies": [
+    "agent-messenger"
+  ]
 }

@@ -29,7 +29,6 @@ import {
   type KakaoTalkClient,
   type KakaoTalkListener,
 } from './kakaotalk'
-import type { KakaoLocoPacket } from './kakaotalk-loco'
 
 type EventKey = keyof KakaoTalkListenerEventMap
 
@@ -79,25 +78,16 @@ function isAttachmentInputArray(
 class FakeClient implements KakaoTalkClient {
   loginCalls = 0
   sendMessageCalls: Array<{ chatId: string; text: string; replyTo?: KakaoReplyTarget }> = []
-  locoCalls: Array<{ method: string; body: Record<string, unknown> }> = []
-  locoResponse: KakaoLocoPacket = { statusCode: 0, body: {} }
-  locoError: Error | null = null
-  getMessagesCalls: Array<{ chatId: string; opts?: { count?: number; from?: string } }> = []
-  getMessagesResult: KakaoMessage[] = []
-  getMessagesError: Error | null = null
-  getMembersCalls: string[] = []
-  closed = false
-  async acquireSession() {
-    return {
-      getConnection: () => ({
-        sendPacket: async (method: string, body: Record<string, unknown>) => {
-          this.locoCalls.push({ method, body })
-          if (this.locoError !== null) throw this.locoError
-          return this.locoResponse
-        },
-      }),
-    }
+  addReactionCalls: Array<{ chatId: string; logId: string; reactionType: number }> = []
+  addReactionResult = {
+    success: true,
+    status_code: 0,
+    chat_id: '111',
+    log_id: 'L1',
+    reaction_type: 1,
   }
+  editMessageCalls: Array<{ chatId: string; logId: string; text: string }> = []
+  editMessageResult = { success: true, status_code: 0, chat_id: '111', log_id: 'L1' }
   profileResult: KakaoProfile = {
     user_id: '999',
     nickname: 'Self',
@@ -109,6 +99,11 @@ class FakeClient implements KakaoTalkClient {
   chats: KakaoChat[] = []
   membersByChat: Map<string, KakaoMember[]> = new Map()
   inlineNamesByChat: Map<string, Map<number, string>> = new Map()
+  getMessagesCalls: Array<{ chatId: string; opts?: { count?: number; from?: string } }> = []
+  getMessagesResult: KakaoMessage[] = []
+  getMessagesError: Error | null = null
+  getMembersCalls: string[] = []
+  closed = false
   getMembersError: Error | null = null
   sendResult: KakaoSendResult = { success: true, status_code: 0, chat_id: '111', log_id: 'L1', sent_at: 0 }
   markReadCalls: Array<{ chatId: string; logId: string; opts?: { linkId?: string } }> = []
@@ -137,6 +132,15 @@ class FakeClient implements KakaoTalkClient {
       ...(options?.replyTo !== undefined ? { replyTo: options.replyTo } : {}),
     })
     return this.sendResult
+  }
+  async addReaction(chatId: string, logId: string, reactionType: number) {
+    this.addReactionCalls.push({ chatId, logId, reactionType })
+    return this.addReactionResult
+  }
+
+  async editMessage(chatId: string, logId: string, text: string) {
+    this.editMessageCalls.push({ chatId, logId, text })
+    return this.editMessageResult
   }
 
   sendAttachmentCalls: Array<
@@ -573,11 +577,7 @@ describe('KakaoTalk mutation callbacks', () => {
     })
 
     expect(result).toEqual({ ok: true })
-    expect(client.locoCalls).toHaveLength(1)
-    expect(client.locoCalls[0]?.method).toBe('ACTION')
-    expect(String(client.locoCalls[0]?.body.chatId)).toBe('111')
-    expect(String(client.locoCalls[0]?.body.logId)).toBe('42')
-    expect(client.locoCalls[0]?.body.type).toBe(1)
+    expect(client.addReactionCalls).toEqual([{ chatId: '111', logId: '42', reactionType: 1 }])
   })
 
   test('rejects unverified KakaoTalk reaction names instead of guessing a type', async () => {
@@ -613,17 +613,12 @@ describe('KakaoTalk mutation callbacks', () => {
     })
 
     expect(result).toEqual({ ok: true })
-    expect(client.locoCalls).toHaveLength(1)
-    expect(client.locoCalls[0]?.method).toBe('REWRITE')
-    expect(String(client.locoCalls[0]?.body.chatId)).toBe('111')
-    expect(String(client.locoCalls[0]?.body.logId)).toBe('42')
-    expect(client.locoCalls[0]?.body.msg).toBe('edited')
-    expect(client.locoCalls[0]?.body.type).toBe(1)
+    expect(client.editMessageCalls).toEqual([{ chatId: '111', logId: '42', text: 'edited' }])
   })
 
   test('surfaces the known macOS REWRITE limitation as not-supported', async () => {
     const client = new FakeClient()
-    client.locoResponse = { statusCode: 0, body: { status: -203 } }
+    client.editMessageResult = { success: false, status_code: -203, chat_id: '111', log_id: '42' }
     const callback = createKakaoEditMessageCallback(client)
 
     const result = await callback({
