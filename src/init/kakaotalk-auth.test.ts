@@ -193,6 +193,58 @@ describe('runKakaotalkBootstrap', () => {
       await rm(agentDir, { recursive: true, force: true })
     }
   })
+  test('uses the experimental android-main profile and ignores saved UUID when requested', async () => {
+    const agentDir = await tmp()
+    const previousDeviceType = process.env.TYPECLAW_KAKAO_DEVICE_TYPE
+    const previousNewDevice = process.env.TYPECLAW_KAKAO_NEW_DEVICE
+    try {
+      await mkdir(agentDir, { recursive: true })
+      await writeFile(
+        kakaotalkSecretsPath(agentDir),
+        JSON.stringify({
+          version: 2,
+          providers: {},
+          channels: {
+            kakaotalk: {
+              currentAccount: null,
+              accounts: {},
+              pendingLogin: {
+                device_uuid: 'previous-uuid',
+                device_type: 'tablet',
+                email: 'u@e.com',
+                created_at: new Date().toISOString(),
+              },
+            },
+          },
+        }),
+      )
+      process.env.TYPECLAW_KAKAO_DEVICE_TYPE = 'android-main'
+      process.env.TYPECLAW_KAKAO_NEW_DEVICE = 'true'
+      let receivedType: string | undefined
+      let receivedUuid: string | undefined
+      const fake: LoginFlowFn = async (opts) => {
+        receivedType = opts.deviceType
+        receivedUuid = opts.savedDeviceUuid
+        return successResult
+      }
+      await runKakaotalkBootstrap({
+        email: 'u@e.com',
+        password: 'x',
+        agentDir,
+        callbacks: { onPasscode: () => {} },
+        loginFlow: fake,
+        ...isolatedKeyStore(agentDir),
+      })
+      expect(receivedType).toBe('android-main')
+      expect(receivedUuid).toBeUndefined()
+    } finally {
+      if (previousDeviceType === undefined) delete process.env.TYPECLAW_KAKAO_DEVICE_TYPE
+      else process.env.TYPECLAW_KAKAO_DEVICE_TYPE = previousDeviceType
+      if (previousNewDevice === undefined) delete process.env.TYPECLAW_KAKAO_NEW_DEVICE
+      else process.env.TYPECLAW_KAKAO_NEW_DEVICE = previousNewDevice
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
 
   test('uses default account_id when user_id is empty', async () => {
     const agentDir = await tmp()

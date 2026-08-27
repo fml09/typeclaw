@@ -5,6 +5,7 @@ import {
   KakaoTalkClient as RealKakaoTalkClient,
   KakaoTalkListener as RealKakaoTalkListener,
   KAKAO_REACTION_TYPE,
+  type KakaoDeviceType,
   type AttachmentInput,
   type KakaoChat,
   type KakaoMarkReadResult,
@@ -75,7 +76,7 @@ export interface KakaoTalkClient {
   removeReaction: (chatId: string, logId: string, reactionType: number) => Promise<KakaoReactionResult>
   editMessage: (chatId: string, logId: string, text: string) => Promise<KakaoEditResult>
   login(
-    credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: 'pc' | 'tablet' },
+    credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: KakaoDeviceType },
     accountId?: string,
   ): Promise<this>
   getChats(options?: { all?: boolean; search?: string }): Promise<KakaoChat[]>
@@ -590,7 +591,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
   let inflightInbounds = 0
   let stopWaiters: Array<() => void> = []
   let reactionTraceCount = 0
-  let kakaoDeviceType: 'pc' | 'tablet' | null = null
+  let kakaoDeviceType: KakaoDeviceType | null = null
   let reactionTraceUnsubscribe: (() => void) | null = null
 
   type RecoveryEpisode = {
@@ -809,7 +810,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
         // path. The live Android/tablet dtype=2 session returned status 0
         // without a visible reaction or SYNCACTION push, so do not advertise
         // that legacy callback until an Android REACT fixture is verified.
-        const legacyActionReactionSupported = kakaoDeviceType !== 'tablet'
+        const legacyActionReactionSupported = kakaoDeviceType === null || kakaoDeviceType === 'pc'
         reactionSupported = legacyActionReactionSupported && typeof client.addReaction === 'function'
         removeReactionSupported = legacyActionReactionSupported && typeof client.removeReaction === 'function'
         logger.info(
