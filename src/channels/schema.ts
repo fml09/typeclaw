@@ -201,6 +201,7 @@ const progressSchema = z.object({
 const reactionTraceSchema = z.object({
   enabled: z.boolean().default(false),
   maxEvents: z.number().int().min(1).max(500).default(100),
+  includeUnknownMethods: z.boolean().default(false),
 })
 
 // Deliberately non-strict: a stale on-disk file may still carry the

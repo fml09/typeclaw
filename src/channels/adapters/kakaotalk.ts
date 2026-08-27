@@ -634,7 +634,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     if (
       trace?.enabled !== true ||
       reactionTraceCount >= trace.maxEvents ||
-      !isKakaoReactionTraceMethod(packet.method)
+      (!trace.includeUnknownMethods && !isKakaoReactionTraceMethod(packet.method))
     ) {
       return
     }
@@ -810,6 +810,13 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
 
       listener = options.listenerFactory ? options.listenerFactory(client) : new KakaoTalkListener(client)
       reactionTraceUnsubscribe = client.onPush?.(handleReactionTracePacket) ?? null
+      const traceConfig = options.configRef().reactionTrace
+      if (traceConfig?.enabled === true) {
+        logger.info(
+          `[kakaotalk][reaction-trace] attached=${reactionTraceUnsubscribe !== null} ` +
+            `max_events=${traceConfig.maxEvents} include_unknown_methods=${traceConfig.includeUnknownMethods}`,
+        )
+      }
       const activeListener = listener
       const scheduleStabilityCheck = (): void => {
         if (recoveryEpisode === null) return

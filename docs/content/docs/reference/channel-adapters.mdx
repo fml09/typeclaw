@@ -77,10 +77,11 @@ on the triggering inbound. An adapter may reject a vocabulary item as
 unsupported; this never blocks the reply.
 
 `reactionTrace.enabled` attaches a temporary KakaoTalk packet trace for
-reaction-related LOCO pushes. It records `SYNCACTION`, `CHGLOGMETA`, and
-`REACT` packets up to `reactionTrace.maxEvents`, while redacting message
-contents and credentials. It does not prove the outbound request shape, so
-an inbound fixture alone is not sufficient to ship a new reaction type.
+reaction protocol discovery. It records up to `reactionTrace.maxEvents`
+inbound LOCO packets while redacting message contents and credentials.
+`includeUnknownMethods: true` includes methods outside the known reaction
+candidate set, which is useful when Kakao changes the push opcode. An inbound
+fixture alone does not prove the outbound request shape.
 
 Credentials live in `secrets.json#channels.<adapter>` ([/reference/secrets-json](/docs/reference/secrets-json)).
 

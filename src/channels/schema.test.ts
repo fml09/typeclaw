@@ -142,12 +142,17 @@ describe('channelsSchema', () => {
   })
   test('parses bounded Kakao reaction trace settings', () => {
     const parsed = channelsSchema.parse({
-      kakaotalk: { reactionTrace: { enabled: true, maxEvents: 25 } },
+      kakaotalk: { reactionTrace: { enabled: true, maxEvents: 25, includeUnknownMethods: true } },
     })
-    expect(parsed.kakaotalk?.reactionTrace).toEqual({ enabled: true, maxEvents: 25 })
+    expect(parsed.kakaotalk?.reactionTrace).toEqual({
+      enabled: true,
+      maxEvents: 25,
+      includeUnknownMethods: true,
+    })
     expect(channelsSchema.parse({ kakaotalk: { reactionTrace: {} } }).kakaotalk?.reactionTrace).toEqual({
       enabled: false,
       maxEvents: 100,
+      includeUnknownMethods: false,
     })
   })
 

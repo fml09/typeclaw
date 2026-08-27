@@ -586,7 +586,7 @@ describe('createKakaotalkAdapter — reaction packet tracing', () => {
     const client = new FakeClient()
     const listener = new FakeListener()
     const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
-    const config = adapterCfg({ reactionTrace: { enabled: true, maxEvents: 2 } })
+    const config = adapterCfg({ reactionTrace: { enabled: true, maxEvents: 2, includeUnknownMethods: false } })
     const logs: string[] = []
     const adapter = createKakaotalkAdapter({
       router,
@@ -597,6 +597,7 @@ describe('createKakaotalkAdapter — reaction packet tracing', () => {
     })
 
     await adapter.start()
+    expect(logs).toContain('[kakaotalk][reaction-trace] attached=true max_events=2 include_unknown_methods=false')
     client.emitPush({
       packetId: 7,
       statusCode: 0,
@@ -626,7 +627,9 @@ describe('createKakaotalkAdapter — reaction packet tracing', () => {
       body: { chatId: 'chat-1', logId: 'message-1', rt: 4 },
     })
 
-    const traces = logs.filter((message) => message.startsWith('[kakaotalk][reaction-trace]'))
+    const traces = logs.filter(
+      (message) => message.startsWith('[kakaotalk][reaction-trace]') && message.includes('"packet_id"'),
+    )
     expect(traces).toHaveLength(2)
     expect(traces[0]).toContain('"method":"SYNCACTION"')
     expect(traces[0]).toContain('"type":2')
@@ -646,7 +649,43 @@ describe('createKakaotalkAdapter — reaction packet tracing', () => {
       method: 'SYNCACTION',
       body: { type: 5 },
     })
-    expect(logs.filter((message) => message.startsWith('[kakaotalk][reaction-trace]'))).toHaveLength(2)
+    expect(
+      logs.filter((message) => message.startsWith('[kakaotalk][reaction-trace]') && message.includes('"packet_id"')),
+    ).toHaveLength(2)
+    await router.stop()
+  })
+  test('includes unknown push methods when explicitly enabled', async () => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const config = adapterCfg({ reactionTrace: { enabled: true, maxEvents: 1, includeUnknownMethods: true } })
+    const logs: string[] = []
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => config,
+      client,
+      listenerFactory: () => listener,
+      logger: { info: (message) => logs.push(message), warn: () => {}, error: () => {} },
+    })
+
+    await adapter.start()
+    client.emitPush({
+      packetId: 11,
+      statusCode: -203,
+      bodyType: 0,
+      method: 'UNSEEN_REACTION_PUSH',
+      body: { rt: 7 },
+    })
+
+    const traces = logs.filter(
+      (message) => message.startsWith('[kakaotalk][reaction-trace]') && message.includes('"packet_id"'),
+    )
+    expect(traces).toHaveLength(1)
+    expect(traces[0]).toContain('"method":"UNSEEN_REACTION_PUSH"')
+    expect(traces[0]).toContain('"status_code":-203')
+    expect(traces[0]).toContain('"rt":7')
+
+    await adapter.stop()
     await router.stop()
   })
 })
