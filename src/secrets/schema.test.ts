@@ -174,6 +174,29 @@ describe('parseSecretsFile (v2 envelope)', () => {
     expect(result.file.channels.kakaotalk?.accounts['user-1']?.oauth_token).toBe('oauth-token')
     expect(result.file.channels.kakaotalk?.pendingLogin?.email).toBe('user@example.com')
   })
+  test('accepts an experimental android-main Kakao credential profile', () => {
+    const result = parseSecretsFile({
+      version: 2,
+      channels: {
+        kakaotalk: {
+          currentAccount: 'user-1',
+          accounts: {
+            'user-1': {
+              account_id: 'user-1',
+              oauth_token: 'oauth-token',
+              user_id: 'user-1',
+              device_uuid: 'device-uuid',
+              device_type: 'android-main',
+              created_at: '2026-01-01T00:00:00.000Z',
+              updated_at: '2026-01-01T00:00:00.000Z',
+            },
+          },
+        },
+      },
+    })
+
+    expect(result.ok).toBe(true)
+  })
 
   test('accepts empty channels.kakaotalk block', () => {
     const result = parseSecretsFile({ version: 2, channels: { kakaotalk: { currentAccount: null, accounts: {} } } })

@@ -151,7 +151,7 @@ export const kakaoAccountRecordSchema = z.object({
   user_id: z.string(),
   refresh_token: z.string().optional(),
   device_uuid: z.string(),
-  device_type: z.union([z.literal('pc'), z.literal('tablet')]),
+  device_type: z.union([z.literal('pc'), z.literal('tablet'), z.literal('android-main')]),
   auth_method: z.union([z.literal('login'), z.literal('extract')]).optional(),
   created_at: z.string(),
   updated_at: z.string(),
@@ -230,7 +230,7 @@ export const slackChannelBlockSchema = z.object({
 
 export const kakaoPendingLoginRecordSchema = z.object({
   device_uuid: z.string(),
-  device_type: z.union([z.literal('pc'), z.literal('tablet')]),
+  device_type: z.union([z.literal('pc'), z.literal('tablet'), z.literal('android-main')]),
   email: z.string(),
   created_at: z.string(),
 })

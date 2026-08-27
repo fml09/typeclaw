@@ -1,6 +1,6 @@
 import { join, resolve } from 'node:path'
 
-import { loginFlow as upstreamLoginFlow } from 'agent-messenger/kakaotalk'
+import { loginFlow as upstreamLoginFlow, type KakaoDeviceType } from 'agent-messenger/kakaotalk'
 
 import { containerNameFromCwd } from '@/container'
 import { keysDir } from '@/hostd/paths'
@@ -29,6 +29,13 @@ export type KakaotalkLoginInput = {
   containerName?: string
 }
 
+function requestedKakaoDeviceType(): KakaoDeviceType {
+  const raw = process.env.TYPECLAW_KAKAO_DEVICE_TYPE
+  if (raw === undefined || raw === '') return 'tablet'
+  if (raw === 'pc' || raw === 'tablet' || raw === 'android-main') return raw
+  throw new Error(`TYPECLAW_KAKAO_DEVICE_TYPE must be pc, tablet, or android-main; received ${JSON.stringify(raw)}`)
+}
+
 export type LoginFlowFn = typeof upstreamLoginFlow
 export type LoginFlowOptions = Parameters<LoginFlowFn>[0]
 export type LoginFlowResult = Awaited<ReturnType<LoginFlowFn>>
@@ -46,13 +53,17 @@ export async function runKakaotalkBootstrap(input: KakaotalkLoginInput): Promise
     })
     const pending = await credManager.loadPendingLogin()
     const existing = await credManager.getAccount()
-    const savedDeviceUuid =
-      pending?.device_uuid ?? (existing?.auth_method === 'login' ? existing.device_uuid : undefined)
+    const deviceType = requestedKakaoDeviceType()
+    const forceNewDevice =
+      process.env.TYPECLAW_KAKAO_NEW_DEVICE === '1' || process.env.TYPECLAW_KAKAO_NEW_DEVICE === 'true'
+    const savedDeviceUuid = forceNewDevice
+      ? undefined
+      : (pending?.device_uuid ?? (existing?.auth_method === 'login' ? existing.device_uuid : undefined))
 
     const result = await loginFlow({
       email: input.email,
       password: input.password,
-      deviceType: (process.env.TYPECLAW_KAKAO_DEVICE_TYPE as 'pc' | 'tablet' | undefined) ?? 'tablet',
+      deviceType,
       force: false,
       ...(savedDeviceUuid !== undefined ? { savedDeviceUuid } : {}),
       onPasscodeDisplay: input.callbacks.onPasscode,

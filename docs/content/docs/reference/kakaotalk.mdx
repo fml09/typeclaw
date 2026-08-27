@@ -67,6 +67,34 @@ A `pendingLogin` record may also appear under `channels.kakaotalk` mid-reauth; s
 
 CLI: `typeclaw channel add kakaotalk` (interactive). **Do not use `channel set`** for credential rotation — use `typeclaw channel reauth kakaotalk` instead.
 
+## Experimental Android main profile
+
+The normal TypeClaw login uses the tablet sub-device profile. The fork also
+exposes an experimental `android-main` profile that sends `dtype=1` and uses a
+fresh device UUID when requested. Use it only with a disposable KakaoTalk
+account: the mobile/main-device flow may invalidate or log out an existing
+phone session.
+
+From the host, request a fresh credential instead of reusing the saved tablet
+UUID:
+
+```sh
+TYPECLAW_KAKAO_DEVICE_TYPE=android-main \
+TYPECLAW_KAKAO_NEW_DEVICE=true \
+typeclaw channel reauth kakaotalk
+```
+
+The command prompts for the account password. If Kakao returns `-100`, approve
+the displayed passcode in the official KakaoTalk app and wait for registration
+to complete. Do not use `--force` unless losing the test account's existing
+session is acceptable. After login, verify
+`secrets.json#channels.kakaotalk.accounts.<account>.device_type` is
+`android-main`.
+
+This profile is protocol-experimental. A successful `LOGINLIST` and `WRITE`
+do not prove that `REWRITE` is supported; verify the actual edited message and
+the `SYNCREWR` push before enabling progress.
+
 ## Capabilities
 
 | Feature                 | Supported | Notes                                                                                                                              |
