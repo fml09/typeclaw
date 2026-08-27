@@ -49,14 +49,17 @@ Adapters come in two shapes. **Bot adapters** authenticate as a platform bot/app
 }
 ```
 
-| Field                      | Adapters | Notes                                                                                            |
-| -------------------------- | -------- | ------------------------------------------------------------------------------------------------ |
-| `enabled`                  | all      | live-reloadable                                                                                  |
-| `quotedReply`              | all      | auto-anchor delayed replies with a `> @author: …` blockquote prefix; defaults to on, 10s         |
-| `quotedReply.enabled`      | all      | set `false` to never prepend the anchor                                                          |
-| `quotedReply.queueDelayMs` | all      | reply delay threshold in ms; `0` anchors every reply, large values anchor only very late replies |
-| `webhookPort`              | `github` | container-side port the webhook server listens on; default `8975`                                |
-| `webhookUrl`               | `github` | optional override; when omitted, the URL comes from a channel-owned tunnel                       |
+| Field                       | Adapters | Notes                                                                                                 |
+| --------------------------- | -------- | ----------------------------------------------------------------------------------------------------- |
+| `enabled`                   | all      | live-reloadable                                                                                       |
+| `quotedReply`               | all      | auto-anchor delayed replies with a `> @author: …` blockquote prefix; defaults to on, 10s              |
+| `quotedReply.enabled`       | all      | set `false` to never prepend the anchor                                                               |
+| `quotedReply.queueDelayMs`  | all      | reply delay threshold in ms; `0` anchors every reply, large values anchor only very late replies      |
+| `inboundBatching`           | all      | fixed quiet-period coalescing for split-message platforms; omit to keep the default hot/cold debounce |
+| `inboundBatching.quietMs`   | all      | run the turn this many ms after the **latest** inbound; every inbound restarts the timer (0–30000)    |
+| `inboundBatching.maxWaitMs` | all      | force a flush once the oldest unprocessed message is this old, even under a steady stream (0–60000)   |
+| `webhookPort`               | `github` | container-side port the webhook server listens on; default `8975`                                     |
+| `webhookUrl`                | `github` | optional override; when omitted, the URL comes from a channel-owned tunnel                            |
 
 Credentials live in `secrets.json#channels.<adapter>` ([/reference/secrets-json](/docs/reference/secrets-json)).
 
@@ -91,6 +94,10 @@ When a message arrives:
 The router never blocks on a slow adapter. Each adapter owns its own outbound queue.
 
 When the agent's first send of a turn lands later than `quotedReply.queueDelayMs` after the inbound was received, OR the channel had observed messages between the inbound and the reply, the router prepends a single-line `> @author: excerpt` markdown blockquote referencing the inbound so the user can see which message the reply is anchored to even after the channel has scrolled. Slack and Discord get platform-native `<@authorId>` mentions inside the quote; Telegram, LINE, KakaoTalk, and GitHub fall back to plain author names because they have no reliable id-only mention syntax inside markdown. Anchoring is first-send-only per turn — multi-part replies don't repeat the quote on every chunk.
+
+## Inbound batching
+
+By default the router coalesces same-chat inbounds with a hot/cold debounce: 600ms after a quiet stretch, 1500ms while a conversation is active, hard-capped at 4s. Platforms where users split one thought across several rapid messages — KakaoTalk chat bubbles are the canonical case — can set `inboundBatching` for a fixed quiet period instead. `quietMs` is how long the router waits after the latest inbound (every message restarts the timer); `maxWaitMs` is the starvation guard that runs the turn anyway, and defaults to `max(4000, quietMs)`. Around `2500 / 6000` is a good starting point for KakaoTalk. The setting is live-reloadable, and a turn that is already running is never interrupted or re-merged — a message landing mid-turn joins the next turn's batch.
 
 ## Cross-channel reads
 

@@ -57,6 +57,9 @@ import {
   getPlainTextChannelToolCallKind,
   stripTrailingLeakedToolCall,
   HISTORY_ATTACHMENT_LIMIT,
+  HOT_DEBOUNCE_MS,
+  HOT_THRESHOLD_MS,
+  INITIAL_DEBOUNCE_MS,
   MAX_CHANNEL_SENDS_PER_TURN,
   MAX_EMPTY_TURN_RETRIES,
   MAX_POLICY_DENIED_CHANNEL_SENDS_PER_TURN,
@@ -1845,6 +1848,83 @@ describe('ChannelRouter engagement and prompt composition', () => {
     await router.__testing!.flushDebounce(KEY)
 
     expect(turnStartPrompts[0]!).toBe('first line\nsecond line')
+  })
+  test('inboundBatching replaces the hot/cold debounce with a fixed quiet period', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      inboundBatching: { quietMs: 2500, maxWaitMs: 6000 },
+    }
+    const { router } = makeRouter(dir, { config, nowRef })
+
+    // A just-created session (hot by the legacy heuristic) waits the full
+    // configured quiet period, and so does a long-idle follow-up once the
+    // previous batch has closed — no hot/cold split.
+    await router.route(inbound())
+    expect(router.__testing!.scheduledDrainDelay(KEY)).toBe(2500)
+    await router.__testing!.flushDebounce(KEY)
+    nowRef.value = 1000 + 60_000
+    await router.route(inbound({ externalMessageId: 'm2', text: 'split message' }))
+    expect(router.__testing!.scheduledDrainDelay(KEY)).toBe(2500)
+  })
+
+  test('inboundBatching maxWaitMs forces a flush under a steady message stream', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      inboundBatching: { quietMs: 2500, maxWaitMs: 6000 },
+    }
+    const { router } = makeRouter(dir, { config, nowRef })
+
+    await router.route(inbound())
+    // 4s into the batch: 2s of headroom left before the ceiling.
+    nowRef.value = 1000 + 4000
+    await router.route(inbound({ externalMessageId: 'm2', text: 'still going' }))
+    expect(router.__testing!.scheduledDrainDelay(KEY)).toBe(2000)
+    // At the ceiling the wait clamps to 0 — the next drain fires immediately.
+    nowRef.value = 1000 + 6000
+    await router.route(inbound({ externalMessageId: 'm3', text: 'flush now' }))
+    expect(router.__testing!.scheduledDrainDelay(KEY)).toBe(0)
+  })
+
+  test('inboundBatching without maxWaitMs defaults the ceiling to at least quietMs', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const config: ChannelAdapterConfig = { ...baseConfig, inboundBatching: { quietMs: 5000 } }
+    const { router } = makeRouter(dir, { config, nowRef })
+
+    await router.route(inbound())
+    // quietMs above MAX_DEBOUNCE_MS must not be capped by the global default.
+    expect(router.__testing!.scheduledDrainDelay(KEY)).toBe(5000)
+  })
+
+  test('legacy hot/cold debounce is unchanged without inboundBatching', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router } = makeRouter(dir, { nowRef })
+
+    await router.route(inbound())
+    expect(router.__testing!.scheduledDrainDelay(KEY)).toBe(HOT_DEBOUNCE_MS)
+    nowRef.value = 1000 + HOT_THRESHOLD_MS + 1
+    await router.route(inbound({ externalMessageId: 'm2', text: 'long idle' }))
+    expect(router.__testing!.scheduledDrainDelay(KEY)).toBe(INITIAL_DEBOUNCE_MS)
+  })
+
+  test('a configured quiet period coalesces rapid split messages into one turn', async () => {
+    const dir = await tempDir()
+    const config: ChannelAdapterConfig = { ...baseConfig, inboundBatching: { quietMs: 60, maxWaitMs: 500 } }
+    const { router, sessions } = makeRouter(dir, { config })
+
+    await router.route(inbound({ text: '이번 주 일정인데' }))
+    await router.route(inbound({ externalMessageId: 'm2', text: '목요일은 빼고' }))
+    // No flushDebounce: the real 60ms quiet timer must fire the drain itself.
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sessions[0]!.prompts[0]).toContain('이번 주 일정인데')
+    expect(sessions[0]!.prompts[0]).toContain('목요일은 빼고')
   })
 
   test('labels the current message even when there is no recent context', async () => {

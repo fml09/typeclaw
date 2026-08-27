@@ -83,6 +83,26 @@ describe('channelsSchema', () => {
     const parsed = channelsSchema.parse({ 'discord-bot': { enabled: false } })
     expect(parsed['discord-bot']?.enabled).toBe(false)
   })
+  test('parses inboundBatching quiet period config', () => {
+    const parsed = channelsSchema.parse({
+      kakaotalk: { inboundBatching: { quietMs: 2500, maxWaitMs: 6000 } },
+    })
+    expect(parsed.kakaotalk?.inboundBatching).toEqual({ quietMs: 2500, maxWaitMs: 6000 })
+  })
+
+  test('inboundBatching maxWaitMs is optional and the block is omitted by default', () => {
+    const parsed = channelsSchema.parse({ kakaotalk: { inboundBatching: { quietMs: 1500 } } })
+    expect(parsed.kakaotalk?.inboundBatching).toEqual({ quietMs: 1500 })
+    expect(channelsSchema.parse({ kakaotalk: {} }).kakaotalk?.inboundBatching).toBeUndefined()
+  })
+
+  test('rejects out-of-range inboundBatching values', () => {
+    expect(() => channelsSchema.parse({ kakaotalk: { inboundBatching: { quietMs: -1 } } })).toThrow()
+    expect(() => channelsSchema.parse({ kakaotalk: { inboundBatching: { quietMs: 30_001 } } })).toThrow()
+    expect(() =>
+      channelsSchema.parse({ kakaotalk: { inboundBatching: { quietMs: 100, maxWaitMs: 60_001 } } }),
+    ).toThrow()
+  })
 
   test('accepts github channel config with webhookUrl omitted', () => {
     const parsed = channelsSchema.parse({ github: { repos: ['owner/repo'] } })

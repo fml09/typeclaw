@@ -894,6 +894,9 @@ type LiveSession = {
   historyAttachments: InboundAttachment[]
   draining: boolean
   debounceTimer: ReturnType<typeof setTimeout> | null
+  // Wait (ms) computed by the most recent scheduleDebouncedDrain call.
+  // Test-observable via __testing.scheduledDrainDelay; not read by logic.
+  debounceWaitMs: number
   typingTimer: ReturnType<typeof setInterval> | null
   typingStartedAt: number
   typingTimedOut: boolean
@@ -1625,6 +1628,10 @@ export type ChannelRouter = {
   liveCount: () => number
   __testing?: {
     flushDebounce: (key: ChannelKey) => Promise<void>
+    // Milliseconds the pending debounce timer will wait before draining,
+    // or null when no timer is scheduled. Pins the batching policy without
+    // racing wall-clock timers.
+    scheduledDrainDelay: (key: ChannelKey) => number | null
     fireTypingHeartbeat: (key: ChannelKey, phase?: 'tick' | 'stop') => Promise<void>
     fireTypingInterval: (key: ChannelKey) => Promise<void>
     fireTypingTick: (key: ChannelKey, epoch: number) => Promise<void>
@@ -2460,6 +2467,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         historyAttachments: [],
         draining: false,
         debounceTimer: null,
+        debounceWaitMs: 0,
         typingTimer: null,
         typingStartedAt: 0,
         typingTimedOut: false,
@@ -3890,10 +3898,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
     const t = now()
     const sinceLast = t - live.lastInboundAt
-    const baseWait = sinceLast < HOT_THRESHOLD_MS ? HOT_DEBOUNCE_MS : INITIAL_DEBOUNCE_MS
+    // `inboundBatching` replaces the hot/cold heuristic with a fixed quiet
+    // period, per adapter (e.g. KakaoTalk's rapid split messages). Read live
+    // on every inbound so an applied config reload takes effect immediately.
+    const batching = options.configForAdapter(live.key.adapter)?.inboundBatching
+    const quietMs = batching ? batching.quietMs : sinceLast < HOT_THRESHOLD_MS ? HOT_DEBOUNCE_MS : INITIAL_DEBOUNCE_MS
     if (live.firstUnprocessedAt === 0) live.firstUnprocessedAt = t
     const elapsedSinceFirst = t - live.firstUnprocessedAt
-    const wait = Math.max(0, Math.min(baseWait, MAX_DEBOUNCE_MS - elapsedSinceFirst))
+    // The ceiling keeps a steady inbound stream from postponing the turn
+    // forever. Defaulted, it never drops below quietMs — capping the
+    // configured quiet period would silently break it.
+    const maxWaitMs = batching ? (batching.maxWaitMs ?? Math.max(MAX_DEBOUNCE_MS, batching.quietMs)) : MAX_DEBOUNCE_MS
+    const wait = Math.max(0, Math.min(quietMs, maxWaitMs - elapsedSinceFirst))
+    live.debounceWaitMs = wait
     live.lastInboundAt = t
     if (mappings) {
       const idx = mappings.findIndex(
@@ -6833,6 +6850,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // a test reading sessions.json right after would race the disk write — the
         // flake that forced wall-clock polling on slow (Windows CI) filesystems.
         await persistChain
+      },
+      scheduledDrainDelay: (key: ChannelKey) => {
+        const live = liveSessions.get(channelKeyId(key))
+        return live?.debounceTimer ? live.debounceWaitMs : null
       },
       fireTypingHeartbeat: async (key: ChannelKey, phase: 'tick' | 'stop' = 'tick') => {
         const live = liveSessions.get(channelKeyId(key))

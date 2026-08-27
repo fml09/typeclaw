@@ -168,6 +168,17 @@ const quotedReplySchema = z
   })
   .default({ enabled: true, queueDelayMs: DEFAULT_QUOTED_REPLY_QUEUE_DELAY_MS })
 
+// Inbound coalescing: platforms where users split one thought across several
+// rapid messages (KakaoTalk chat bubbles, WhatsApp-style texting) get a fixed
+// quiet period instead of the router's hot/cold debounce heuristic. Every
+// inbound restarts the quiet timer; `maxWaitMs` bounds the total wait so a
+// steady stream cannot postpone the turn forever. Omitted entirely = legacy
+// timing (INITIAL_DEBOUNCE_MS / HOT_DEBOUNCE_MS / MAX_DEBOUNCE_MS).
+const inboundBatchingSchema = z.object({
+  quietMs: z.number().int().min(0).max(30_000),
+  maxWaitMs: z.number().int().min(0).max(60_000).optional(),
+})
+
 // Deliberately non-strict: a stale on-disk file may still carry the
 // legacy `allow` field. Zod silently drops unknown keys here, which is
 // exactly what we want — the field is ignored, not translated, and a hard
@@ -177,6 +188,7 @@ const adapterSchema = z.object({
   history: historySchema,
   enabled: z.boolean().default(true),
   quotedReply: quotedReplySchema.optional(),
+  inboundBatching: inboundBatchingSchema.optional(),
 })
 
 export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [

@@ -95,6 +95,7 @@ typeclaw channel reauth kakaotalk
 - **Mark-read**: fires on every inbound message, clearing the unread "1" (노란숫자), except in open chats.
 - **Provisional registration**: chats not surfaced by `getChats` are registered provisionally on first message.
 - **No combined send**: files are sent first, then text, as separate API calls.
+- **Split messages**: users often send one thought as several rapid bubbles, and the default router debounce (600ms/1500ms) can start a turn on the first bubble alone. Set `inboundBatching` (`quietMs: 2500`, `maxWaitMs: 6000` is a good start) to wait for a quiet gap and answer all bubbles in one turn.
 
 ## Config
 
@@ -113,7 +114,8 @@ typeclaw channel reauth kakaotalk
           "channel": { "tail": 10 }
         }
       },
-      "quotedReply": { "enabled": true, "queueDelayMs": 10000 }
+      "quotedReply": { "enabled": true, "queueDelayMs": 10000 },
+      "inboundBatching": { "quietMs": 2500, "maxWaitMs": 6000 }
     }
   }
 }
