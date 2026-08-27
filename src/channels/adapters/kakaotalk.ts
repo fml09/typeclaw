@@ -381,6 +381,7 @@ function kakaoReactionTypeFor(emoji: string): number | null {
 export function createKakaoReactionCallback(
   client: Pick<KakaoTalkClient, 'addReaction'>,
   activeReactions: KakaoReactionState = new Set(),
+  logger?: KakaotalkAdapterLogger,
 ): ReactionCallback {
   return async (req): Promise<ReactionResult> => {
     if (req.adapter !== 'kakaotalk' || req.reactionRef.adapter !== 'kakaotalk') {
@@ -403,6 +404,10 @@ export function createKakaoReactionCallback(
     if (activeReactions.has(key)) return { ok: true, reactionRef }
     try {
       const result = await client.addReaction(target.chatId, target.logId, reactionType)
+      logger?.info(
+        `[kakaotalk] reaction-add chat=${target.chatId} log_id=${target.logId} type=${reactionType} ` +
+          `success=${result.success} status_code=${result.status_code}`,
+      )
       if (!result.success) {
         return {
           ok: false,
@@ -413,6 +418,9 @@ export function createKakaoReactionCallback(
       activeReactions.add(key)
       return { ok: true, reactionRef }
     } catch (err) {
+      logger?.info(
+        `[kakaotalk] reaction-add threw chat=${target.chatId} log_id=${target.logId} type=${reactionType}: ${describeError(err)}`,
+      )
       return { ok: false, error: describeError(err), code: 'transient' }
     }
   }
@@ -421,6 +429,7 @@ export function createKakaoReactionCallback(
 export function createKakaoRemoveReactionCallback(
   client: Pick<KakaoTalkClient, 'removeReaction'>,
   activeReactions?: KakaoReactionState,
+  logger?: KakaotalkAdapterLogger,
 ): RemoveReactionCallback {
   return async (req): Promise<ReactionResult> => {
     if (req.adapter !== 'kakaotalk' || req.reactionRef.adapter !== 'kakaotalk') {
@@ -447,6 +456,10 @@ export function createKakaoRemoveReactionCallback(
     }
     try {
       const result = await client.removeReaction(target.chatId, target.logId, target.reactionType)
+      logger?.info(
+        `[kakaotalk] reaction-remove chat=${target.chatId} log_id=${target.logId} type=${target.reactionType} ` +
+          `success=${result.success} status_code=${result.status_code}`,
+      )
       if (!result.success) {
         return {
           ok: false,
@@ -457,15 +470,25 @@ export function createKakaoRemoveReactionCallback(
       activeReactions?.delete(key)
       return { ok: true }
     } catch (err) {
+      logger?.info(
+        `[kakaotalk] reaction-remove threw chat=${target.chatId} log_id=${target.logId} type=${target.reactionType}: ${describeError(err)}`,
+      )
       return { ok: false, error: describeError(err), code: 'transient' }
     }
   }
 }
 
-export function createKakaoEditMessageCallback(client: Pick<KakaoTalkClient, 'editMessage'>): EditMessageCallback {
+export function createKakaoEditMessageCallback(
+  client: Pick<KakaoTalkClient, 'editMessage'>,
+  logger?: KakaotalkAdapterLogger,
+): EditMessageCallback {
   return async (req) => {
     try {
       const result = await client.editMessage(req.chat, req.messageId, req.text)
+      logger?.info(
+        `[kakaotalk] message-edit chat=${req.chat} log_id=${req.messageId} ` +
+          `success=${result.success} status_code=${result.status_code}`,
+      )
       if (result.success) return { ok: true }
       return {
         ok: false,
@@ -473,6 +496,7 @@ export function createKakaoEditMessageCallback(client: Pick<KakaoTalkClient, 'ed
         code: result.status_code === -203 ? 'not-supported' : 'not-found',
       }
     } catch (err) {
+      logger?.info(`[kakaotalk] message-edit threw chat=${req.chat} log_id=${req.messageId}: ${describeError(err)}`)
       return { ok: false, error: describeError(err), code: 'not-found' }
     }
   }
@@ -614,9 +638,9 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     formatChannelTag,
   })
   const activeReactions: KakaoReactionState = new Set()
-  const reactionCallback = createKakaoReactionCallback(client, activeReactions)
-  const removeReactionCallback = createKakaoRemoveReactionCallback(client, activeReactions)
-  const editMessageCallback = createKakaoEditMessageCallback(client)
+  const reactionCallback = createKakaoReactionCallback(client, activeReactions, logger)
+  const removeReactionCallback = createKakaoRemoveReactionCallback(client, activeReactions, logger)
+  const editMessageCallback = createKakaoEditMessageCallback(client, logger)
   const reactionSupported = typeof client.addReaction === 'function'
   const removeReactionSupported = typeof client.removeReaction === 'function'
   const editSupported = typeof client.editMessage === 'function'

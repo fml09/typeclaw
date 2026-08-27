@@ -73,7 +73,7 @@ CLI: `typeclaw channel add kakaotalk` (interactive). **Do not use `channel set`*
 | ----------------------- | --------- | ---------------------------------------------------------------------------------------------- |
 | Outbound messages       | yes       |                                                                                                |
 | Reactions               | yes       | LOCO `ACTION`; verified `like` only; the same request toggles the bot's own known reaction off |
-| Message editing         | yes\*     | LOCO `REWRITE`; PC/macOS devices may return status `-203` (server-side limitation)             |
+| Message editing         | limited   | LOCO `REWRITE`; the current sub-device `dtype=2` session returns status `-203`                 |
 | Typing indicator        | DM/group  | Animated "…" composing dots via the sub-device LOCO session; **not** OpenChat (see below)      |
 | Channel-name resolution | yes       |                                                                                                |
 | Self identity           | yes       | Resolved from the authenticated `getProfile()` `user_id` and nickname                          |
@@ -97,8 +97,8 @@ typeclaw channel reauth kakaotalk
 - **Provisional registration**: chats not surfaced by `getChats` are registered provisionally on first message.
 - **No combined send**: files are sent first, then text, as separate API calls.
 - **Split messages**: users often send one thought as several rapid bubbles, and the default router debounce (600ms/1500ms) can start a turn on the first bubble alone. Set `inboundBatching` (`quietMs: 2500`, `maxWaitMs: 6000` is a good start) to wait for a quiet gap and answer all bubbles in one turn.
-- **Reactions**: `channel_react` queues a `like` reaction for the triggering message after a substantive reply. Runtime progress can use the same verified `ACTION` request as a toggle: it removes only a reaction instance TypeClaw previously recorded as added, then applies the configured terminal reaction. Unverified reaction types are rejected rather than guessed.
-- **Message editing**: `channel_edit` maps to LOCO `REWRITE` and can edit only a message authored by the agent. PC/macOS KakaoTalk devices may reject it with status `-203`; Android/tablet device mode is required by the observed protocol implementation. With `progress.enabled`, the runtime-owned status message is edited in place and the terminal `channel_reply` reuses that message.
+- **Reactions**: `channel_react` queues a `like` reaction for the triggering message after a substantive reply. The current wire contract is LOCO `ACTION` with `type=1`; the adapter logs add/remove outcomes with `status_code` when configured. Unverified reaction types are rejected rather than guessed.
+- **Message editing**: `channel_edit` maps to LOCO `REWRITE` and can edit only a message authored by the agent. The current sub-device `dtype=2` session returns status `-203`, so production progress is disabled until a compatible request path is verified.
 
 ## Config
 

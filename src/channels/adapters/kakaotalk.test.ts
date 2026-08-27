@@ -698,8 +698,12 @@ describe('KakaoTalk mutation callbacks', () => {
 
   test('maps the supported like aliases to the ACTION reaction type', async () => {
     const client = new FakeClient()
-    const callback = createKakaoReactionCallback(client)
-
+    const logs: string[] = []
+    const callback = createKakaoReactionCallback(client, new Set(), {
+      info: (message) => logs.push(message),
+      warn: () => {},
+      error: () => {},
+    })
     const result = await callback({
       adapter: 'kakaotalk',
       workspace: '@kakao-group',
@@ -717,6 +721,7 @@ describe('KakaoTalk mutation callbacks', () => {
       },
     })
     expect(client.addReactionCalls).toEqual([{ chatId: '111', logId: '42', reactionType: 1 }])
+    expect(logs).toContain('[kakaotalk] reaction-add chat=111 log_id=42 type=1 success=true status_code=0')
   })
   test('removes only a reaction ref previously returned by the add callback', async () => {
     const client = new FakeClient()

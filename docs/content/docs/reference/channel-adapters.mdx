@@ -156,16 +156,20 @@ Only the two first-class bot adapters (`slack-bot`, `discord-bot`) back the `mes
 
 Editing is opt-in per adapter, mirroring `ADAPTER_WRITE_CAPABILITIES` in `src/channels/schema.ts`. When an adapter hasn't registered the capability, `channel_edit` returns a `message-edit-not-supported` error rather than failing the turn; a configured-but-crashed adapter that _does_ support editing returns `message-edit-adapter-unavailable` instead, so the re-auth hint only shows when re-auth would help.
 
-| Adapter        | `channel_edit` | Underlying call                                       |
-| -------------- | :------------: | ----------------------------------------------------- |
-| `slack-bot`    |      yes       | `chat.update`                                         |
-| `slack`        |      yes       | `chat.update`                                         |
-| `discord-bot`  |      yes       | `PATCH .../messages/{id}`                             |
-| `telegram-bot` |      yes       | `editMessageText`                                     |
-| `webex`        |      yes       | `PUT /messages/{id}`                                  |
-| `webex-bot`    |      yes       | `PUT /messages/{id}`                                  |
-| `kakaotalk`    |      yes       | `REWRITE` (PC/macOS devices may return status `-203`) |
-| every other    |       no       | —                                                     |
+| Adapter        | `channel_edit` | Underlying call                                                        |
+| -------------- | :------------: | ---------------------------------------------------------------------- |
+| `slack-bot`    |      yes       | `chat.update`                                                          |
+| `slack`        |      yes       | `chat.update`                                                          |
+| `discord-bot`  |      yes       | `PATCH .../messages/{id}`                                              |
+| `telegram-bot` |      yes       | `editMessageText`                                                      |
+| `webex`        |      yes       | `PUT /messages/{id}`                                                   |
+| `kakaotalk`    |     yes\*      | `REWRITE` (current sub-device `dtype=2` session returns status `-203`) |
+| every other    |       no       | —                                                                      |
+
+`kakaotalk` is marked `yes*` because the adapter exposes the edit callback, but
+the current production sub-device session returns `-203` for `REWRITE`. The
+GitOps deployment keeps runtime progress disabled until a compatible edit path
+is verified.
 
 The five adapters that don't support editing are `discord` (user), `github`, `instagram`, `line`, and `teams` — their SDKs expose no edit primitive.
 
