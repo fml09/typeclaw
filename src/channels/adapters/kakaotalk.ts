@@ -304,6 +304,11 @@ type KakaoReactionTarget = {
 type KakaoReactionRemovalTarget = KakaoReactionTarget & {
   reactionType: number
 }
+type KakaoReactionState = Set<string>
+
+function kakaoReactionKey(target: KakaoReactionTarget, reactionType: number): string {
+  return `${target.chatId}:${target.logId}:${reactionType}`
+}
 
 function encodeKakaoReactionTarget(target: KakaoReactionTarget): ReactionRef {
   return {
@@ -362,7 +367,10 @@ function kakaoReactionTypeFor(emoji: string): number | null {
   return null
 }
 
-export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'addReaction'>): ReactionCallback {
+export function createKakaoReactionCallback(
+  client: Pick<KakaoTalkClient, 'addReaction'>,
+  activeReactions: KakaoReactionState = new Set(),
+): ReactionCallback {
   return async (req): Promise<ReactionResult> => {
     if (req.adapter !== 'kakaotalk' || req.reactionRef.adapter !== 'kakaotalk') {
       return { ok: false, error: 'reaction ref is not for kakaotalk', code: 'unsupported' }
@@ -379,6 +387,9 @@ export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'addRe
         code: 'unsupported',
       }
     }
+    const key = kakaoReactionKey(target, reactionType)
+    const reactionRef = encodeKakaoReactionRemovalRef({ ...target, reactionType })
+    if (activeReactions.has(key)) return { ok: true, reactionRef }
     try {
       const result = await client.addReaction(target.chatId, target.logId, reactionType)
       if (!result.success) {
@@ -388,7 +399,8 @@ export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'addRe
           code: 'transient',
         }
       }
-      return { ok: true, reactionRef: encodeKakaoReactionRemovalRef({ ...target, reactionType }) }
+      activeReactions.add(key)
+      return { ok: true, reactionRef }
     } catch (err) {
       return { ok: false, error: describeError(err), code: 'transient' }
     }
@@ -397,6 +409,7 @@ export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'addRe
 
 export function createKakaoRemoveReactionCallback(
   client: Pick<KakaoTalkClient, 'removeReaction'>,
+  activeReactions?: KakaoReactionState,
 ): RemoveReactionCallback {
   return async (req): Promise<ReactionResult> => {
     if (req.adapter !== 'kakaotalk' || req.reactionRef.adapter !== 'kakaotalk') {
@@ -413,6 +426,14 @@ export function createKakaoRemoveReactionCallback(
         code: 'unsupported',
       }
     }
+    const key = kakaoReactionKey(target, target.reactionType)
+    if (activeReactions !== undefined && !activeReactions.has(key)) {
+      return {
+        ok: false,
+        error: 'KakaoTalk reaction removal ref is not active in this session',
+        code: 'not-found',
+      }
+    }
     try {
       const result = await client.removeReaction(target.chatId, target.logId, target.reactionType)
       if (!result.success) {
@@ -422,6 +443,7 @@ export function createKakaoRemoveReactionCallback(
           code: 'transient',
         }
       }
+      activeReactions?.delete(key)
       return { ok: true }
     } catch (err) {
       return { ok: false, error: describeError(err), code: 'transient' }
@@ -578,8 +600,9 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     logger,
     formatChannelTag,
   })
-  const reactionCallback = createKakaoReactionCallback(client)
-  const removeReactionCallback = createKakaoRemoveReactionCallback(client)
+  const activeReactions: KakaoReactionState = new Set()
+  const reactionCallback = createKakaoReactionCallback(client, activeReactions)
+  const removeReactionCallback = createKakaoRemoveReactionCallback(client, activeReactions)
   const editMessageCallback = createKakaoEditMessageCallback(client)
   const reactionSupported = typeof client.addReaction === 'function'
   const removeReactionSupported = typeof client.removeReaction === 'function'
