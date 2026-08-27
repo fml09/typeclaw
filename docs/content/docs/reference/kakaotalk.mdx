@@ -126,13 +126,18 @@ typeclaw channel reauth kakaotalk
         "startReaction": "like",
         "successReaction": "like",
         "errorReaction": "like"
-      }
+      },
+      "reactionTrace": { "enabled": true, "maxEvents": 100 }
     }
   }
 }
 ```
 
-All fields above are shared across adapters. No adapter-specific extensions exist for `kakaotalk`. Credentials live in [`secrets.json#channels.kakaotalk`](/docs/reference/secrets-json).
+`reactionTrace` is a temporary, opt-in diagnostic setting for KakaoTalk. It
+logs bounded inbound reaction-related LOCO packets (`SYNCACTION`,
+`CHGLOGMETA`, and `REACT`) while redacting message contents and credentials.
+Disable it after collecting a protocol fixture. Credentials live in
+[`secrets.json#channels.kakaotalk`](/docs/reference/secrets-json).
 
 ## See also
 

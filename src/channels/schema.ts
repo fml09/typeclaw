@@ -195,6 +195,13 @@ const progressSchema = z.object({
   successReaction: z.string().trim().min(1).max(32).optional(),
   errorReaction: z.string().trim().min(1).max(32).optional(),
 })
+// Opt-in, bounded tracing for KakaoTalk reaction-related LOCO pushes. The
+// adapter redacts message contents and credentials before logging. Keep this
+// diagnostic switch disabled outside a short protocol-capture window.
+const reactionTraceSchema = z.object({
+  enabled: z.boolean().default(false),
+  maxEvents: z.number().int().min(1).max(500).default(100),
+})
 
 // Deliberately non-strict: a stale on-disk file may still carry the
 // legacy `allow` field. Zod silently drops unknown keys here, which is
@@ -208,6 +215,7 @@ const adapterSchema = z.object({
   inboundBatching: inboundBatchingSchema.optional(),
   postReplyReaction: postReplyReactionSchema.optional(),
   progress: progressSchema.optional(),
+  reactionTrace: reactionTraceSchema.optional(),
 })
 
 export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [

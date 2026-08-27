@@ -140,6 +140,16 @@ describe('channelsSchema', () => {
     })
     expect(() => channelsSchema.parse({ kakaotalk: { progress: { updateIntervalMs: 249 } } })).toThrow()
   })
+  test('parses bounded Kakao reaction trace settings', () => {
+    const parsed = channelsSchema.parse({
+      kakaotalk: { reactionTrace: { enabled: true, maxEvents: 25 } },
+    })
+    expect(parsed.kakaotalk?.reactionTrace).toEqual({ enabled: true, maxEvents: 25 })
+    expect(channelsSchema.parse({ kakaotalk: { reactionTrace: {} } }).kakaotalk?.reactionTrace).toEqual({
+      enabled: false,
+      maxEvents: 100,
+    })
+  })
 
   test('accepts github channel config with webhookUrl omitted', () => {
     const parsed = channelsSchema.parse({ github: { repos: ['owner/repo'] } })

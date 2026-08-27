@@ -49,19 +49,21 @@ Adapters come in two shapes. **Bot adapters** authenticate as a platform bot/app
 }
 ```
 
-| Field                       | Adapters | Notes                                                                                                 |
-| --------------------------- | -------- | ----------------------------------------------------------------------------------------------------- |
-| `enabled`                   | all      | live-reloadable                                                                                       |
-| `quotedReply`               | all      | auto-anchor delayed replies with a `> @author: …` blockquote prefix; defaults to on, 10s              |
-| `quotedReply.enabled`       | all      | set `false` to never prepend the anchor                                                               |
-| `quotedReply.queueDelayMs`  | all      | reply delay threshold in ms; `0` anchors every reply, large values anchor only very late replies      |
-| `inboundBatching`           | all      | fixed quiet-period coalescing for split-message platforms; omit to keep the default hot/cold debounce |
-| `inboundBatching.quietMs`   | all      | run the turn this many ms after the **latest** inbound; every inbound restarts the timer (0–30000)    |
-| `inboundBatching.maxWaitMs` | all      | force a flush once the oldest unprocessed message is this old, even under a steady stream (0–60000)   |
-| `postReplyReaction`         | all      | optional automatic reaction after a substantive reply; adapter-specific vocabulary applies            |
-| `progress`                  | all      | optional runtime-owned status message edited in place during an active turn                           |
-| `webhookPort`               | `github` | container-side port the webhook server listens on; default `8975`                                     |
-| `webhookUrl`                | `github` | optional override; when omitted, the URL comes from a channel-owned tunnel                            |
+| Field                       | Adapters    | Notes                                                                                                 |
+| --------------------------- | ----------- | ----------------------------------------------------------------------------------------------------- |
+| `enabled`                   | all         | live-reloadable                                                                                       |
+| `quotedReply`               | all         | auto-anchor delayed replies with a `> @author: …` blockquote prefix; defaults to on, 10s              |
+| `quotedReply.enabled`       | all         | set `false` to never prepend the anchor                                                               |
+| `quotedReply.queueDelayMs`  | all         | reply delay threshold in ms; `0` anchors every reply, large values anchor only very late replies      |
+| `inboundBatching`           | all         | fixed quiet-period coalescing for split-message platforms; omit to keep the default hot/cold debounce |
+| `inboundBatching.quietMs`   | all         | run the turn this many ms after the **latest** inbound; every inbound restarts the timer (0–30000)    |
+| `inboundBatching.maxWaitMs` | all         | force a flush once the oldest unprocessed message is this old, even under a steady stream (0–60000)   |
+| `postReplyReaction`         | all         | optional automatic reaction after a substantive reply; adapter-specific vocabulary applies            |
+| `progress`                  | all         | optional runtime-owned status message edited in place during an active turn                           |
+| `reactionTrace`             | `kakaotalk` | bounded, opt-in inbound reaction packet trace; redact and disable after capture                       |
+
+| `webhookPort` | `github` | container-side port the webhook server listens on; default `8975` |
+| `webhookUrl` | `github` | optional override; when omitted, the URL comes from a channel-owned tunnel |
 
 `progress.enabled` enables a runtime-owned status message for adapters that
 return an outbound message id and support editing. The router creates the
@@ -73,6 +75,12 @@ events into coarse safe labels, and edits that same message with the terminal
 `successReaction`, and `errorReaction` optionally define the reaction lifecycle
 on the triggering inbound. An adapter may reject a vocabulary item as
 unsupported; this never blocks the reply.
+
+`reactionTrace.enabled` attaches a temporary KakaoTalk packet trace for
+reaction-related LOCO pushes. It records `SYNCACTION`, `CHGLOGMETA`, and
+`REACT` packets up to `reactionTrace.maxEvents`, while redacting message
+contents and credentials. It does not prove the outbound request shape, so
+an inbound fixture alone is not sufficient to ship a new reaction type.
 
 Credentials live in `secrets.json#channels.<adapter>` ([/reference/secrets-json](/docs/reference/secrets-json)).
 

@@ -30,6 +30,7 @@ import {
   type KakaoTalkClient,
   type KakaoTalkListener,
 } from './kakaotalk'
+import type { KakaoPushPacket } from './kakaotalk'
 
 type EventKey = keyof KakaoTalkListenerEventMap
 
@@ -113,6 +114,16 @@ class FakeClient implements KakaoTalkClient {
   getMessagesError: Error | null = null
   getMembersCalls: string[] = []
   closed = false
+  private pushHandlers = new Set<(packet: KakaoPushPacket) => void>()
+
+  onPush(handler: (packet: KakaoPushPacket) => void): () => void {
+    this.pushHandlers.add(handler)
+    return () => this.pushHandlers.delete(handler)
+  }
+
+  emitPush(packet: KakaoPushPacket): void {
+    for (const handler of this.pushHandlers) handler(packet)
+  }
   getMembersError: Error | null = null
   sendResult: KakaoSendResult = { success: true, status_code: 0, chat_id: '111', log_id: 'L1', sent_at: 0 }
   markReadCalls: Array<{ chatId: string; logId: string; opts?: { linkId?: string } }> = []
@@ -570,6 +581,76 @@ describe('createKakaotalkAdapter — start/stop lifecycle', () => {
     await router.stop()
   })
 })
+describe('createKakaotalkAdapter — reaction packet tracing', () => {
+  test('logs bounded reaction pushes with message and credential fields redacted', async () => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const config = adapterCfg({ reactionTrace: { enabled: true, maxEvents: 2 } })
+    const logs: string[] = []
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => config,
+      client,
+      listenerFactory: () => listener,
+      logger: { info: (message) => logs.push(message), warn: () => {}, error: () => {} },
+    })
+
+    await adapter.start()
+    client.emitPush({
+      packetId: 7,
+      statusCode: 0,
+      bodyType: 0,
+      method: 'SYNCACTION',
+      body: {
+        chatId: 'chat-1',
+        logId: 'message-1',
+        type: 2,
+        adid: 9,
+        msg: 'private text',
+        nested: { access_token: 'private token' },
+      },
+    })
+    client.emitPush({
+      packetId: 8,
+      statusCode: 0,
+      bodyType: 0,
+      method: 'CHGLOGMETA',
+      body: { chatId: 'chat-1', logId: 'message-1', rt: 3 },
+    })
+    client.emitPush({
+      packetId: 9,
+      statusCode: 0,
+      bodyType: 0,
+      method: 'REACT',
+      body: { chatId: 'chat-1', logId: 'message-1', rt: 4 },
+    })
+
+    const traces = logs.filter((message) => message.startsWith('[kakaotalk][reaction-trace]'))
+    expect(traces).toHaveLength(2)
+    expect(traces[0]).toContain('"method":"SYNCACTION"')
+    expect(traces[0]).toContain('"type":2')
+    expect(traces[0]).toContain('"adid":9')
+    expect(traces[0]).toContain('"msg":"<REDACTED>"')
+    expect(traces[0]).toContain('"access_token":"<REDACTED>"')
+    expect(traces[0]).not.toContain('private text')
+    expect(traces[0]).not.toContain('private token')
+    expect(traces[1]).toContain('"method":"CHGLOGMETA"')
+    expect(traces[1]).toContain('"rt":3')
+
+    await adapter.stop()
+    client.emitPush({
+      packetId: 10,
+      statusCode: 0,
+      bodyType: 0,
+      method: 'SYNCACTION',
+      body: { type: 5 },
+    })
+    expect(logs.filter((message) => message.startsWith('[kakaotalk][reaction-trace]'))).toHaveLength(2)
+    await router.stop()
+  })
+})
+
 describe('KakaoTalk mutation callbacks', () => {
   const reactionRef = {
     adapter: 'kakaotalk' as const,

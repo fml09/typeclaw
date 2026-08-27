@@ -57,6 +57,14 @@ import { toKakaoPlainText } from './kakaotalk-format'
 import { createKakaoMembershipResolver } from './kakaotalk-membership'
 import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEARTBEAT_MS } from './kakaotalk-typing'
 
+export type KakaoPushPacket = {
+  packetId: number
+  statusCode: number
+  method: string
+  bodyType: number
+  body: Record<string, unknown>
+}
+
 // Structural duck-type of agent-messenger's KakaoTalkClient class. The class
 // has private fields, and TypeScript treats those as nominal — test fakes that
 // match the public surface get rejected. Declaring this as an interface lets
@@ -86,6 +94,9 @@ export interface KakaoTalkClient {
   getMembers(chatId: string): Promise<KakaoMember[]>
   lookupAuthorName(chatId: string, authorId: number): string | null
   close(): void
+  // Optional raw-packet seam used by the bounded, opt-in reaction protocol
+  // trace. The production SDK exposes this; older test doubles may omit it.
+  onPush?: (handler: (packet: KakaoPushPacket) => void) => () => void
 }
 
 export interface KakaoTalkListener {
@@ -554,6 +565,8 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
   let lastConnectedAt: number | null = null
   let inflightInbounds = 0
   let stopWaiters: Array<() => void> = []
+  let reactionTraceCount = 0
+  let reactionTraceUnsubscribe: (() => void) | null = null
 
   type RecoveryEpisode = {
     startedAt: number
@@ -616,6 +629,29 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
   })
 
   const fetchAttachmentCallback = createFetchAttachmentCallback({ logger })
+  const handleReactionTracePacket = (packet: KakaoPushPacket): void => {
+    const trace = options.configRef().reactionTrace
+    if (
+      trace?.enabled !== true ||
+      reactionTraceCount >= trace.maxEvents ||
+      !isKakaoReactionTraceMethod(packet.method)
+    ) {
+      return
+    }
+
+    reactionTraceCount++
+    const payload = {
+      packet_id: packet.packetId,
+      status_code: packet.statusCode,
+      body_type: packet.bodyType,
+      method: packet.method,
+      direction: 'in',
+      body: redactKakaoReactionTraceValue(packet.body),
+      event_count: reactionTraceCount,
+      event_limit: trace.maxEvents,
+    }
+    logger.info(`[kakaotalk][reaction-trace] ${JSON.stringify(payload)}`)
+  }
 
   const handleMessageEvent = async (event: KakaoTalkPushMessageEvent): Promise<void> => {
     const { text, attachments } = splitInbound(event)
@@ -711,6 +747,8 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     async start(): Promise<void> {
       if (started) return
       started = true
+      reactionTraceCount = 0
+
       lastConnectedAt = null
       resetRecoveryEpisode()
       try {
@@ -771,6 +809,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       }
 
       listener = options.listenerFactory ? options.listenerFactory(client) : new KakaoTalkListener(client)
+      reactionTraceUnsubscribe = client.onPush?.(handleReactionTracePacket) ?? null
       const activeListener = listener
       const scheduleStabilityCheck = (): void => {
         if (recoveryEpisode === null) return
@@ -870,6 +909,9 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
         } catch {
           // ignore — best-effort cleanup, the start failure is what we surface
         }
+        reactionTraceUnsubscribe?.()
+        reactionTraceUnsubscribe = null
+
         listener = null
         started = false
         logger.error(`[kakaotalk] listener start failed: ${describeError(err)}`)
@@ -918,6 +960,8 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
           stopWaiters.push(resolve)
         })
       }
+      reactionTraceUnsubscribe?.()
+      reactionTraceUnsubscribe = null
       listener?.stop()
       listener = null
       try {
@@ -939,6 +983,62 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
   }
 }
 
+const KAKAO_REACTION_TRACE_METHODS = new Set(['ACTION', 'CHGLOGMETA', 'REACT', 'SYNCACTION'])
+const KAKAO_REACTION_TRACE_REDACTED_KEYS = new Set([
+  'access',
+  'accesstoken',
+  'attachment',
+  'content',
+  'cookie',
+  'data',
+  'deviceuuid',
+  'duuid',
+  'extra',
+  'message',
+  'msg',
+  'oauth',
+  'oauthtoken',
+  'password',
+  'payload',
+  'refreshtoken',
+  'secret',
+  'text',
+  'token',
+  'xvc',
+])
+
+function isKakaoReactionTraceMethod(method: string): boolean {
+  return KAKAO_REACTION_TRACE_METHODS.has(method.toUpperCase())
+}
+
+function redactKakaoReactionTraceValue(value: unknown, depth = 0, seen = new Set<object>()): unknown {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') return value
+  if (typeof value === 'bigint') return `${value.toString()}n`
+  if (typeof value === 'string') {
+    return value.length > 256 ? `${value.slice(0, 256)}…` : value
+  }
+  if (typeof value !== 'object') return String(value)
+  if (depth >= 8) return '<depth-limit>'
+  if (value instanceof Uint8Array) return `<binary:${value.byteLength}>`
+  if (seen.has(value)) return '<circular>'
+
+  seen.add(value)
+  if (Array.isArray(value)) {
+    const result = value.slice(0, 100).map((item) => redactKakaoReactionTraceValue(item, depth + 1, seen))
+    seen.delete(value)
+    return result
+  }
+
+  const result: Record<string, unknown> = {}
+  for (const [key, nested] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase().replaceAll(/[-_]/g, '')
+    result[key] = KAKAO_REACTION_TRACE_REDACTED_KEYS.has(normalizedKey)
+      ? '<REDACTED>'
+      : redactKakaoReactionTraceValue(nested, depth + 1, seen)
+  }
+  seen.delete(value)
+  return result
+}
 function markReadIfSupported(deps: {
   client: Pick<KakaoTalkClient, 'markRead'>
   event: KakaoTalkPushMessageEvent
