@@ -103,6 +103,15 @@ describe('channelsSchema', () => {
       channelsSchema.parse({ kakaotalk: { inboundBatching: { quietMs: 100, maxWaitMs: 60_001 } } }),
     ).toThrow()
   })
+  test('parses postReplyReaction with a default like emoji', () => {
+    const parsed = channelsSchema.parse({ kakaotalk: { postReplyReaction: { enabled: true } } })
+    expect(parsed.kakaotalk?.postReplyReaction).toEqual({ enabled: true, emoji: 'like' })
+    expect(channelsSchema.parse({ kakaotalk: {} }).kakaotalk?.postReplyReaction).toBeUndefined()
+  })
+
+  test('rejects an empty postReplyReaction emoji', () => {
+    expect(() => channelsSchema.parse({ kakaotalk: { postReplyReaction: { enabled: true, emoji: ' ' } } })).toThrow()
+  })
 
   test('accepts github channel config with webhookUrl omitted', () => {
     const parsed = channelsSchema.parse({ github: { repos: ['owner/repo'] } })

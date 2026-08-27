@@ -19,14 +19,17 @@ import type {
 
 import { createChannelRouter, type ChannelRouter } from '@/channels/router'
 import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/schema'
-import type { TypingCallback } from '@/channels/types'
+import type { ChannelSelfIdentityResolver, TypingCallback } from '@/channels/types'
 
 import {
   createKakaotalkAdapter,
   createOutboundCallback,
+  createKakaoEditMessageCallback,
+  createKakaoReactionCallback,
   type KakaoTalkClient,
   type KakaoTalkListener,
 } from './kakaotalk'
+import type { KakaoLocoPacket } from './kakaotalk-loco'
 
 type EventKey = keyof KakaoTalkListenerEventMap
 
@@ -76,11 +79,25 @@ function isAttachmentInputArray(
 class FakeClient implements KakaoTalkClient {
   loginCalls = 0
   sendMessageCalls: Array<{ chatId: string; text: string; replyTo?: KakaoReplyTarget }> = []
+  locoCalls: Array<{ method: string; body: Record<string, unknown> }> = []
+  locoResponse: KakaoLocoPacket = { statusCode: 0, body: {} }
+  locoError: Error | null = null
   getMessagesCalls: Array<{ chatId: string; opts?: { count?: number; from?: string } }> = []
   getMessagesResult: KakaoMessage[] = []
   getMessagesError: Error | null = null
   getMembersCalls: string[] = []
   closed = false
+  async acquireSession() {
+    return {
+      getConnection: () => ({
+        sendPacket: async (method: string, body: Record<string, unknown>) => {
+          this.locoCalls.push({ method, body })
+          if (this.locoError !== null) throw this.locoError
+          return this.locoResponse
+        },
+      }),
+    }
+  }
   profileResult: KakaoProfile = {
     user_id: '999',
     nickname: 'Self',
@@ -238,6 +255,41 @@ describe('createKakaotalkAdapter — start/stop lifecycle', () => {
     expect(client.closed).toBe(true)
     expect(adapter.isConnected()).toBe(false)
 
+    await router.stop()
+  })
+  test('registers and clears router self identity from the authenticated profile', async () => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    let registeredResolver: ChannelSelfIdentityResolver | null = null
+    let unregisteredResolver: ChannelSelfIdentityResolver | null = null
+    const registerSelfIdentity = router.registerSelfIdentity.bind(router)
+    const unregisterSelfIdentity = router.unregisterSelfIdentity.bind(router)
+    router.registerSelfIdentity = (adapter, resolver) => {
+      if (adapter === 'kakaotalk') registeredResolver = resolver
+      registerSelfIdentity(adapter, resolver)
+    }
+    router.unregisterSelfIdentity = (adapter, resolver) => {
+      if (adapter === 'kakaotalk') unregisteredResolver = resolver
+      unregisterSelfIdentity(adapter, resolver)
+    }
+
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+    })
+
+    await adapter.start()
+
+    expect(registeredResolver).not.toBeNull()
+    expect(registeredResolver!('@kakao-group')).toEqual({ id: '999', username: 'Self' })
+
+    await adapter.stop()
+
+    expect(unregisteredResolver).toBe(registeredResolver)
+    expect(registeredResolver!('@kakao-group')).toBeNull()
     await router.stop()
   })
 
@@ -498,6 +550,142 @@ describe('createKakaotalkAdapter — start/stop lifecycle', () => {
     expect(client.sendTypingCalls).toEqual([{ chatId: '888' }])
 
     await adapter.stop()
+    await router.stop()
+  })
+})
+describe('KakaoTalk mutation callbacks', () => {
+  const reactionRef = {
+    adapter: 'kakaotalk' as const,
+    value: JSON.stringify({ chatId: '111', logId: '42' }),
+  }
+
+  test('maps the supported like aliases to the ACTION reaction type', async () => {
+    const client = new FakeClient()
+    const callback = createKakaoReactionCallback(client)
+
+    const result = await callback({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      thread: null,
+      reactionRef,
+      emoji: '+1',
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(client.locoCalls).toHaveLength(1)
+    expect(client.locoCalls[0]?.method).toBe('ACTION')
+    expect(String(client.locoCalls[0]?.body.chatId)).toBe('111')
+    expect(String(client.locoCalls[0]?.body.logId)).toBe('42')
+    expect(client.locoCalls[0]?.body.type).toBe(1)
+  })
+
+  test('rejects unverified KakaoTalk reaction names instead of guessing a type', async () => {
+    const callback = createKakaoReactionCallback(new FakeClient())
+
+    const result = await callback({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      thread: null,
+      reactionRef,
+      emoji: 'rocket',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'KakaoTalk currently supports only the like reaction (`like`, `+1`, `thumbsup`, or `👍`)',
+      code: 'unsupported',
+    })
+  })
+
+  test('passes the message target and replacement text to REWRITE', async () => {
+    const client = new FakeClient()
+    const callback = createKakaoEditMessageCallback(client)
+
+    const result = await callback({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      thread: null,
+      messageId: '42',
+      text: 'edited',
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(client.locoCalls).toHaveLength(1)
+    expect(client.locoCalls[0]?.method).toBe('REWRITE')
+    expect(String(client.locoCalls[0]?.body.chatId)).toBe('111')
+    expect(String(client.locoCalls[0]?.body.logId)).toBe('42')
+    expect(client.locoCalls[0]?.body.msg).toBe('edited')
+    expect(client.locoCalls[0]?.body.type).toBe(1)
+  })
+
+  test('surfaces the known macOS REWRITE limitation as not-supported', async () => {
+    const client = new FakeClient()
+    client.locoResponse = { statusCode: 0, body: { status: -203 } }
+    const callback = createKakaoEditMessageCallback(client)
+
+    const result = await callback({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      thread: null,
+      messageId: '42',
+      text: 'edited',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'KakaoTalk REWRITE failed with status -203',
+      code: 'not-supported',
+    })
+  })
+
+  test('registers mutation callbacks when the SDK exposes them', async () => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    let reactionRegistered = false
+    let editRegistered = false
+    let reactionUnregistered = false
+    let editUnregistered = false
+    const registerReaction = router.registerReaction.bind(router)
+    const unregisterReaction = router.unregisterReaction.bind(router)
+    const registerEditMessage = router.registerEditMessage.bind(router)
+    const unregisterEditMessage = router.unregisterEditMessage.bind(router)
+    router.registerReaction = (adapter, callback) => {
+      if (adapter === 'kakaotalk') reactionRegistered = true
+      registerReaction(adapter, callback)
+    }
+    router.unregisterReaction = (adapter, callback) => {
+      if (adapter === 'kakaotalk') reactionUnregistered = true
+      unregisterReaction(adapter, callback)
+    }
+    router.registerEditMessage = (adapter, callback) => {
+      if (adapter === 'kakaotalk') editRegistered = true
+      registerEditMessage(adapter, callback)
+    }
+    router.unregisterEditMessage = (adapter, callback) => {
+      if (adapter === 'kakaotalk') editUnregistered = true
+      unregisterEditMessage(adapter, callback)
+    }
+
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+    })
+    await adapter.start()
+
+    expect(reactionRegistered).toBe(true)
+    expect(editRegistered).toBe(true)
+
+    await adapter.stop()
+
+    expect(reactionUnregistered).toBe(true)
+    expect(editUnregistered).toBe(true)
     await router.stop()
   })
 })

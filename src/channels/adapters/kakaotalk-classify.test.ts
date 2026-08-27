@@ -117,6 +117,10 @@ describe('classifyInbound', () => {
     expect(verdict.payload.thread).toBeNull()
     expect(verdict.payload.text).toBe('hello')
     expect(verdict.payload.externalMessageId).toBe('L1')
+    expect(verdict.payload.reactionRef).toEqual({
+      adapter: 'kakaotalk',
+      value: JSON.stringify({ chatId: '111', logId: 'L1' }),
+    })
     expect(verdict.payload.authorId).toBe('222')
     expect(verdict.payload.ts).toBe(1_730_000_000_000)
     expect(new Date(verdict.payload.ts).getUTCFullYear()).toBe(2024)

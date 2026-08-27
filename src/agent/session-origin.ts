@@ -132,10 +132,14 @@ type PlatformInfo = {
   plainTextOnly: boolean
   // Whether this adapter registers a ReactionCallback, i.e. whether
   // `channel_react` actually does anything here. Gates the proactive-reaction
-  // prompt guidance so we never tell a KakaoTalk/Telegram agent to react when
-  // the call would no-op. Keep in sync with the adapters that call
-  // `router.registerReaction` (github, slack-bot, discord-bot today).
+  // prompt guidance so we never tell an adapter to react when the call would
+  // no-op. Keep in sync with the adapters that call `router.registerReaction`
+  // (github, slack-bot, discord-bot, kakaotalk).
   supportsReactions: boolean
+  // Optional platform-specific vocabulary. Most adapters use the shared
+  // sentiment examples; KakaoTalk currently exposes only the verified `like`
+  // ACTION type.
+  reactionGuidance?: string
   // Whether this adapter's OutboundCallback accepts file attachments. Gates the
   // "ship a researcher report as a PDF by default" prompt guidance: a report is
   // only worth converting to a downloadable file on channels that can actually
@@ -230,7 +234,8 @@ const PLATFORM_INFO: Record<AdapterId, PlatformInfo> = {
     displayName: 'KakaoTalk',
     mentionMode: 'alias',
     plainTextOnly: true,
-    supportsReactions: false,
+    supportsReactions: true,
+    reactionGuidance: 'KakaoTalk currently supports only `like` (also `+1`, `thumbsup`, or `👍`).',
     supportsAttachments: true,
   },
 }
@@ -519,9 +524,9 @@ function renderChannelOrigin(
     lines.push(
       '',
       '**React like a teammate would.** `channel_react({ emoji })` adds only a',
-      'reaction: `+1` approve, `rocket` shipping/exciting, `tada` celebrate,',
-      '`heart` appreciate, `laugh` funny, `eyes` looking. Use it when it adds',
-      'real signal, not every turn. The reaction is applied ONLY if you also',
+      platformInfo.reactionGuidance ??
+        'reaction: `+1` approve, `rocket` shipping/exciting, `tada` celebrate, `heart` appreciate, `laugh` funny, `eyes` looking.',
+      'Use it when it adds real signal, not every turn. The reaction is applied ONLY if you also',
       'reply to this message this turn; if you stay silent or `skip_response`,',
       'it is dropped — so never react to a message you are only observing and',
       'not answering. It does NOT satisfy the reply obligation; substantive',

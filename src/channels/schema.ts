@@ -57,7 +57,7 @@ export const ADAPTER_WRITE_CAPABILITIES: Record<AdapterId, readonly WriteCapabil
   github: [],
   instagram: [],
   line: [],
-  kakaotalk: [],
+  kakaotalk: ['message-edit'],
   slack: ['message-edit'],
   'slack-bot': ['message-edit'],
   teams: ['message-edit'],
@@ -178,6 +178,13 @@ const inboundBatchingSchema = z.object({
   quietMs: z.number().int().min(0).max(30_000),
   maxWaitMs: z.number().int().min(0).max(60_000).optional(),
 })
+// Optional automatic reaction sent after a substantive reply. Kept separate
+// from model-requested `channel_react` so operators can enable a conservative
+// platform-specific default without forcing every adapter to react.
+const postReplyReactionSchema = z.object({
+  enabled: z.boolean().default(false),
+  emoji: z.string().trim().min(1).max(32).default('like'),
+})
 
 // Deliberately non-strict: a stale on-disk file may still carry the
 // legacy `allow` field. Zod silently drops unknown keys here, which is
@@ -189,6 +196,7 @@ const adapterSchema = z.object({
   enabled: z.boolean().default(true),
   quotedReply: quotedReplySchema.optional(),
   inboundBatching: inboundBatchingSchema.optional(),
+  postReplyReaction: postReplyReactionSchema.optional(),
 })
 
 export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [

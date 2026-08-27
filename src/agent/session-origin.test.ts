@@ -379,13 +379,28 @@ describe('renderSessionOrigin', () => {
     },
   )
 
+  test('KakaoTalk reaction guidance names its verified like-only vocabulary', () => {
+    const out = renderSessionOrigin({
+      kind: 'channel',
+      adapter: 'kakaotalk',
+      workspace: 'W0',
+      chat: 'C0',
+      thread: null,
+      reactionRef: { adapter: 'kakaotalk', value: 'target' },
+    })
+
+    expect(out).toMatch(/React like a teammate/i)
+    expect(out).toMatch(/KakaoTalk currently supports only `like`/i)
+    expect(out).not.toMatch(/`rocket`/)
+  })
+
   // Regression for the `channel_react denied: this conversation has no message
   // to react to` incident: reminder-only turns (restart-resume, subagent-
   // completion, idle/todo continuation) wake a reaction-capable session with
   // no inbound, so the origin carries no reactionRef. The proactive-reaction
   // block must be suppressed there, otherwise the model is nudged into a
   // channel_react the tool will deny.
-  test.each(['slack-bot', 'discord-bot', 'github'] as const)(
+  test.each(['slack-bot', 'discord-bot', 'github', 'kakaotalk'] as const)(
     'reaction-capable channel origin (%s) omits the proactive-reaction guidance when there is no reaction target',
     (adapter) => {
       const out = renderSessionOrigin({
@@ -399,7 +414,7 @@ describe('renderSessionOrigin', () => {
     },
   )
 
-  test.each(['telegram-bot', 'kakaotalk'] as const)(
+  test.each(['telegram-bot'] as const)(
     'channel origin without reaction support (%s) omits the proactive-reaction guidance',
     (adapter) => {
       const out = renderSessionOrigin({

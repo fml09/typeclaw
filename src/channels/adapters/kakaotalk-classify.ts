@@ -81,6 +81,12 @@ export function classifyInbound(
         ? { attachments: context.attachments }
         : {}),
       externalMessageId: event.log_id,
+      // ACTION reactions address the original chat log, so preserve both ids
+      // in an adapter-owned opaque ref rather than making the router parse them.
+      reactionRef: {
+        adapter: 'kakaotalk',
+        value: JSON.stringify({ chatId: event.chat_id, logId: event.log_id }),
+      },
       authorId: String(event.author_id),
       authorName: event.author_name ?? String(event.author_id),
       authorIsBot: false,

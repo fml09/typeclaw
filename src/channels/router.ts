@@ -3776,9 +3776,32 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             sentReplyThisTurn &&
             live.emptyTurnFallbackTurn !== live.turnSeq &&
             assistantLeafStopReason(live.session) !== 'error'
+          const postReplyReaction = options.configForAdapter(live.key.adapter)?.postReplyReaction
+          const automaticReactionRef = live.currentTurnReactionRef
+          const modelQueuedReaction = live.pendingTurnReactions.length > 0
           if (usableReplyThisTurn) {
             flushPendingReactions(live)
             void dropSilentAckReactions(live)
+            // An explicit post-reply reaction is sent only after a real reply
+            // and only when the model did not already choose one. This keeps
+            // KakaoTalk's automatic acknowledgement opt-in and avoids two
+            // reaction writes on the same turn.
+            if (!modelQueuedReaction && postReplyReaction?.enabled === true && automaticReactionRef !== null) {
+              void react({
+                adapter: live.key.adapter,
+                workspace: live.key.workspace,
+                chat: live.key.chat,
+                thread: live.key.thread,
+                reactionRef: automaticReactionRef,
+                emoji: postReplyReaction.emoji,
+              }).then((result) => {
+                if (!result.ok && result.code !== 'unsupported') {
+                  logger.info(
+                    `[channels] post-reply reaction failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
+                  )
+                }
+              })
+            }
           } else live.pendingTurnReactions = []
           // Either retry budget keeps the turn in flight, so a deferred provider
           // error must wait for the reminder-only iteration that actually ends it.

@@ -3579,6 +3579,36 @@ describe('ChannelRouter model react only when replying', () => {
     await waitFor(() => added.length === 1)
     expect(added[0]).toMatchObject({ adapter: 'discord-bot', chat: 'c1', emoji: 'eyes', reactionRef: TARGET_REF })
   })
+  test('adds the configured reaction only after a successful reply', async () => {
+    const dir = await tempDir()
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      postReplyReaction: { enabled: true, emoji: 'like' },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    router.setTypingCapability('discord-bot', true)
+    const added: ReactionRequest[] = []
+    router.registerReaction('discord-bot', async (req) => {
+      added.push(req)
+      return { ok: true }
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ reactionRef: TARGET_REF }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'reply' })
+      sessions[0]!.setAssistantText('reply')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    await waitFor(() => added.length === 1)
+    expect(added[0]).toMatchObject({
+      adapter: 'discord-bot',
+      chat: 'c1',
+      emoji: 'like',
+      reactionRef: TARGET_REF,
+    })
+  })
 
   test('drops a queued channel_react reaction when the turn stays silent', async () => {
     // given a typing-capable adapter (no eager engage :eyes:) whose model queues

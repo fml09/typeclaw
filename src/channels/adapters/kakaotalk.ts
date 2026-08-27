@@ -23,11 +23,15 @@ import { prependQuoteAnchor, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
   ChannelHistoryMessage,
+  ChannelSelfIdentityResolver,
+  EditMessageCallback,
   FetchHistoryArgs,
   FetchHistoryResult,
   HistoryCallback,
   OutboundCallback,
   OutboundMessage,
+  ReactionCallback,
+  ReactionResult,
   ResolvedChannelNames,
   SendResult,
   InboundAttachment,
@@ -45,6 +49,13 @@ import { createKakaoChannelResolver, type KakaoChannelResolver } from './kakaota
 import { classifyInbound, type InboundDropReason } from './kakaotalk-classify'
 import { createFetchAttachmentCallback } from './kakaotalk-fetch-attachment'
 import { toKakaoPlainText } from './kakaotalk-format'
+import {
+  KAKAO_LIKE_REACTION_TYPE,
+  kakaoMutationStatusCode,
+  rewriteKakaoMessage,
+  sendKakaoReaction,
+  type KakaoLocoClient,
+} from './kakaotalk-loco'
 import { createKakaoMembershipResolver } from './kakaotalk-membership'
 import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEARTBEAT_MS } from './kakaotalk-typing'
 
@@ -54,7 +65,9 @@ import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEA
 // Declaring this as an interface lets fakes satisfy it without inheriting
 // private state. The cast on the const below bridges the runtime class
 // onto this interface; the real upstream class satisfies every method.
+
 export interface KakaoTalkClient {
+  acquireSession?: KakaoLocoClient['acquireSession']
   login(
     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: 'pc' | 'tablet' },
     accountId?: string,
@@ -280,6 +293,93 @@ export function createOutboundCallback(deps: {
   }
 }
 
+type KakaoReactionTarget = {
+  chatId: string
+  logId: string
+}
+
+function parseKakaoReactionTarget(value: string): KakaoReactionTarget | null {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const target = parsed as { chatId?: unknown; logId?: unknown }
+    if (typeof target.chatId !== 'string' || target.chatId === '') return null
+    if (typeof target.logId !== 'string' || target.logId === '') return null
+    return { chatId: target.chatId, logId: target.logId }
+  } catch {
+    return null
+  }
+}
+
+function kakaoReactionTypeFor(emoji: string): number | null {
+  const normalized = emoji.trim().replace(/^:|:$/g, '').toLocaleLowerCase()
+  if (normalized === 'like' || normalized === '+1' || normalized === 'thumbsup' || normalized === '👍') {
+    return KAKAO_LIKE_REACTION_TYPE
+  }
+  return null
+}
+
+export function createKakaoReactionCallback(client: Pick<KakaoTalkClient, 'acquireSession'>): ReactionCallback {
+  return async (req): Promise<ReactionResult> => {
+    if (req.adapter !== 'kakaotalk' || req.reactionRef.adapter !== 'kakaotalk') {
+      return { ok: false, error: 'reaction ref is not for kakaotalk', code: 'unsupported' }
+    }
+    if (client.acquireSession === undefined) {
+      return {
+        ok: false,
+        error: 'installed agent-messenger SDK does not expose the KakaoTalk LOCO session',
+        code: 'unsupported',
+      }
+    }
+    const target = parseKakaoReactionTarget(req.reactionRef.value)
+    if (target === null || target.chatId !== req.chat) {
+      return { ok: false, error: 'invalid KakaoTalk reaction target', code: 'not-found' }
+    }
+    const reactionType = kakaoReactionTypeFor(req.emoji)
+    if (reactionType === null) {
+      return {
+        ok: false,
+        error: 'KakaoTalk currently supports only the like reaction (`like`, `+1`, `thumbsup`, or `👍`)',
+        code: 'unsupported',
+      }
+    }
+    try {
+      const packet = await sendKakaoReaction(client, target.chatId, target.logId, reactionType)
+      const statusCode = kakaoMutationStatusCode(packet)
+      if (statusCode !== 0) {
+        return { ok: false, error: `KakaoTalk ACTION failed with status ${statusCode}`, code: 'transient' }
+      }
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: describeError(err), code: 'transient' }
+    }
+  }
+}
+
+export function createKakaoEditMessageCallback(client: Pick<KakaoTalkClient, 'acquireSession'>): EditMessageCallback {
+  return async (req) => {
+    if (client.acquireSession === undefined) {
+      return {
+        ok: false,
+        error: 'installed agent-messenger SDK does not expose the KakaoTalk LOCO session',
+        code: 'not-supported',
+      }
+    }
+    try {
+      const packet = await rewriteKakaoMessage(client, req.chat, req.messageId, req.text)
+      const statusCode = kakaoMutationStatusCode(packet)
+      if (statusCode === 0) return { ok: true }
+      return {
+        ok: false,
+        error: `KakaoTalk REWRITE failed with status ${statusCode}`,
+        code: statusCode === -203 ? 'not-supported' : 'not-found',
+      }
+    } catch (err) {
+      return { ok: false, error: describeError(err), code: 'not-found' }
+    }
+  }
+}
+
 // KakaoTalk replies need the full source message, not just its log_id. Resolve
 // it from the chat's recent history (matching the upstream CLI's approach).
 // Returns undefined when the target isn't in the fetched window or the fetch
@@ -361,6 +461,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     })
   let listener: KakaoTalkListener | null = null
   let selfUserId: string | null = null
+  let selfNickname: string | null = null
   let connected = false
   let started = false
   let lastConnectedAt: number | null = null
@@ -385,6 +486,13 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     selfUserIdRef: () => selfUserId,
     logger,
   })
+  const selfIdentityResolver: ChannelSelfIdentityResolver = () => {
+    if (selfUserId === null) return null
+    return {
+      id: selfUserId,
+      ...(selfNickname !== null && selfNickname !== '' ? { username: selfNickname } : {}),
+    }
+  }
 
   const formatChannelTag = async (workspace: string, chat: string): Promise<string> => {
     const names = await channelResolver
@@ -405,6 +513,10 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     logger,
     formatChannelTag,
   })
+  const reactionCallback = createKakaoReactionCallback(client)
+  const editMessageCallback = createKakaoEditMessageCallback(client)
+  const reactionSupported = typeof client.acquireSession === 'function'
+  const editSupported = typeof client.acquireSession === 'function'
 
   const typing = createKakaoTypingCallback({
     logger,
@@ -545,6 +657,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       try {
         const profile = await client.getProfile()
         selfUserId = profile.user_id
+        selfNickname = profile.nickname
         logger.info(`[kakaotalk] authenticated as ${profile.nickname || profile.user_id} (${profile.user_id})`)
       } catch (err) {
         started = false
@@ -680,12 +793,15 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       // unregisters in the inverse order.
       options.router.registerOutbound('kakaotalk', outboundCallback)
       options.router.registerTyping('kakaotalk', typing.callback)
+      if (reactionSupported) options.router.registerReaction('kakaotalk', reactionCallback)
+      if (editSupported) options.router.registerEditMessage('kakaotalk', editMessageCallback)
       options.router.setTypingCapability('kakaotalk', true)
       // KakaoTalk expires the indicator ~5s after the last packet, faster than
       // the default 8s heartbeat, so the router paces our refresh at 4s and the
       // callback holds no timer of its own.
       options.router.setTypingHeartbeatInterval('kakaotalk', KAKAO_TYPING_HEARTBEAT_MS)
       options.router.registerChannelNameResolver('kakaotalk', channelResolver.resolve)
+      options.router.registerSelfIdentity('kakaotalk', selfIdentityResolver)
       options.router.registerHistory('kakaotalk', historyCallback)
       options.router.registerFetchAttachment('kakaotalk', fetchAttachmentCallback)
       options.router.registerMembership('kakaotalk', membershipResolver)
@@ -696,9 +812,12 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       started = false
       options.router.unregisterOutbound('kakaotalk', outboundCallback)
       options.router.unregisterTyping('kakaotalk', typing.callback)
+      if (editSupported) options.router.unregisterEditMessage('kakaotalk', editMessageCallback)
+      if (reactionSupported) options.router.unregisterReaction('kakaotalk', reactionCallback)
       options.router.setTypingCapability('kakaotalk', false)
       typing.reset()
       options.router.unregisterChannelNameResolver('kakaotalk', channelResolver.resolve)
+      options.router.unregisterSelfIdentity('kakaotalk', selfIdentityResolver)
       options.router.unregisterHistory('kakaotalk', historyCallback)
       options.router.unregisterFetchAttachment('kakaotalk', fetchAttachmentCallback)
       options.router.unregisterMembership('kakaotalk', membershipResolver)
@@ -716,6 +835,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
         // session is gone either way and there's nothing to recover.
       }
       selfUserId = null
+      selfNickname = null
       connected = false
       lastConnectedAt = null
       resetRecoveryEpisode()
