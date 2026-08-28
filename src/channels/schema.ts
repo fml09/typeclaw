@@ -187,10 +187,14 @@ const postReplyReactionSchema = z.object({
 })
 // Runtime-owned progress message settings. When enabled, the router creates
 // one short status message after generation starts and edits that same
-// bot-authored message for safe lifecycle phases and the final reply.
+// bot-authored message for safe lifecycle phases and the final reply. With
+// `toolLog` (default on), the most recent tool executions render as name-only
+// `· <tool>` lines under the phase so the chat can watch the work happen;
+// tool arguments and results never cross the boundary.
 const progressSchema = z.object({
   enabled: z.boolean().default(false),
   updateIntervalMs: z.number().int().min(250).max(10_000).default(750),
+  toolLog: z.boolean().optional(),
   startReaction: z.string().trim().min(1).max(32).optional(),
   successReaction: z.string().trim().min(1).max(32).optional(),
   errorReaction: z.string().trim().min(1).max(32).optional(),

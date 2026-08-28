@@ -71,10 +71,15 @@ message only after generation produces a progress event, coalesces repeated
 events into coarse safe labels, and edits that same message with the terminal
 `channel_reply`. Raw model thinking is never forwarded to a channel.
 
-`progress.updateIntervalMs` limits intermediate edits. `startReaction`,
-`successReaction`, and `errorReaction` optionally define the reaction lifecycle
-on the triggering inbound. An adapter may reject a vocabulary item as
-unsupported; this never blocks the reply.
+`progress.updateIntervalMs` limits intermediate edits. Failed edits retry with
+exponential backoff (1.5s base, doubling to a 12s cap, ±25% jitter) so a
+rate-limiting adapter is not hammered. `progress.toolLog` (default on) renders
+the most recent tool executions as name-only `· <tool>` lines under the phase
+label, Hermes-style, so the chat can watch the work happen; tool arguments and
+results never cross the channel boundary. `startReaction`, `successReaction`,
+and `errorReaction` optionally define the reaction lifecycle on the triggering
+inbound. An adapter may reject a vocabulary item as unsupported; this never
+blocks the reply.
 
 KakaoTalk's current Android/tablet `dtype=2` credential does not register the
 legacy `ACTION` reaction callback after a live status-0/no-visible-effect

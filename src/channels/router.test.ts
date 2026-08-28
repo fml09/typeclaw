@@ -2907,7 +2907,7 @@ describe('ChannelRouter runtime progress', () => {
 
     await waitFor(() => edits.includes('final answer'))
     expect(outbound).toHaveLength(1)
-    expect(outbound[0]?.text).toBe('Processing…')
+    expect(outbound[0]?.text).toBe('⏳ Processing…')
     // The final reply replaces the pending phase text in one paced edit.
     expect(edits).toEqual(['final answer'])
     expect(reactionEvents).toEqual(['add:eyes', 'remove', 'add:white_check_mark'])
@@ -2969,7 +2969,7 @@ describe('ChannelRouter runtime progress', () => {
 
     await waitFor(() => outbound.length >= 2)
 
-    expect(outbound.map((message) => message.text)).toEqual(['Processing…', 'first final'])
+    expect(outbound.map((message) => message.text)).toEqual(['⏳ Processing…', 'first final'])
 
     await router.route(
       inbound({
@@ -2982,7 +2982,7 @@ describe('ChannelRouter runtime progress', () => {
     await router.__testing!.flushDebounce(key)
     await waitFor(() => edits.includes('second final'))
 
-    expect(outbound.map((message) => message.text)).toEqual(['Processing…', 'first final', 'Processing…'])
+    expect(outbound.map((message) => message.text)).toEqual(['⏳ Processing…', 'first final', '⏳ Processing…'])
     expect(edits).toContain('second final')
     await router.stop()
   })
@@ -3055,6 +3055,61 @@ describe('ChannelRouter runtime progress', () => {
     expect(reactionEvents).toEqual(['add:like', 'remove', 'add:like'])
     await router.stop()
   })
+  test('does not tombstone the leftover progress bubble into a trailing "Done." after a delivered reply', async () => {
+    // Production shape (Kakao, 2026-08-28): the model delivers an ack through
+    // the progress bubble (more_work status edit), then ends the turn. The ack
+    // IS the delivered reply, so the leftover bubble must keep showing the ack
+    // text — Kakao surfaces every MODIFYMSG as a message event, and the trailing
+    // "Done." tombstone read as a spurious extra bubble after the answer.
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      progress: { enabled: true, updateIntervalMs: 50 },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const edits: string[] = []
+    router.registerOutbound('kakaotalk', async () => {
+      return { ok: true, messageId: 'progress-message', messageIds: ['progress-message'] }
+    })
+    router.registerEditMessage('kakaotalk', async (request) => {
+      edits.push(request.text)
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '안녕',
+        externalMessageId: 'kakao-inbound',
+        isDm: true,
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
+      })
+      sessions[0]!.setAssistantText('NO_REPLY')
+      const reply = createChannelReplyTool({ router, origin: key })
+      await reply.execute(
+        'ack-call',
+        { text: '확인해볼게요', more_work_this_turn: true },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+    }
+    await router.__testing!.flushDebounce(key)
+    await waitFor(() => edits.includes('확인해볼게요'))
+
+    // The ack status edit landed and the turn ended. No trailing "Done." (or
+    // failure) tombstone may fire after the delivered reply.
+    expect(edits).toContain('확인해볼게요')
+    expect(edits).not.toContain('Done.')
+    expect(edits.some((text) => text.startsWith('⚠️'))).toBe(false)
+    await router.stop()
+  })
   test('does not send terminal progress reactions when progress is disabled', async () => {
     const dir = await tempDir()
     const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
@@ -3107,6 +3162,122 @@ describe('ChannelRouter runtime progress', () => {
     await waitFor(() => outbound.length === 1)
     expect(outbound[0]?.text).toBe('final answer')
     expect(reactionEvents).toEqual([])
+    await router.stop()
+  })
+  test('streams a bounded Hermes-style tool log under the progress phase', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      progress: { enabled: true, updateIntervalMs: 50 },
+    }
+    // makeRouter freezes `now` at nowRef.value; the edit scheduler defers via
+    // real timers until `now` advances past the pacing gap, so the poll below
+    // drives the fake clock forward until each scheduled edit becomes due.
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { config, nowRef })
+    const edits: string[] = []
+    router.registerOutbound('kakaotalk', async () => {
+      return { ok: true, messageId: 'progress-message', messageIds: ['progress-message'] }
+    })
+    router.registerEditMessage('kakaotalk', async (request) => {
+      edits.push(request.text)
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '조사해줘',
+        externalMessageId: 'kakao-inbound',
+        isDm: true,
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.emit({ type: 'tool_execution_start', toolName: 'bash', args: { command: 'bun test' } })
+      await waitFor(() => {
+        nowRef.value += 100
+        return edits.includes('🛠️ Working…\n· bash')
+      })
+      sessions[0]!.emit({ type: 'tool_execution_start', toolName: 'grep', args: { pattern: 'progress' } })
+      await waitFor(() => {
+        nowRef.value += 100
+        return edits.includes('🛠️ Working…\n· bash\n· grep')
+      })
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
+      })
+      sessions[0]!.setAssistantText('final answer')
+      const reply = createChannelReplyTool({ router, origin: key })
+      await reply.execute(
+        'reply-call',
+        { text: 'final answer', more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+    }
+    await router.__testing!.flushDebounce(key)
+    await waitFor(() => {
+      nowRef.value += 100
+      return edits.includes('final answer')
+    })
+
+    // The log carries tool NAMES only — never args or results.
+    const logEdits = edits.filter((text) => text.startsWith('🛠️ Working…'))
+    expect(logEdits.length).toBeGreaterThanOrEqual(2)
+    expect(logEdits[0]).toBe('🛠️ Working…\n· bash')
+    expect(logEdits.at(-1)).toBe('🛠️ Working…\n· bash\n· grep')
+    expect(edits.at(-1)).toBe('final answer')
+    expect(edits.some((text) => text.includes('bun test') || text.includes('progress'))).toBe(false)
+    await router.stop()
+  })
+  test('toolLog: false keeps the progress bubble phase-only', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      progress: { enabled: true, updateIntervalMs: 50, toolLog: false },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const edits: string[] = []
+    router.registerOutbound('kakaotalk', async () => {
+      return { ok: true, messageId: 'progress-message', messageIds: ['progress-message'] }
+    })
+    router.registerEditMessage('kakaotalk', async (request) => {
+      edits.push(request.text)
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '조사해줘',
+        externalMessageId: 'kakao-inbound',
+        isDm: true,
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.emit({ type: 'tool_execution_start', toolName: 'bash', args: { command: 'bun test' } })
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
+      })
+      sessions[0]!.setAssistantText('final answer')
+      const reply = createChannelReplyTool({ router, origin: key })
+      await reply.execute(
+        'reply-call',
+        { text: 'final answer', more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+    }
+    await router.__testing!.flushDebounce(key)
+    await waitFor(() => edits.includes('final answer'))
+
+    expect(edits.some((text) => text.includes('· bash'))).toBe(false)
     await router.stop()
   })
 })

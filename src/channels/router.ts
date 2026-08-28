@@ -86,7 +86,14 @@ import {
   saveChannelSessions,
   type ChannelSessionRecord,
 } from './persistence'
-import { CHANNEL_PROGRESS_FAILURE_TEXT, CHANNEL_PROGRESS_INITIAL_TEXT, progressTextForEvent } from './progress'
+import {
+  CHANNEL_PROGRESS_FAILURE_TEXT,
+  CHANNEL_PROGRESS_INITIAL_TEXT,
+  progressEditRetryDelayMs,
+  progressTextForEvent,
+  renderProgressText,
+  toolNameForEvent,
+} from './progress'
 import {
   ADAPTER_READ_CAPABILITIES,
   ADAPTER_WRITE_CAPABILITIES,
@@ -849,7 +856,7 @@ type ProgressMessageState = {
 // Kakao's MODIFYMSG rate-limits back-to-back edits (-303) and drops the
 // socket entirely on tighter bursts. Never issue a progress edit sooner than
 // this long after the previous one.
-const PROGRESS_EDIT_MIN_GAP_MS = 1200
+const PROGRESS_EDIT_MIN_GAP_MS = 1500
 // One transient edit failure (rate-limit blip, in-flight reconnect) must not
 // kill progress for the session's lifetime; latch only after repeated misses.
 const PROGRESS_EDIT_MAX_CONSECUTIVE_FAILURES = 3
@@ -995,6 +1002,10 @@ type LiveSession = {
   // fall back to a new post while it is disabled.
   progressDisabled: boolean
   progressEditFailures: number
+  // Hermes-style rolling work log for the progress bubble: names of the most
+  // recent tool executions this prompt, rendered as `· <tool>` lines under the
+  // phase text. Reset at every prompt start; bounded to the render window.
+  progressToolLog: string[]
   // Model-requested `channel_react` reactions for THIS turn, held until the turn
   // ends. Flushed to the adapter only if the agent actually replied this turn;
   // discarded on silence (skip_response / empty / errored turns) so the bot never
@@ -2528,6 +2539,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         progressPendingText: null,
         progressDisabled: false,
         progressEditFailures: 0,
+        progressToolLog: [],
         pendingTurnReactions: [],
         silentAckTurn: null,
         activeSilentAckReactions: [],
@@ -3020,7 +3032,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.progressMessage !== state || live.progressDisabled || state.pendingText === null) return
     if (state.editInFlight !== null || state.editTimer !== null) return
     const intervalMs = progressConfigFor(live)?.updateIntervalMs ?? 750
-    const waitMs = Math.max(0, intervalMs - (now() - state.lastEditAt))
+    // Failed edits back off exponentially (1.5s → 3s → …) with jitter so a
+    // flaky Kakao window never hammers the MODIFYMSG limiter; successful
+    // pacing stays on the configured interval.
+    const waitMs =
+      live.progressEditFailures > 0
+        ? Math.max(0, progressEditRetryDelayMs(live.progressEditFailures) - (now() - state.lastEditAt))
+        : Math.max(0, intervalMs - (now() - state.lastEditAt))
     if (waitMs > 0) {
       state.editTimer = setTimeout(() => {
         state.editTimer = null
@@ -3088,11 +3106,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     scheduleProgressEdit(live, state)
   }
 
+  const progressToolLogEnabledFor = (live: LiveSession): boolean => progressConfigFor(live)?.toolLog !== false
+
   const subscribeProgressActivity = (session: AgentSession, live: LiveSession): (() => void) =>
     session.subscribe((event: unknown) => {
       if (!live.promptInFlight || live.destroyed) return
-      const text = progressTextForEvent(event)
-      if (text !== null) requestProgressUpdate(live, text)
+      const toolName = progressToolLogEnabledFor(live) ? toolNameForEvent(event) : null
+      if (toolName !== null) {
+        live.progressToolLog.push(toolName)
+        if (live.progressToolLog.length > 4) live.progressToolLog.shift()
+      }
+      const phase = progressTextForEvent(event)
+      if (phase !== null) requestProgressUpdate(live, renderProgressText(phase, live.progressToolLog))
     })
 
   const flushProgressEditNow = async (live: LiveSession, state: ProgressMessageState): Promise<boolean> => {
@@ -3932,6 +3957,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const promptText = retrievalContext.results.length > 0 ? `${text}\n\n${retrievalContext.results}` : text
         applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
         live.promptInFlight = true
+        live.progressToolLog = []
         try {
           const result = await promptPersistentTurnWithFallback({
             refs: resolveFallbackChain(getConfig().models, undefined),
@@ -4054,7 +4080,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             !retryQueuedThisTurn &&
             (providerErrorThisTurn || live.emptyTurnFallbackTurn === live.turnSeq)
           if (!retryQueuedThisTurn && (live.progressMessage !== null || live.progressStartPromise !== null)) {
-            await finishProgressMessage(live, usableReplyThisTurn ? 'Done.' : CHANNEL_PROGRESS_FAILURE_TEXT)
+            // A turn that delivered a real reply must not ALSO surface the leftover
+            // progress bubble as a trailing "Done." message: the reply itself is the
+            // completion signal, and on Kakao every MODIFYMSG lands as a fresh
+            // message event, so the tombstone reads as a spurious extra bubble
+            // after the answer. Release the state silently — the bubble keeps
+            // showing the last phase (or the ack text it was edited to) — and
+            // reserve the failure text for turns that genuinely produced nothing.
+            if (usableReplyThisTurn) {
+              if (live.progressMessage?.editTimer !== null && live.progressMessage?.editTimer !== undefined) {
+                clearTimeout(live.progressMessage.editTimer)
+              }
+              live.progressMessage = null
+              live.progressPendingText = null
+            } else {
+              await finishProgressMessage(live, CHANNEL_PROGRESS_FAILURE_TEXT)
+            }
           }
           const postReplyReaction = options.configForAdapter(live.key.adapter)?.postReplyReaction
           const automaticReactionRef = live.currentTurnReactionRef
