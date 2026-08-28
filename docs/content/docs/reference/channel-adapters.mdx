@@ -168,13 +168,14 @@ Editing is opt-in per adapter, mirroring `ADAPTER_WRITE_CAPABILITIES` in `src/ch
 | `discord-bot`  |      yes       | `PATCH .../messages/{id}`                                              |
 | `telegram-bot` |      yes       | `editMessageText`                                                      |
 | `webex`        |      yes       | `PUT /messages/{id}`                                                   |
-| `kakaotalk`    |     yes\*      | `REWRITE` (current sub-device `dtype=2` session returns status `-203`) |
+| `kakaotalk`    |     yes\*      | `MODIFYMSG` (text edits; omit `extra` for the default text packet)      |
 | every other    |       no       | —                                                                      |
 
-`kakaotalk` is marked `yes*` because the adapter exposes the edit callback, but
-the current production sub-device session returns `-203` for `REWRITE`. The
-GitOps deployment keeps runtime progress disabled until a compatible edit path
-is verified.
+`kakaotalk` is marked `yes*` because the adapter exposes the edit callback and
+the test account accepted the exact `MODIFYMSG` text packet with status `0`.
+The default text path must omit `extra` (`extra: "{}"` returned `-303`), and
+the GitOps deployment keeps progress disabled until the replacement is
+visually confirmed in KakaoTalk.
 
 The five adapters that don't support editing are `discord` (user), `github`, `instagram`, `line`, and `teams` — their SDKs expose no edit primitive.
 
