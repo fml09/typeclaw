@@ -97,7 +97,7 @@ class FakeClient implements KakaoTalkClient {
     reaction_type: 1,
   }
   editMessageCalls: Array<{ chatId: string; logId: string; text: string }> = []
-  editMessageResult = { success: true, status_code: 0, chat_id: '111', log_id: 'L1' }
+  editMessageResult = { success: true, status_code: 0, chat_id: '111', log_id: 'L1', message: '' }
   profileResult: KakaoProfile = {
     user_id: '999',
     nickname: 'Self',
@@ -872,7 +872,7 @@ describe('KakaoTalk mutation callbacks', () => {
 
   test('surfaces a known MODIFYMSG limitation as not-supported', async () => {
     const client = new FakeClient()
-    client.editMessageResult = { success: false, status_code: -203, chat_id: '111', log_id: '42' }
+    client.editMessageResult = { success: false, status_code: -203, chat_id: '111', log_id: '42', message: 'edited' }
     const callback = createKakaoEditMessageCallback(client)
 
     const result = await callback({
