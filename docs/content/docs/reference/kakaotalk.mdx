@@ -97,17 +97,17 @@ and its persisted history before enabling progress.
 
 ## Capabilities
 
-| Feature                 | Supported | Notes                                                                                                                              |
-| ----------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Outbound messages       | yes       |                                                                                                                                    |
-| Reactions               | limited   | Legacy LOCO `ACTION`; only verified for the macOS-compatible path; Android/tablet dtype=2 is disabled pending `REACT` verification |
+| Feature                 | Supported | Notes                                                                                                                                                 |
+| ----------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Outbound messages       | yes       |                                                                                                                                                       |
+| Reactions               | limited   | Legacy LOCO `ACTION`; only verified for the macOS-compatible path; Android/tablet dtype=2 is disabled pending `REACT` verification                    |
 | Message editing         | limited   | LOCO `MODIFYMSG`; the current raw test account accepted text edits with status `0`, but a fresh `android-main` credential still requires verification |
-| Typing indicator        | DM/group  | Animated "…" composing dots via the sub-device LOCO session; **not** OpenChat (see below)                                          |
-| Channel-name resolution | yes       |                                                                                                                                    |
-| Self identity           | yes       | Resolved from the authenticated `getProfile()` `user_id` and nickname                                                              |
-| History                 | yes       | Limit 200 messages                                                                                                                 |
-| Attachments             | yes       | Files sent before text; no combined text+file send in one call                                                                     |
-| Membership              | no        |                                                                                                                                    |
+| Typing indicator        | DM/group  | Animated "…" composing dots via the sub-device LOCO session; **not** OpenChat (see below)                                                             |
+| Channel-name resolution | yes       |                                                                                                                                                       |
+| Self identity           | yes       | Resolved from the authenticated `getProfile()` `user_id` and nickname                                                                                 |
+| History                 | yes       | Limit 200 messages                                                                                                                                    |
+| Attachments             | yes       | Files sent before text; no combined text+file send in one call                                                                                        |
+| Membership              | no        |                                                                                                                                                       |
 
 ## Token renewal
 
