@@ -80,21 +80,25 @@ function isAttachmentInputArray(
 class FakeClient implements KakaoTalkClient {
   loginCalls = 0
   sendMessageCalls: Array<{ chatId: string; text: string; replyTo?: KakaoReplyTarget }> = []
-  addReactionCalls: Array<{ chatId: string; logId: string; reactionType: number }> = []
+  addReactionCalls: Array<{ chatId: string; logId: string; reactionId: string }> = []
   addReactionResult = {
     success: true,
     status_code: 0,
     chat_id: '111',
     log_id: 'L1',
-    reaction_type: 1,
+    reaction_id: '1200282_026',
+    action: 'add' as const,
+    revision: '1',
   }
-  removeReactionCalls: Array<{ chatId: string; logId: string; reactionType: number }> = []
+  removeReactionCalls: Array<{ chatId: string; logId: string; reactionId: string }> = []
   removeReactionResult = {
     success: true,
     status_code: 0,
     chat_id: '111',
     log_id: 'L1',
-    reaction_type: 1,
+    reaction_id: '1200282_026',
+    action: 'remove' as const,
+    revision: '2',
   }
   editMessageCalls: Array<{ chatId: string; logId: string; text: string }> = []
   editMessageResult = { success: true, status_code: 0, chat_id: '111', log_id: 'L1', message: '' }
@@ -153,12 +157,12 @@ class FakeClient implements KakaoTalkClient {
     })
     return this.sendResult
   }
-  async addReaction(chatId: string, logId: string, reactionType: number) {
-    this.addReactionCalls.push({ chatId, logId, reactionType })
+  async addReaction(chatId: string, logId: string, reactionId: string) {
+    this.addReactionCalls.push({ chatId, logId, reactionId })
     return this.addReactionResult
   }
-  async removeReaction(chatId: string, logId: string, reactionType: number) {
-    this.removeReactionCalls.push({ chatId, logId, reactionType })
+  async removeReaction(chatId: string, logId: string, reactionId: string) {
+    this.removeReactionCalls.push({ chatId, logId, reactionId })
     return this.removeReactionResult
   }
 
@@ -581,8 +585,8 @@ describe('createKakaotalkAdapter — start/stop lifecycle', () => {
     await router.stop()
   })
 })
-describe('createKakaotalkAdapter — legacy reaction capability', () => {
-  test('does not register ACTION reactions for an Android/tablet credential', async () => {
+describe('createKakaotalkAdapter — HTTP reaction capability', () => {
+  test('registers HTTP reactions regardless of the device profile', async () => {
     const client = new FakeClient()
     const listener = new FakeListener()
     const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
@@ -622,9 +626,9 @@ describe('createKakaotalkAdapter — legacy reaction capability', () => {
     })
 
     await adapter.start()
-    expect(reactionRegistered).toBe(false)
-    expect(removeReactionRegistered).toBe(false)
-    expect(logs).toContain('[kakaotalk] legacy ACTION reactions=disabled device_type=tablet')
+    expect(reactionRegistered).toBe(true)
+    expect(removeReactionRegistered).toBe(true)
+    expect(logs).toContain('[kakaotalk] HTTP reactions=enabled')
 
     await adapter.stop()
     await router.stop()
@@ -746,7 +750,7 @@ describe('KakaoTalk mutation callbacks', () => {
     value: JSON.stringify({ chatId: '111', logId: '42' }),
   }
 
-  test('maps the supported like aliases to the ACTION reaction type', async () => {
+  test('maps the supported like aliases to the verified HTTP reaction ID', async () => {
     const client = new FakeClient()
     const logs: string[] = []
     const callback = createKakaoReactionCallback(client, new Set(), {
@@ -767,11 +771,13 @@ describe('KakaoTalk mutation callbacks', () => {
       ok: true,
       reactionRef: {
         adapter: 'kakaotalk',
-        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionType: 1 }),
+        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionId: '1200282_026' }),
       },
     })
-    expect(client.addReactionCalls).toEqual([{ chatId: '111', logId: '42', reactionType: 1 }])
-    expect(logs).toContain('[kakaotalk] reaction-add chat=111 log_id=42 type=1 success=true status_code=0')
+    expect(client.addReactionCalls).toEqual([{ chatId: '111', logId: '42', reactionId: '1200282_026' }])
+    expect(logs).toContain(
+      '[kakaotalk] reaction-add chat=111 log_id=42 reaction=1200282_026 success=true status_code=0',
+    )
   })
   test('removes only a reaction ref previously returned by the add callback', async () => {
     const client = new FakeClient()
@@ -784,12 +790,12 @@ describe('KakaoTalk mutation callbacks', () => {
       thread: null,
       reactionRef: {
         adapter: 'kakaotalk',
-        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionType: 1 }),
+        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionId: '1200282_026' }),
       },
     })
 
     expect(result).toEqual({ ok: true })
-    expect(client.removeReactionCalls).toEqual([{ chatId: '111', logId: '42', reactionType: 1 }])
+    expect(client.removeReactionCalls).toEqual([{ chatId: '111', logId: '42', reactionId: '1200282_026' }])
   })
 
   test('rejects a raw target ref for reaction removal', async () => {
@@ -811,7 +817,7 @@ describe('KakaoTalk mutation callbacks', () => {
     })
     expect(client.removeReactionCalls).toEqual([])
   })
-  test('rejects a removal ref containing an unverified reaction type', async () => {
+  test('rejects a removal ref containing an unverified reaction ID', async () => {
     const client = new FakeClient()
     const callback = createKakaoRemoveReactionCallback(client)
 
@@ -822,19 +828,19 @@ describe('KakaoTalk mutation callbacks', () => {
       thread: null,
       reactionRef: {
         adapter: 'kakaotalk',
-        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionType: 2 }),
+        value: JSON.stringify({ op: 'remove', chatId: '111', logId: '42', reactionId: '999999_999' }),
       },
     })
 
     expect(result).toEqual({
       ok: false,
-      error: 'KakaoTalk reaction removal supports only the verified like reaction',
+      error: 'KakaoTalk reaction removal supports only the verified like, eyes, heart, and laugh reactions',
       code: 'unsupported',
     })
     expect(client.removeReactionCalls).toEqual([])
   })
 
-  test('rejects unverified KakaoTalk reaction names instead of guessing a type', async () => {
+  test('rejects unverified KakaoTalk reaction names instead of guessing an ID', async () => {
     const callback = createKakaoReactionCallback(new FakeClient())
 
     const result = await callback({
@@ -848,7 +854,8 @@ describe('KakaoTalk mutation callbacks', () => {
 
     expect(result).toEqual({
       ok: false,
-      error: 'KakaoTalk currently supports only the like reaction (`like`, `+1`, `thumbsup`, or `👍`)',
+      error:
+        'KakaoTalk currently supports only the like, eyes, heart, and laugh reactions (`like`/`+1`/`👍`, `eyes`/`👀`, `heart`/`❤️`, `laugh`/`😂`)',
       code: 'unsupported',
     })
   })

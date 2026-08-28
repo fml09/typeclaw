@@ -379,7 +379,7 @@ describe('renderSessionOrigin', () => {
     },
   )
 
-  test('KakaoTalk reaction guidance names its verified like-only vocabulary', () => {
+  test('KakaoTalk reaction guidance names its verified reaction vocabulary', () => {
     const out = renderSessionOrigin({
       kind: 'channel',
       adapter: 'kakaotalk',
@@ -390,7 +390,7 @@ describe('renderSessionOrigin', () => {
     })
 
     expect(out).toMatch(/React like a teammate/i)
-    expect(out).toMatch(/KakaoTalk currently supports only `like`/i)
+    expect(out).toMatch(/only `like` .+ `eyes` .+ `heart` .+ `laugh`/is)
     expect(out).not.toMatch(/`rocket`/)
   })
 

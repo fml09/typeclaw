@@ -22,7 +22,10 @@ export const findEntryTool = defineTool({
   // `path` is a real local file this tool reads; declaring it pins an immutable
   // snapshot before readFile (and restores the original path in the result)
   // instead of the scanner rejecting the bare `sessions/...jsonl` path.
-  fileOperands: { input: ['path'] },
+  fileOperands: {
+    input: ['path'],
+    nonFile: ['entryId'],
+  },
   async execute({ path, entryId }) {
     if (entryId.length === 0) {
       throw new Error('find_entry requires a non-empty entryId; an empty needle would match every line.')
