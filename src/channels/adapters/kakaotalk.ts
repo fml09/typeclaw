@@ -493,8 +493,8 @@ export function createKakaoEditMessageCallback(
       if (result.success) return { ok: true }
       return {
         ok: false,
-        error: `KakaoTalk REWRITE failed with status ${result.status_code}`,
-        code: result.status_code === -203 ? 'not-supported' : 'not-found',
+        error: `KakaoTalk MODIFYMSG failed with status ${result.status_code}`,
+        code: result.status_code === -203 || result.status_code === -303 ? 'not-supported' : 'not-found',
       }
     } catch (err) {
       logger?.info(`[kakaotalk] message-edit threw chat=${req.chat} log_id=${req.messageId}: ${describeError(err)}`)

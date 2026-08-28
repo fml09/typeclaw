@@ -853,7 +853,7 @@ describe('KakaoTalk mutation callbacks', () => {
     })
   })
 
-  test('passes the message target and replacement text to REWRITE', async () => {
+  test('passes the message target and replacement text to MODIFYMSG', async () => {
     const client = new FakeClient()
     const callback = createKakaoEditMessageCallback(client)
 
@@ -870,7 +870,7 @@ describe('KakaoTalk mutation callbacks', () => {
     expect(client.editMessageCalls).toEqual([{ chatId: '111', logId: '42', text: 'edited' }])
   })
 
-  test('surfaces the known macOS REWRITE limitation as not-supported', async () => {
+  test('surfaces a known MODIFYMSG limitation as not-supported', async () => {
     const client = new FakeClient()
     client.editMessageResult = { success: false, status_code: -203, chat_id: '111', log_id: '42' }
     const callback = createKakaoEditMessageCallback(client)
@@ -886,7 +886,7 @@ describe('KakaoTalk mutation callbacks', () => {
 
     expect(result).toEqual({
       ok: false,
-      error: 'KakaoTalk REWRITE failed with status -203',
+      error: 'KakaoTalk MODIFYMSG failed with status -203',
       code: 'not-supported',
     })
   })
