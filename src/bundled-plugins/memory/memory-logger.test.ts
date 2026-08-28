@@ -6,7 +6,8 @@ import { join } from 'node:path'
 import type { RunSession, SubagentContext } from '@/plugin'
 import { formatLocalDate } from '@/shared'
 
-import { appendTool } from './append-tool'
+import { advanceWatermarkTool, appendTool } from './append-tool'
+import { findEntryTool } from './find-entry-tool'
 import {
   createMemoryLoggerSubagent,
   isMemoryLoggerPayload,
@@ -372,6 +373,10 @@ describe('memoryLoggerSubagent', () => {
     expect(descriptions.some((d) => d.includes('Append a memory fragment'))).toBe(true)
     expect(descriptions.some((d) => d.includes('Advance the daily-stream watermark'))).toBe(true)
     expect(descriptions.some((d) => d.includes('store_reference'))).toBe(true)
+  })
+  test('declares transcript and session identifiers as non-file operands', () => {
+    expect(findEntryTool.fileOperands).toEqual({ input: ['path'], nonFile: ['entryId'] })
+    expect(advanceWatermarkTool.fileOperands).toEqual({ nonFile: ['source', 'latestEntryId'] })
   })
 
   test('declares a defensive tool-result byte budget on the read tool so a malfunctioning find_entry cannot cause unbounded chunked reads', () => {

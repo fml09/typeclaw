@@ -115,8 +115,38 @@ describe('private-surface-read guard — fail-closed across ALL tools (not a whi
     expect(result?.reason).toMatch(/memory/)
     expect(result?.reason).not.toMatch(/internal guard error/i)
   })
+  test('does not fail closed when a plugin prose value exceeds one Linux filename component', () => {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-private-long-prose-')))
+    const longProse = '한국어 자연어 메시지 '.repeat(40)
+    const inaccessible = path.resolve(agentDir, longProse)
+    const error = Object.assign(new Error('name too long'), { code: 'ENAMETOOLONG' })
+    const internalErrors: unknown[] = []
 
-  for (const code of ['ELOOP', 'ENOTDIR', 'EPERM', 'ENAMETOOLONG', 'EIO']) {
+    const result = checkPrivateSurfaceReadGuard(
+      {
+        tool: 'memory-logger_append',
+        args: { body: longProse },
+        agentDir,
+        hidden: privilegedHidden,
+        fileOperands: { nonFile: ['body'] },
+        toolProvenance: 'plugin',
+      },
+      {
+        realpathNative(candidate) {
+          if (candidate === inaccessible) throw error
+          return realpathSync.native(candidate)
+        },
+        onInternalError: (thrown) => internalErrors.push(thrown),
+      },
+    )
+
+    expect(result).toBeUndefined()
+    expect(internalErrors).toEqual([])
+  })
+
+  // Other realpath failures remain fail-closed. ENAMETOOLONG is handled by the
+  // deny-list-specific ancestor recovery test above.
+  for (const code of ['ELOOP', 'ENOTDIR', 'EPERM', 'EIO']) {
     test(`blocks with a generic reason when realpathSync.native reports ${code}`, () => {
       // Must resolve like the guard does: a POSIX literal would not match on Windows.
       const inaccessible = path.resolve(AGENT, 'public/protected.md')
@@ -665,6 +695,29 @@ describe('private-surface-read guard — symlink bypass defense', () => {
       hidden,
     })
     expect(result?.block).toBe(true)
+  })
+  test('keeps a hidden symlink blocked when an overlong tail cannot be realpathed', () => {
+    const { agentDir, hidden } = makeAgentWithSymlinks()
+    const longTail = 'x'.repeat(300)
+    const candidate = path.join(agentDir, 'public', 'mem-link', longTail)
+    const error = Object.assign(new Error('name too long'), { code: 'ENAMETOOLONG' })
+    const internalErrors: unknown[] = []
+
+    const result = checkPrivateSurfaceReadGuard(
+      { tool: 'read', args: { path: candidate }, agentDir, hidden },
+      {
+        realpathNative(value) {
+          if (value === candidate) throw error
+          return realpathSync.native(value)
+        },
+        onInternalError: (thrown) => internalErrors.push(thrown),
+      },
+    )
+
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toMatch(/memory/)
+    expect(result?.reason).not.toMatch(/internal guard error/i)
+    expect(internalErrors).toEqual([])
   })
 
   test('blocks the symlink via a NESTED arg shape (look_at images[].path)', () => {

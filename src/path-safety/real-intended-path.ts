@@ -24,6 +24,16 @@ export const RECOVER_MISSING: ReadonlySet<string> = new Set(['ENOENT'])
 // the denied surface after rejoining: a masked directory still matches lexically and
 // still blocks. It is NOT sound for an allowlist — see RECOVER_MISSING.
 export const RECOVER_MISSING_OR_UNSEARCHABLE: ReadonlySet<string> = new Set(['ENOENT', 'EACCES'])
+// Deny-list canonicalization may also recover from ENAMETOOLONG. An overlong
+// component cannot name a reachable filesystem entry as written, so retreating
+// to the nearest resolvable ancestor and reattaching the tail is sound. This
+// still resolves every existing prefix (including planted symlinks). Keep this
+// separate from RECOVER_MISSING_OR_UNSEARCHABLE: allow-list callers must remain
+// strict and fail on ENAMETOOLONG.
+export const RECOVER_MISSING_OR_UNSEARCHABLE_OR_TOO_LONG: ReadonlySet<string> = new Set([
+  ...RECOVER_MISSING_OR_UNSEARCHABLE,
+  'ENAMETOOLONG',
+])
 
 export type RealIntendedPathOptions = {
   // Defaults to RECOVER_MISSING: callers must opt in to the broader set.

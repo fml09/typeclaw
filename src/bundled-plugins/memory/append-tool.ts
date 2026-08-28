@@ -237,6 +237,9 @@ export const advanceWatermarkTool = defineTool({
     source: z.string().min(1),
     latestEntryId: z.string().min(1),
   }),
+  // Both values are session/entry identifiers; neither is dereferenced as a
+  // caller-selected local path.
+  fileOperands: { nonFile: ['source', 'latestEntryId'] },
   async execute({ source, latestEntryId }, ctx) {
     const streamPath = dailyStreamPath(ctx.agentDir)
     const watermarkId = newEventId()
