@@ -4,7 +4,6 @@ import {
   KakaoCredentialManager,
   KakaoTalkClient as RealKakaoTalkClient,
   KakaoTalkListener as RealKakaoTalkListener,
-  KAKAO_REACTION_TYPE,
   type KakaoDeviceType,
   type AttachmentInput,
   type KakaoChat,
@@ -72,8 +71,8 @@ export type KakaoPushPacket = {
 // fakes satisfy it without inheriting private state. The cast on the const
 // below bridges the runtime class onto this interface.
 export interface KakaoTalkClient {
-  addReaction: (chatId: string, logId: string, reactionType: number) => Promise<KakaoReactionResult>
-  removeReaction: (chatId: string, logId: string, reactionType: number) => Promise<KakaoReactionResult>
+  addReaction: (chatId: string, logId: string, reactionId: string) => Promise<KakaoReactionResult>
+  removeReaction: (chatId: string, logId: string, reactionId: string) => Promise<KakaoReactionResult>
   editMessage: (chatId: string, logId: string, text: string) => Promise<KakaoEditResult>
   login(
     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: KakaoDeviceType },
@@ -313,13 +312,26 @@ type KakaoReactionTarget = {
   logId: string
 }
 
+// Verified emoticon-pack reaction IDs for the HTTP reaction endpoint
+// (talk-pilsner /emoticon/chat/rx). Live-verified add+remove on the test
+// account 2026-08-28; integer reaction values are rejected with HTTP 400, so
+// this vocabulary is string IDs only. Names are the catalog's Korean labels.
+const KAKAO_REACTION_IDS = {
+  THUMBS_UP: '1200282_026', // 엄지척
+  EYES: '1200509_012', // 눈빛
+  HEART: '1200281_001', // 사랑
+  LAUGH: '1200282_002', // 웃음
+} as const
+
+const KAKAO_KNOWN_REACTION_IDS = new Set<string>(Object.values(KAKAO_REACTION_IDS))
+
 type KakaoReactionRemovalTarget = KakaoReactionTarget & {
-  reactionType: number
+  reactionId: string
 }
 type KakaoReactionState = Set<string>
 
-function kakaoReactionKey(target: KakaoReactionTarget, reactionType: number): string {
-  return `${target.chatId}:${target.logId}:${reactionType}`
+function kakaoReactionKey(target: KakaoReactionTarget, reactionId: string): string {
+  return `${target.chatId}:${target.logId}:${reactionId}`
 }
 
 function encodeKakaoReactionTarget(target: KakaoReactionTarget): ReactionRef {
@@ -356,29 +368,31 @@ function parseKakaoReactionRemovalTarget(value: string): KakaoReactionRemovalTar
   try {
     const parsed: unknown = JSON.parse(value)
     if (typeof parsed !== 'object' || parsed === null) return null
-    const target = parsed as { op?: unknown; chatId?: unknown; logId?: unknown; reactionType?: unknown }
+    const target = parsed as { op?: unknown; chatId?: unknown; logId?: unknown; reactionId?: unknown }
     if (target.op !== 'remove') return null
     if (typeof target.chatId !== 'string' || target.chatId === '') return null
     if (typeof target.logId !== 'string' || target.logId === '') return null
-    if (!Number.isInteger(target.reactionType) || (target.reactionType as number) <= 0) return null
+    if (typeof target.reactionId !== 'string' || target.reactionId === '') return null
     return {
       chatId: target.chatId,
       logId: target.logId,
-      reactionType: target.reactionType as number,
+      reactionId: target.reactionId,
     }
   } catch {
     return null
   }
 }
 
-function kakaoReactionTypeFor(emoji: string): number | null {
+function kakaoReactionIdFor(emoji: string): string | null {
   const normalized = emoji.trim().replace(/^:|:$/g, '').toLocaleLowerCase()
   if (normalized === 'like' || normalized === '+1' || normalized === 'thumbsup' || normalized === '👍') {
-    return KAKAO_REACTION_TYPE.LIKE
+    return KAKAO_REACTION_IDS.THUMBS_UP
   }
+  if (normalized === 'eyes' || normalized === '👀') return KAKAO_REACTION_IDS.EYES
+  if (normalized === 'heart' || normalized === '❤️' || normalized === '♥️') return KAKAO_REACTION_IDS.HEART
+  if (normalized === 'laugh' || normalized === 'joy' || normalized === '😂') return KAKAO_REACTION_IDS.LAUGH
   return null
 }
-
 export function createKakaoReactionCallback(
   client: Pick<KakaoTalkClient, 'addReaction'>,
   activeReactions: KakaoReactionState = new Set(),
@@ -392,27 +406,28 @@ export function createKakaoReactionCallback(
     if (target === null || target.chatId !== req.chat) {
       return { ok: false, error: 'invalid KakaoTalk reaction target', code: 'not-found' }
     }
-    const reactionType = kakaoReactionTypeFor(req.emoji)
-    if (reactionType === null) {
+    const reactionId = kakaoReactionIdFor(req.emoji)
+    if (reactionId === null) {
       return {
         ok: false,
-        error: 'KakaoTalk currently supports only the like reaction (`like`, `+1`, `thumbsup`, or `👍`)',
+        error:
+          'KakaoTalk currently supports only the like, eyes, heart, and laugh reactions (`like`/`+1`/`👍`, `eyes`/`👀`, `heart`/`❤️`, `laugh`/`😂`)',
         code: 'unsupported',
       }
     }
-    const key = kakaoReactionKey(target, reactionType)
-    const reactionRef = encodeKakaoReactionRemovalRef({ ...target, reactionType })
+    const key = kakaoReactionKey(target, reactionId)
+    const reactionRef = encodeKakaoReactionRemovalRef({ ...target, reactionId })
     if (activeReactions.has(key)) return { ok: true, reactionRef }
     try {
-      const result = await client.addReaction(target.chatId, target.logId, reactionType)
+      const result = await client.addReaction(target.chatId, target.logId, reactionId)
       logger?.info(
-        `[kakaotalk] reaction-add chat=${target.chatId} log_id=${target.logId} type=${reactionType} ` +
+        `[kakaotalk] reaction-add chat=${target.chatId} log_id=${target.logId} reaction=${reactionId} ` +
           `success=${result.success} status_code=${result.status_code}`,
       )
       if (!result.success) {
         return {
           ok: false,
-          error: `KakaoTalk ACTION failed with status ${result.status_code}`,
+          error: `KakaoTalk reaction add failed with status ${result.status_code}`,
           code: 'transient',
         }
       }
@@ -420,7 +435,7 @@ export function createKakaoReactionCallback(
       return { ok: true, reactionRef }
     } catch (err) {
       logger?.info(
-        `[kakaotalk] reaction-add threw chat=${target.chatId} log_id=${target.logId} type=${reactionType}: ${describeError(err)}`,
+        `[kakaotalk] reaction-add threw chat=${target.chatId} log_id=${target.logId} reaction=${reactionId}: ${describeError(err)}`,
       )
       return { ok: false, error: describeError(err), code: 'transient' }
     }
@@ -440,14 +455,14 @@ export function createKakaoRemoveReactionCallback(
     if (target === null || target.chatId !== req.chat) {
       return { ok: false, error: 'invalid KakaoTalk reaction removal ref', code: 'not-found' }
     }
-    if (target.reactionType !== KAKAO_REACTION_TYPE.LIKE) {
+    if (!KAKAO_KNOWN_REACTION_IDS.has(target.reactionId)) {
       return {
         ok: false,
-        error: 'KakaoTalk reaction removal supports only the verified like reaction',
+        error: 'KakaoTalk reaction removal supports only the verified like, eyes, heart, and laugh reactions',
         code: 'unsupported',
       }
     }
-    const key = kakaoReactionKey(target, target.reactionType)
+    const key = kakaoReactionKey(target, target.reactionId)
     if (activeReactions !== undefined && !activeReactions.has(key)) {
       return {
         ok: false,
@@ -456,15 +471,15 @@ export function createKakaoRemoveReactionCallback(
       }
     }
     try {
-      const result = await client.removeReaction(target.chatId, target.logId, target.reactionType)
+      const result = await client.removeReaction(target.chatId, target.logId, target.reactionId)
       logger?.info(
-        `[kakaotalk] reaction-remove chat=${target.chatId} log_id=${target.logId} type=${target.reactionType} ` +
+        `[kakaotalk] reaction-remove chat=${target.chatId} log_id=${target.logId} reaction=${target.reactionId} ` +
           `success=${result.success} status_code=${result.status_code}`,
       )
       if (!result.success) {
         return {
           ok: false,
-          error: `KakaoTalk ACTION reaction removal failed with status ${result.status_code}`,
+          error: `KakaoTalk reaction removal failed with status ${result.status_code}`,
           code: 'transient',
         }
       }
@@ -472,7 +487,7 @@ export function createKakaoRemoveReactionCallback(
       return { ok: true }
     } catch (err) {
       logger?.info(
-        `[kakaotalk] reaction-remove threw chat=${target.chatId} log_id=${target.logId} type=${target.reactionType}: ${describeError(err)}`,
+        `[kakaotalk] reaction-remove threw chat=${target.chatId} log_id=${target.logId} reaction=${target.reactionId}: ${describeError(err)}`,
       )
       return { ok: false, error: describeError(err), code: 'transient' }
     }
@@ -806,17 +821,12 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
           // ~/.config/agent-messenger.
           await client.login()
         }
-        // The verified ACTION reaction fixture is for the macOS-compatible
-        // path. The live Android/tablet dtype=2 session returned status 0
-        // without a visible reaction or SYNCACTION push, so do not advertise
-        // that legacy callback until an Android REACT fixture is verified.
-        const legacyActionReactionSupported = kakaoDeviceType === null || kakaoDeviceType === 'pc'
-        reactionSupported = legacyActionReactionSupported && typeof client.addReaction === 'function'
-        removeReactionSupported = legacyActionReactionSupported && typeof client.removeReaction === 'function'
-        logger.info(
-          `[kakaotalk] legacy ACTION reactions=${reactionSupported ? 'enabled' : 'disabled'} ` +
-            `device_type=${kakaoDeviceType ?? 'unknown'}`,
-        )
+        // Reactions ride the HTTP endpoint (talk-pilsner /emoticon/chat/rx),
+        // which is independent of the LOCO device profile — verified add+remove
+        // on the tablet test account with emoticon-pack string IDs.
+        reactionSupported = typeof client.addReaction === 'function'
+        removeReactionSupported = typeof client.removeReaction === 'function'
+        logger.info(`[kakaotalk] HTTP reactions=${reactionSupported ? 'enabled' : 'disabled'}`)
       } catch (err) {
         started = false
         logger.error(`[kakaotalk] login failed: ${describeError(err)}`)

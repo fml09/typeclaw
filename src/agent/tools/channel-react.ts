@@ -38,7 +38,7 @@ export function createChannelReactTool({
     description:
       'React to the message that triggered this turn with an emoji that fits its content or tone — a lightweight, ' +
       'human touch that posts no comment. Works on GitHub (issue/PR/comment), Slack, Discord, and KakaoTalk. ' +
-      'KakaoTalk currently supports only the like reaction (`like`, `+1`, `thumbsup`, or `👍`). ' +
+      'KakaoTalk supports the like, eyes, heart, and laugh reactions (`like`/`+1`/`👍`, `eyes`/`👀`, `heart`/`❤️`, `laugh`/`😂`). ' +
       'Pick the reaction a thoughtful teammate would leave: :+1: to agree or approve, :rocket: for something ' +
       'shipping or exciting, :tada: to celebrate, :heart: to show appreciation, :eyes: to signal "I am looking at this", ' +
       ':laugh: for something funny. Use it when a reaction adds genuine social signal — not on every message. ' +

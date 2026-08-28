@@ -235,7 +235,8 @@ const PLATFORM_INFO: Record<AdapterId, PlatformInfo> = {
     mentionMode: 'alias',
     plainTextOnly: true,
     supportsReactions: true,
-    reactionGuidance: 'KakaoTalk currently supports only `like` (also `+1`, `thumbsup`, or `👍`).',
+    reactionGuidance:
+      'reaction: only `like` (also `+1`, `thumbsup`, or `👍`), `eyes` (`👀`), `heart` (`❤️`), or `laugh` (`😂`).',
     supportsAttachments: true,
   },
 }
