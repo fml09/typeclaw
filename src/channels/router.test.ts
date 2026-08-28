@@ -2908,9 +2908,82 @@ describe('ChannelRouter runtime progress', () => {
     await waitFor(() => edits.includes('final answer'))
     expect(outbound).toHaveLength(1)
     expect(outbound[0]?.text).toBe('Processing…')
-    expect(edits).toContain('Thinking…')
-    expect(edits.at(-1)).toBe('final answer')
+    // The final reply replaces the pending phase text in one paced edit.
+    expect(edits).toEqual(['final answer'])
     expect(reactionEvents).toEqual(['add:eyes', 'remove', 'add:white_check_mark'])
+    await router.stop()
+  })
+  test('falls back once after a transient final edit failure without disabling the next turn', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      progress: { enabled: true, updateIntervalMs: 50 },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const outbound: OutboundMessage[] = []
+    const edits: string[] = []
+    let failNextEdit = true
+    let promptCount = 0
+
+    router.registerOutbound('kakaotalk', async (message) => {
+      outbound.push(message)
+      const messageId = `outbound-${outbound.length}`
+      return { ok: true, messageId, messageIds: [messageId] }
+    })
+    router.registerEditMessage('kakaotalk', async (request) => {
+      if (failNextEdit) {
+        failNextEdit = false
+        return { ok: false, error: 'KakaoTalk MODIFYMSG failed with status -303', code: 'not-supported' }
+      }
+      edits.push(request.text)
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: 'first',
+        externalMessageId: 'first',
+        isDm: true,
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      promptCount++
+      const text = promptCount === 1 ? 'first final' : 'second final'
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
+      })
+      sessions[0]!.setAssistantText(text)
+      const reply = createChannelReplyTool({ router, origin: key })
+      await reply.execute(
+        'reply-call',
+        { text, more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+    }
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => outbound.length >= 2)
+
+    expect(outbound.map((message) => message.text)).toEqual(['Processing…', 'first final'])
+
+    await router.route(
+      inbound({
+        ...key,
+        text: 'second',
+        externalMessageId: 'second',
+        isDm: true,
+      }),
+    )
+    await router.__testing!.flushDebounce(key)
+    await waitFor(() => edits.includes('second final'))
+
+    expect(outbound.map((message) => message.text)).toEqual(['Processing…', 'first final', 'Processing…'])
+    expect(edits).toContain('second final')
     await router.stop()
   })
   test('sequences Kakao-like ACTION toggles before applying the final like', async () => {
