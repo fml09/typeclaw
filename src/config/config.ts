@@ -670,10 +670,11 @@ function asModelRef(value: string): ModelRef {
 // level. `migrateLegacyConfigShape` rewrites that to `models: { default: ... }`
 // on first load (and writes the result back to disk + commits via
 // `persistMigratedConfig`), so every downstream consumer sees the new shape.
-// Mirrors pi-coding-agent's `ThinkingLevel`. Kept as a local enum (rather than
-// importing the SDK type) so the schema owns the canonical value list and zod
-// can validate `typeclaw.json` without a runtime SDK dependency.
-export const thinkingLevelSchema = z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+// Tracks pi-coding-agent's thinking-level vocabulary, including the
+// forward-compatible `max` value. Kept as a local enum (rather than importing
+// the SDK type) so the schema owns the canonical value list and zod can
+// validate `typeclaw.json` without a runtime SDK dependency.
+export const thinkingLevelSchema = z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 export type ThinkingLevel = z.infer<typeof thinkingLevelSchema>
 
 // Reject exact duplicates in a chain — retrying the same ref after the same

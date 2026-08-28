@@ -110,6 +110,11 @@ describe('configSchema models field', () => {
     expect(parsed.models.default).toEqual({ refs: modelRefList(VALID_MODEL), thinkingLevel: 'high' })
   })
 
+  test('accepts the maximum thinking level', () => {
+    const parsed = configSchema.parse({ models: { default: { model: VALID_MODEL, thinkingLevel: 'max' } } })
+    expect(parsed.models.default).toEqual({ refs: modelRefList(VALID_MODEL), thinkingLevel: 'max' })
+  })
+
   test('accepts a rich profile object with a models chain + thinkingLevel', () => {
     const parsed = configSchema.parse({
       models: { default: { models: [VALID_MODEL, VALID_MODEL_2], thinkingLevel: 'off' } },

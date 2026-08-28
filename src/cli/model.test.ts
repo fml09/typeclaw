@@ -128,7 +128,7 @@ describe('typeclaw model set/add reject a definitely-invalid ref via the real CL
 
 describe('parseThinkingArg', () => {
   test('accepts every supported level, case-insensitively', () => {
-    for (const level of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const) {
+    for (const level of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
       expect(parseThinkingArg(level.toUpperCase())).toEqual({ ok: true, level })
     }
   })
@@ -142,7 +142,7 @@ describe('parseThinkingArg', () => {
   test('rejects an unknown value with a helpful reason', () => {
     const result = parseThinkingArg('turbo')
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.reason).toMatch(/off, minimal, low, medium, high, xhigh/)
+    if (!result.ok) expect(result.reason).toMatch(/off, minimal, low, medium, high, xhigh, max/)
   })
 })
 
@@ -377,6 +377,20 @@ describe('typeclaw model set validates the thinking level before mutating the pr
     expect(await readProfile('fast')).toEqual({ models: 'openai/gpt-5.4-nano', thinkingLevel: 'high' })
     // The default profile is untouched and stays in its bare-ref form.
     expect(await readProfile('default')).toBe(ORIGINAL_REF)
+  })
+
+  test('a max --thinking value writes the profile without downgrading the config', async () => {
+    const proc = Bun.spawn({
+      cmd: ['bun', CLI_ENTRY, 'model', 'set', 'deep', 'openai/gpt-5.4-nano', '--thinking', 'max', '--force'],
+      cwd,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, NO_COLOR: '1' },
+    })
+    const exitCode = await proc.exited
+
+    expect(exitCode).toBe(0)
+    expect(await readProfile('deep')).toEqual({ models: 'openai/gpt-5.4-nano', thinkingLevel: 'max' })
   })
 
   test('`--thinking default` clears a profile`s existing level (regression: explicit clear must win)', async () => {

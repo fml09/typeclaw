@@ -59,7 +59,7 @@ const setSub = defineCommand({
     thinking: {
       type: 'string',
       description:
-        "reasoning effort for THIS profile (off|minimal|low|medium|high|xhigh|default); the `default` profile's level is the de-facto global default",
+        "reasoning effort for THIS profile (off|minimal|low|medium|high|xhigh|max|default); the `default` profile's level is the de-facto global default",
       required: false,
     },
   },
@@ -117,7 +117,7 @@ const thinkingSub = defineCommand({
     level: {
       type: 'positional',
       description:
-        'reasoning effort (off|minimal|low|medium|high|xhigh); or "default" to clear and defer to the SDK default',
+        'reasoning effort (off|minimal|low|medium|high|xhigh|max); or "default" to clear and defer to the SDK default',
       required: false,
     },
   },
@@ -318,7 +318,7 @@ async function pickProfileName(): Promise<string> {
   return choice
 }
 
-const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const KEEP_THINKING_SENTINEL = '__keep__'
 
 export type ParsedThinkingArg = { ok: true; level: ThinkingLevel | undefined } | { ok: false; reason: string }

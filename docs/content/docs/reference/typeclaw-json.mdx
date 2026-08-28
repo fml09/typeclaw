@@ -81,15 +81,15 @@ A profile value may also be an object that pairs its model(s) with a `thinkingLe
 }
 ```
 
-`thinkingLevel` (`off` through `xhigh`) sets the reasoning effort for sessions running under that profile. There is no global `thinkingLevel` field — the **`default` profile's** `thinkingLevel` is the de-facto global default, exactly as `models.default` is the default model.
+`thinkingLevel` (`off` through `max`) sets the reasoning effort for sessions running under that profile. There is no global `thinkingLevel` field — the **`default` profile's** `thinkingLevel` is the de-facto global default, exactly as `models.default` is the default model.
 
-A session resolves its effort with the precedence **the profile's own `thinkingLevel` → the `default` profile's `thinkingLevel` → the SDK default**. So `vision` above (a bare ref with no level) inherits whatever `default` declares; if `default` has no level either, the SDK default (`medium`) applies. The value is clamped to each model's capabilities at session creation (`xhigh` is OpenAI-family-only and clamps down to `high` elsewhere). An attention-escalation cue in a turn (frustration or an explicit "do it properly" / "ultrathink") still bumps that single turn to maximum effort regardless of this setting.
+A session resolves its effort with the precedence **the profile's own `thinkingLevel` → the `default` profile's `thinkingLevel` → the SDK default**. So `vision` above (a bare ref with no level) inherits whatever `default` declares; if `default` has no level either, the SDK default (`medium`) applies. The value is clamped to each model's capabilities at session creation (`xhigh` and `max` are model-family-specific and may clamp down elsewhere). An attention-escalation cue in a turn (frustration or an explicit "do it properly" / "ultrathink") still bumps that single turn to maximum effort regardless of this setting.
 
 Two well-known profiles ship with a built-in `thinkingLevel`: **`fast` defaults to `low`** and **`deep` defaults to `high`**. These are materialized into the profile at config-load time, so they show up in `typeclaw model list` and win over a lower `default` level (a materialized `deep: high` still thinks hard even if you lower the global default). `default` and `vision` carry no built-in level — they fall through to the `default` profile's level, then the SDK default. Setting an explicit `thinkingLevel` on `fast` or `deep` (including `off`) overrides the built-in.
 
 The object form accepts `model` (a single ref) **or** `models` (a single ref or a fallback-chain array) — exactly one — plus the optional `thinkingLevel`. Bare string/array profile values keep working unchanged (no migration needed); a profile only becomes an object when you attach a `thinkingLevel`. Live-reloadable: a change lands on the next session without a container restart.
 
-Set it from the CLI with `typeclaw model set <profile> <ref> --thinking <level>` (targets that profile), or `typeclaw model thinking <level>` for the `default` profile's level. `--thinking default` clears a profile's override.
+Set it from the CLI with `typeclaw model set <profile> <ref> --thinking <level>` (targets that profile), or `typeclaw model thinking <level>` for the `default` profile's level. Supported levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `--thinking default` clears a profile's override.
 
 ## `network`
 

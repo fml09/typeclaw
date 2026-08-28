@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { getSupportedThinkingLevels } from '@mariozechner/pi-ai'
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -513,6 +514,10 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // Read live so a reloaded `models` lands on the next session without a
   // container restart.
   const thinkingLevel = resolveSessionThinkingLevel(getConfig().models, resolved, activeRef)
+  // `max` is part of the config vocabulary even when the installed Pi SDK
+  // predates it. Keep the strongest level this model/SDK exposes; newer SDKs
+  // pass `max` through when the model advertises it.
+  const sdkThinkingLevel = thinkingLevel === 'max' ? (getSupportedThinkingLevels(model).at(-1) ?? 'off') : thinkingLevel
   const { session } = await createAgentSession({
     model,
     sessionManager,
@@ -523,7 +528,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     noTools: 'builtin',
     tools: intendedActiveToolNames,
     customTools,
-    ...(thinkingLevel ? { thinkingLevel } : {}),
+    ...(sdkThinkingLevel ? { thinkingLevel: sdkThinkingLevel } : {}),
   })
   // typeclaw owns retry/fallback in its turn drivers, so the SDK's own
   // same-model auto-retry must be OFF. Leaving it on races typeclaw's
