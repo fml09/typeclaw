@@ -843,7 +843,21 @@ type ProgressMessageState = {
   pendingText: string | null
   lastEditAt: number
   editTimer: ReturnType<typeof setTimeout> | null
-  editInFlight: Promise<void> | null
+  editInFlight: Promise<boolean> | null
+}
+
+// Kakao's MODIFYMSG rate-limits back-to-back edits (-303) and drops the
+// socket entirely on tighter bursts. Never issue a progress edit sooner than
+// this long after the previous one.
+const PROGRESS_EDIT_MIN_GAP_MS = 1200
+// One transient edit failure (rate-limit blip, in-flight reconnect) must not
+// kill progress for the session's lifetime; latch only after repeated misses.
+const PROGRESS_EDIT_MAX_CONSECUTIVE_FAILURES = 3
+
+const delay = (ms: number): Promise<void> => {
+  const { promise, resolve } = Promise.withResolvers<void>()
+  setTimeout(resolve, ms)
+  return promise
 }
 
 type LiveSession = {
@@ -976,9 +990,11 @@ type LiveSession = {
   progressMessage: ProgressMessageState | null
   progressStartPromise: Promise<void> | null
   progressPendingText: string | null
-  // A failed edit (e.g. Kakao's device-mode -203 response) disables the
-  // progress path for this live session; final replies fall back to a new post.
+  // A failed edit (e.g. Kakao's -303 rate-limit response) disables the
+  // progress path for this live session after repeated misses; final replies
+  // fall back to a new post while it is disabled.
   progressDisabled: boolean
+  progressEditFailures: number
   // Model-requested `channel_react` reactions for THIS turn, held until the turn
   // ends. Flushed to the adapter only if the agent actually replied this turn;
   // discarded on silence (skip_response / empty / errored turns) so the bot never
@@ -2511,6 +2527,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         progressStartPromise: null,
         progressPendingText: null,
         progressDisabled: false,
+        progressEditFailures: 0,
         pendingTurnReactions: [],
         silentAckTurn: null,
         activeSilentAckReactions: [],
@@ -2949,26 +2966,54 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { ok: false, error: lastError ?? 'progress message was not delivered', code: 'callback-rejected' }
   }
 
-  const applyProgressEdit = async (live: LiveSession, state: ProgressMessageState, text: string): Promise<void> => {
-    const result = await editMessage({
-      adapter: live.key.adapter,
-      workspace: live.key.workspace,
-      chat: live.key.chat,
-      thread: live.key.thread,
-      messageId: state.messageId,
-      text,
-    })
-    if (!result.ok) {
+  const recordProgressEditFailure = (
+    live: LiveSession,
+    state: ProgressMessageState,
+    text: string,
+    error: string,
+  ): void => {
+    live.progressEditFailures++
+    if (live.progressEditFailures >= PROGRESS_EDIT_MAX_CONSECUTIVE_FAILURES) {
       live.progressDisabled = true
       if (live.progressMessage === state) live.progressMessage = null
       live.progressPendingText = null
-      logger.info(`[channels] ${live.keyId}: progress edit disabled: ${result.error}`)
+      state.pendingText = null
+      logger.info(
+        `[channels] ${live.keyId}: progress edit disabled after ${live.progressEditFailures} consecutive failures: ${error}`,
+      )
       return
     }
+    if (live.progressMessage === state && state.pendingText === null) state.pendingText = text
+    logger.info(
+      `[channels] ${live.keyId}: progress edit failed (${live.progressEditFailures}/${PROGRESS_EDIT_MAX_CONSECUTIVE_FAILURES}): ${error}`,
+    )
+  }
+
+  const applyProgressEdit = async (live: LiveSession, state: ProgressMessageState, text: string): Promise<boolean> => {
+    let result: EditMessageResult
+    try {
+      result = await editMessage({
+        adapter: live.key.adapter,
+        workspace: live.key.workspace,
+        chat: live.key.chat,
+        thread: live.key.thread,
+        messageId: state.messageId,
+        text,
+      })
+    } catch (err) {
+      recordProgressEditFailure(live, state, text, `threw: ${describeError(err)}`)
+      return false
+    }
+    if (!result.ok) {
+      recordProgressEditFailure(live, state, text, result.error)
+      return false
+    }
+    live.progressEditFailures = 0
     if (live.progressMessage === state) {
       state.lastText = text
       state.lastEditAt = now()
     }
+    return true
   }
 
   const scheduleProgressEdit = (live: LiveSession, state: ProgressMessageState): void => {
@@ -2985,10 +3030,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     const text = state.pendingText
     state.pendingText = null
-    const edit = applyProgressEdit(live, state, text).catch((err) => {
-      live.progressDisabled = true
-      logger.info(`[channels] ${live.keyId}: progress edit threw: ${describeError(err)}`)
-    })
+    const edit = applyProgressEdit(live, state, text)
     state.editInFlight = edit
     void edit.finally(() => {
       if (state.editInFlight === edit) state.editInFlight = null
@@ -3053,16 +3095,25 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (text !== null) requestProgressUpdate(live, text)
     })
 
-  const flushProgressEditNow = async (live: LiveSession, state: ProgressMessageState): Promise<void> => {
+  const flushProgressEditNow = async (live: LiveSession, state: ProgressMessageState): Promise<boolean> => {
     if (state.editTimer !== null) {
       clearTimeout(state.editTimer)
       state.editTimer = null
     }
     if (state.editInFlight !== null) await state.editInFlight
-    if (live.progressMessage !== state || live.progressDisabled || state.pendingText === null) return
+    if (live.destroyed || live.progressMessage !== state || live.progressDisabled) return false
+    if (state.pendingText === null) return true
+    // Pacing: the awaited in-flight edit and this one would otherwise fire
+    // back-to-back, which Kakao's MODIFYMSG rate limit rejects with -303.
+    const intervalMs = progressConfigFor(live)?.updateIntervalMs ?? 750
+    const gap = Math.max(0, Math.max(intervalMs, PROGRESS_EDIT_MIN_GAP_MS) - (now() - state.lastEditAt))
+    if (gap > 0) await delay(gap)
+    if (live.destroyed || live.progressMessage !== state || live.progressDisabled || state.pendingText === null) {
+      return false
+    }
     const text = state.pendingText
     state.pendingText = null
-    await applyProgressEdit(live, state, text)
+    return await applyProgressEdit(live, state, text)
   }
 
   const finishProgressMessage = async (live: LiveSession, text: string): Promise<boolean> => {
@@ -3070,15 +3121,21 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (start !== null) await start
     const state = live.progressMessage
     if (state === null || live.progressDisabled) return false
-    await flushProgressEditNow(live, state)
-    if (live.progressDisabled || live.progressMessage !== state) return false
-    if (state.lastText !== text) await applyProgressEdit(live, state, text)
-    const finished = live.progressMessage === state && !live.progressDisabled
-    if (finished) {
-      live.progressMessage = null
-      live.progressPendingText = null
+    // Coalesce any pending phase text with the final text into ONE edit —
+    // two MODIFYMSG packets in the same tick is what tripped Kakao's -303.
+    if (state.lastText !== text) {
+      state.pendingText = text
+      const edited = await flushProgressEditNow(live, state)
+      if (!edited || live.progressDisabled || live.progressMessage !== state || state.lastText !== text) {
+        state.pendingText = null
+        if (live.progressMessage === state) live.progressMessage = null
+        return false
+      }
     }
-    return finished
+    if (live.progressDisabled || live.progressMessage !== state) return false
+    live.progressMessage = null
+    live.progressPendingText = null
+    return true
   }
 
   const deliverProgressReply = async (
@@ -3092,8 +3149,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (state === null || live.progressDisabled) return null
     if (kind === 'status') {
       state.pendingText = text
-      await flushProgressEditNow(live, state)
-      if (live.progressDisabled || live.progressMessage !== state) return null
+      const edited = await flushProgressEditNow(live, state)
+      if (!edited || live.progressDisabled || live.progressMessage !== state) return null
       return { ok: true, messageId: state.messageId, messageIds: [state.messageId] }
     }
     const messageId = state.messageId
