@@ -851,6 +851,7 @@ type ProgressMessageState = {
   lastEditAt: number
   editTimer: ReturnType<typeof setTimeout> | null
   editInFlight: Promise<boolean> | null
+  flushInFlight: Promise<boolean> | null
 }
 
 // Kakao's MODIFYMSG rate-limits back-to-back edits (-303) and drops the
@@ -1006,6 +1007,10 @@ type LiveSession = {
   // recent tool executions this prompt, rendered as `· <tool>` lines under the
   // phase text. Reset at every prompt start; bounded to the render window.
   progressToolLog: string[]
+  // Set as soon as a terminal channel_reply is attempted so late tool
+  // lifecycle events cannot recreate a fresh Processing bubble after the
+  // reply has already been delivered or is being finalized.
+  progressReplyFinalized: boolean
   // Model-requested `channel_react` reactions for THIS turn, held until the turn
   // ends. Flushed to the adapter only if the agent actually replied this turn;
   // discarded on silence (skip_response / empty / errored turns) so the bot never
@@ -2540,6 +2545,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         progressDisabled: false,
         progressEditFailures: 0,
         progressToolLog: [],
+        progressReplyFinalized: false,
         pendingTurnReactions: [],
         silentAckTurn: null,
         activeSilentAckReactions: [],
@@ -3030,7 +3036,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const scheduleProgressEdit = (live: LiveSession, state: ProgressMessageState): void => {
     if (live.progressMessage !== state || live.progressDisabled || state.pendingText === null) return
-    if (state.editInFlight !== null || state.editTimer !== null) return
+    if (state.flushInFlight !== null || state.editInFlight !== null || state.editTimer !== null) return
     const intervalMs = progressConfigFor(live)?.updateIntervalMs ?? 750
     // Failed edits back off exponentially (1.5s → 3s → …) with jitter so a
     // flaky Kakao window never hammers the MODIFYMSG limiter; successful
@@ -3076,6 +3082,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         lastEditAt: now(),
         editTimer: null,
         editInFlight: null,
+        flushInFlight: null,
       }
       live.progressPendingText = null
       live.progressMessage = state
@@ -3094,14 +3101,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const requestProgressUpdate = (live: LiveSession, text: string): void => {
-    if (!progressEnabledFor(live) || !live.promptInFlight) return
+    if (!progressEnabledFor(live) || !live.promptInFlight || live.progressReplyFinalized) return
     const state = live.progressMessage
     if (state === null) {
       if (live.progressPendingText !== text) live.progressPendingText = text
       void ensureProgressMessage(live)
       return
     }
-    if (state.lastText === text || state.pendingText === text) return
+    if (state.flushInFlight !== null || state.lastText === text || state.pendingText === text) return
     state.pendingText = text
     scheduleProgressEdit(live, state)
   }
@@ -3110,7 +3117,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const subscribeProgressActivity = (session: AgentSession, live: LiveSession): (() => void) =>
     session.subscribe((event: unknown) => {
-      if (!live.promptInFlight || live.destroyed) return
+      if (!live.promptInFlight || live.destroyed || live.progressReplyFinalized) return
       const toolName = progressToolLogEnabledFor(live) ? toolNameForEvent(event) : null
       if (toolName !== null) {
         live.progressToolLog.push(toolName)
@@ -3120,25 +3127,48 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (phase !== null) requestProgressUpdate(live, renderProgressText(phase, live.progressToolLog))
     })
 
-  const flushProgressEditNow = async (live: LiveSession, state: ProgressMessageState): Promise<boolean> => {
-    if (state.editTimer !== null) {
-      clearTimeout(state.editTimer)
-      state.editTimer = null
-    }
-    if (state.editInFlight !== null) await state.editInFlight
-    if (live.destroyed || live.progressMessage !== state || live.progressDisabled) return false
-    if (state.pendingText === null) return true
-    // Pacing: the awaited in-flight edit and this one would otherwise fire
-    // back-to-back, which Kakao's MODIFYMSG rate limit rejects with -303.
-    const intervalMs = progressConfigFor(live)?.updateIntervalMs ?? 750
-    const gap = Math.max(0, Math.max(intervalMs, PROGRESS_EDIT_MIN_GAP_MS) - (now() - state.lastEditAt))
-    if (gap > 0) await delay(gap)
-    if (live.destroyed || live.progressMessage !== state || live.progressDisabled || state.pendingText === null) {
-      return false
-    }
-    const text = state.pendingText
-    state.pendingText = null
-    return await applyProgressEdit(live, state, text)
+  const flushProgressEditNow = (live: LiveSession, state: ProgressMessageState): Promise<boolean> => {
+    if (state.flushInFlight !== null) return state.flushInFlight
+
+    const flush = (async (): Promise<boolean> => {
+      if (state.editTimer !== null) {
+        clearTimeout(state.editTimer)
+        state.editTimer = null
+      }
+      if (state.editInFlight !== null) await state.editInFlight
+      // The edit's completion callback cannot schedule while flushInFlight is
+      // set, but clear defensively in case a timer was already queued.
+      if (state.editTimer !== null) {
+        clearTimeout(state.editTimer)
+        state.editTimer = null
+      }
+      if (live.destroyed || live.progressMessage !== state || live.progressDisabled) return false
+      if (state.pendingText === null) return true
+      // Pacing: the awaited in-flight edit and this one would otherwise fire
+      // back-to-back, which Kakao's MODIFYMSG rate limit rejects with -303.
+      const intervalMs = progressConfigFor(live)?.updateIntervalMs ?? 750
+      const gap = Math.max(0, Math.max(intervalMs, PROGRESS_EDIT_MIN_GAP_MS) - (now() - state.lastEditAt))
+      if (gap > 0) await delay(gap)
+      if (live.destroyed || live.progressMessage !== state || live.progressDisabled || state.pendingText === null) {
+        return false
+      }
+      const text = state.pendingText
+      state.pendingText = null
+      return await applyProgressEdit(live, state, text)
+    })()
+
+    state.flushInFlight = flush
+    void flush.then(
+      () => {
+        if (state.flushInFlight === flush) state.flushInFlight = null
+        if (live.progressMessage === state && state.pendingText !== null) scheduleProgressEdit(live, state)
+      },
+      () => {
+        if (state.flushInFlight === flush) state.flushInFlight = null
+        if (live.progressMessage === state && state.pendingText !== null) scheduleProgressEdit(live, state)
+      },
+    )
+    return flush
   }
 
   const finishProgressMessage = async (live: LiveSession, text: string): Promise<boolean> => {
@@ -3958,6 +3988,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
         live.promptInFlight = true
         live.progressToolLog = []
+        live.progressReplyFinalized = false
         try {
           const result = await promptPersistentTurnWithFallback({
             refs: resolveFallbackChain(getConfig().models, undefined),
@@ -5325,6 +5356,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const keyId = channelKeyId(accountingTarget)
     const live = liveSessions.get(keyId)
     const sendKey = consecutiveSendKey(accountingTarget.chat, accountingTarget.thread)
+    // A terminal channel_reply owns the rest of this prompt's progress
+    // lifecycle. Mark it before any await so tool lifecycle events emitted
+    // after the tool result cannot create another Processing message.
+    if (live && deliveryMatchesAccounting && source === 'tool' && opts?.progressReply === 'final') {
+      live.progressReplyFinalized = true
+    }
     // Tool-source sends consume the captured quote candidate exactly
     // once per turn — the intervening-observed check runs HERE against
     // the live buffer so the relevant signal is actual channel chatter
