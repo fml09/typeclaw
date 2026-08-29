@@ -3233,6 +3233,76 @@ describe('ChannelRouter runtime progress', () => {
     expect(edits).toContain('final answer')
     await router.stop()
   })
+  test('reuses one progress bubble across a queued continuation', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      progress: { enabled: true, updateIntervalMs: 50 },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const outbound: OutboundMessage[] = []
+    const edits: string[] = []
+    const editMessageIds: string[] = []
+    let promptCount = 0
+
+    router.registerOutbound('kakaotalk', async (message) => {
+      outbound.push(message)
+      const messageId = `message-${outbound.length}`
+      return { ok: true, messageId, messageIds: [messageId] }
+    })
+    router.registerEditMessage('kakaotalk', async (request) => {
+      editMessageIds.push(request.messageId)
+      edits.push(request.text)
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '계속 진행해줘',
+        externalMessageId: 'kakao-inbound',
+        isDm: true,
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      promptCount++
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
+      })
+      const reply = createChannelReplyTool({ router, origin: key })
+      if (promptCount === 1) {
+        sessions[0]!.setAssistantText('확인해볼게요')
+        await reply.execute(
+          'ack-call',
+          { text: '확인해볼게요', more_work_this_turn: true },
+          undefined,
+          undefined,
+          {} as Parameters<typeof reply.execute>[4],
+        )
+        router.__testing!.injectContinuationReminder(key, 'continue the current work')
+        return
+      }
+      sessions[0]!.setAssistantText('final answer')
+      await reply.execute(
+        'reply-call',
+        { text: 'final answer', more_work_this_turn: false },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+    }
+    await router.__testing!.flushDebounce(key)
+    await waitFor(() => edits.includes('final answer'))
+
+    expect(promptCount).toBe(2)
+    expect(outbound.map((message) => message.text)).toEqual(['⏳ Processing…'])
+    expect(editMessageIds.every((messageId) => messageId === 'message-1')).toBe(true)
+    expect(edits).toContain('확인해볼게요')
+    expect(edits).toContain('final answer')
+    await router.stop()
+  })
   test('does not send terminal progress reactions when progress is disabled', async () => {
     const dir = await tempDir()
     const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }

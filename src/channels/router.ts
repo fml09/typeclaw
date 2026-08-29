@@ -4110,7 +4110,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             !usableReplyThisTurn &&
             !retryQueuedThisTurn &&
             (providerErrorThisTurn || live.emptyTurnFallbackTurn === live.turnSeq)
-          if (!retryQueuedThisTurn && (live.progressMessage !== null || live.progressStartPromise !== null)) {
+          const keepProgressForContinuation =
+            !live.progressReplyFinalized &&
+            (live.promisedWorkOutstandingThisLogicalTurn || live.pendingSystemReminders.length > 0)
+          if (
+            !retryQueuedThisTurn &&
+            !keepProgressForContinuation &&
+            (live.progressMessage !== null || live.progressStartPromise !== null)
+          ) {
             // A turn that delivered a real reply must not ALSO surface the leftover
             // progress bubble as a trailing "Done." message: the reply itself is the
             // completion signal, and on Kakao every MODIFYMSG lands as a fresh
