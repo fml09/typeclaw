@@ -5363,10 +5363,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const keyId = channelKeyId(accountingTarget)
     const live = liveSessions.get(keyId)
     const sendKey = consecutiveSendKey(accountingTarget.chat, accountingTarget.thread)
-    // A terminal channel_reply owns the rest of this prompt's progress
-    // lifecycle. Mark it before any await so tool lifecycle events emitted
-    // after the tool result cannot create another Processing message.
-    if (live && deliveryMatchesAccounting && source === 'tool' && opts?.progressReply === 'final') {
+    // An explicit final-progress delivery owns the rest of this prompt's
+    // progress lifecycle. Mark it before any await so late tool lifecycle
+    // events cannot create another Processing message. validateChannelTurn's
+    // internal recovery uses the same contract as channel_reply.
+    if (live && deliveryMatchesAccounting && opts?.progressReply === 'final') {
       live.progressReplyFinalized = true
     }
     // Tool-source sends consume the captured quote candidate exactly
@@ -6202,7 +6203,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         thread: live.key.thread,
         text: assistantText,
       },
-      { source: 'system', outputKind: 'substantive' },
+      { source: 'system', outputKind: 'substantive', progressReply: 'final' },
     )
     if (!result.ok) {
       logger.warn(`[channels] ${live.keyId}: recovery send failed: ${result.error}`)

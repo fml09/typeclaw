@@ -3303,6 +3303,56 @@ describe('ChannelRouter runtime progress', () => {
     expect(edits).toContain('final answer')
     await router.stop()
   })
+  test('reuses progress for recovered plain assistant text', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      progress: { enabled: true, updateIntervalMs: 50 },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const outbound: OutboundMessage[] = []
+    const edits: Array<{ messageId: string; text: string }> = []
+    router.registerOutbound('kakaotalk', async (message) => {
+      outbound.push(message)
+      const messageId = `message-${outbound.length}`
+      return { ok: true, messageId, messageIds: [messageId] }
+    })
+    router.registerEditMessage('kakaotalk', async (request) => {
+      edits.push({ messageId: request.messageId, text: request.text })
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '검색해서 답해줘',
+        externalMessageId: 'kakao-inbound',
+        isDm: true,
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.emit({
+        type: 'tool_execution_start',
+        toolName: 'web_search',
+        args: { query: 'secret query that must not appear in progress' },
+      })
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', delta: 'recovered answer' },
+      })
+      // Production shape: the model ends with visible plain text instead of
+      // calling channel_reply. validateChannelTurn must recover that text
+      // through the existing progress message, not a fresh Kakao bubble.
+      sessions[0]!.setAssistantText('recovered answer')
+    }
+    await router.__testing!.flushDebounce(key)
+
+    expect(outbound.map((message) => message.text)).toEqual(['⏳ Processing…'])
+    expect(edits.at(-1)).toEqual({ messageId: 'message-1', text: 'recovered answer' })
+    expect(edits.some((edit) => edit.text.includes('secret query'))).toBe(false)
+    await router.stop()
+  })
   test('does not send terminal progress reactions when progress is disabled', async () => {
     const dir = await tempDir()
     const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
