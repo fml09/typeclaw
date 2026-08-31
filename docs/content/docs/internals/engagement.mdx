@@ -82,6 +82,15 @@ Cold-start prefetch seeds the same buffer (`source: 'prefetch'`), and may exceed
 
 The `contextBuffer` only flushes inside `drain()`, which only runs on an `engage`. A channel the bot perpetually observes (a busy multi-human room it's never addressed in) trims **by count only**, never by age. There is no staleness gate on flush, so the first engage after a long observe-only stretch can inject up-to-20 stale messages as "recent context." Prefetch is bounded by recency; runtime observation is bounded only by count. Whether this matters is a product call — noted here so a future maintainer doesn't assume the buffer is time-bounded.
 
+## Mid-turn delivery: queue vs steer
+
+An engaged inbound that lands while a turn is already running has two delivery paths:
+
+- **Queue (default).** `enqueue()` pushes onto `live.promptQueue`; the drain while-loop splices it as the next batch after the in-flight prompt resolves. Every per-turn composition runs — `composeTurnPrompt` wrapping, quote anchors, attachment snapshots, per-turn origin/role refresh.
+- **Steer** (`channels.<adapter>.steer.enabled`). A plain-text inbound is parked in `live.steerBuffer` for a quiet window (`flushSteerBufferMidTurn`) and injected into the RUNNING turn via `session.steer()` — the pi SDK delivers it after the current assistant message's tool calls settle, before the next model call, composed by `composeSteerPrompt` under an H2 heading with normal author attribution. Steered authors are added to `live.currentTurnAuthorIds` so reply targeting sees them. This bypasses turn composition by design — which is exactly why attachments, reply-quotes, and github review rounds are excluded (`isSteerableInbound`) and why a non-steerable inbound flushes the buffer to `promptQueue` first (arrival-order preservation).
+
+The invariant both paths share: a message is never dropped. Every fallback — turn ended during the window (drain's prompt-finally `flushSteerBufferToQueue`), aborting turn, reload teardown, `session.steer()` rejection — lands the buffer on `promptQueue`, which the teardown carry hands to the successor session. `/stop` is the one dropper: it clears `steerBuffer` alongside the queued prompts it already cancels.
+
 ## Peer-bot loop guard
 
 Distinct from the per-session [tool loop guard](/docs/internals/message-stream) (`src/agent/loop-guard.ts`, exact-call and sliding-window cycle detection). The channel-level guard (`updateLoopGuard`, `router.ts`) counts **engaged peer-bot turns since the last human**:

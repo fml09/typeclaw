@@ -112,6 +112,18 @@ describe('channelsSchema', () => {
   test('rejects an empty postReplyReaction emoji', () => {
     expect(() => channelsSchema.parse({ kakaotalk: { postReplyReaction: { enabled: true, emoji: ' ' } } })).toThrow()
   })
+
+  test('parses steer config; the block stays omitted by default', () => {
+    const parsed = channelsSchema.parse({ kakaotalk: { steer: { enabled: true } } })
+    expect(parsed.kakaotalk?.steer).toEqual({ enabled: true })
+    expect(channelsSchema.parse({ kakaotalk: {} }).kakaotalk?.steer).toBeUndefined()
+    expect(channelsSchema.parse({}).kakaotalk).toBeUndefined()
+  })
+
+  test('rejects out-of-range steer quietMs', () => {
+    expect(() => channelsSchema.parse({ kakaotalk: { steer: { enabled: true, quietMs: -1 } } })).toThrow()
+    expect(() => channelsSchema.parse({ kakaotalk: { steer: { enabled: true, quietMs: 30_001 } } })).toThrow()
+  })
   test('parses runtime-owned progress settings', () => {
     const parsed = channelsSchema.parse({
       kakaotalk: {

@@ -207,6 +207,24 @@ const reactionTraceSchema = z.object({
   maxEvents: z.number().int().min(1).max(500).default(100),
   includeUnknownMethods: z.boolean().default(false),
 })
+// Steer (mid-turn injection). When an engaged inbound arrives while the live
+// session's turn is still running (`prompt()` in flight), the router holds it
+// for a short quiet window and then injects it into the RUNNING turn via the
+// pi SDK's steering queue (`session.steer()` — delivered after the current
+// assistant message's tool calls settle, before the next model call) instead
+// of queueing it as a separate follow-up turn. Plain-text inbounds only:
+// attachments, reply-quotes, and github review rounds always take the
+// queued-turn path because their composition runs at turn start. `quietMs`
+// bounds how long the router coalesces split bubbles into one injection
+// (defaults to `inboundBatching.quietMs` when set, else the hot-debounce
+// cadence); if the turn finishes during the window the buffered inbound
+// falls back to the ordinary queued path, so steering can never lose a
+// message. Read live per inbound — an applied config reload toggles it
+// without a restart.
+const steerSchema = z.object({
+  enabled: z.boolean().default(false),
+  quietMs: z.number().int().min(0).max(30_000).optional(),
+})
 
 // Deliberately non-strict: a stale on-disk file may still carry the
 // legacy `allow` field. Zod silently drops unknown keys here, which is
@@ -221,6 +239,7 @@ const adapterSchema = z.object({
   postReplyReaction: postReplyReactionSchema.optional(),
   progress: progressSchema.optional(),
   reactionTrace: reactionTraceSchema.optional(),
+  steer: steerSchema.optional(),
 })
 
 export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [

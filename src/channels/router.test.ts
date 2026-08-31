@@ -123,6 +123,12 @@ class FakeSession {
   public onPrompt: ((text: string) => void | Promise<void>) | undefined
   public onContinue: (() => void | Promise<void>) | undefined
   public continued = 0
+  public steered: string[] = []
+  // When set, steer() REJECTS — matching the real AgentSession.steer, whose
+  // extension-command guard and template expansion surface as rejections of
+  // the returned promise, never sync throws. Lets tests pin the router's
+  // fallback to the queued-turn path.
+  public steerError: Error | undefined
 
   // Mirrors the real `AgentSession.agent` surface the router touches:
   // `agent.abort()` flips `agent.signal.aborted`. The router uses this as the
@@ -175,6 +181,10 @@ class FakeSession {
     this.prompts.push(text)
     this.agent.controller = new AbortController()
     await this.onPrompt?.(text)
+  }
+  steer = async (text: string): Promise<void> => {
+    if (this.steerError !== undefined) throw this.steerError
+    this.steered.push(text)
   }
   abort = async (): Promise<void> => {
     this.aborted++
@@ -18301,5 +18311,192 @@ describe('ChannelRouter background-child await suppression', () => {
 
     expect(continuationRuns).toBe(0)
     expect(logs.some((m) => m.includes('skipping todo continuation while background child runs'))).toBe(true)
+  })
+})
+
+describe('steer (mid-turn injection)', () => {
+  const steerConfig = (quietMs: number): ChannelAdapterConfig => ({ ...baseConfig, steer: { enabled: true, quietMs } })
+
+  // Route the first inbound, hold its prompt mid-flight so route() sees
+  // promptInFlight=true, and return the release + drain handles.
+  const holdFirstTurn = async (router: ChannelRouter, sessions: FakeSession[]) => {
+    await router.route(inbound({ text: 'long running request' }))
+    let released = false
+    let release: (() => void) | undefined
+    sessions[0]!.onPrompt = () =>
+      new Promise<void>((resolve) => {
+        // Hold ONLY the first prompt: any later prompt in the same test must
+        // resolve on its own, or the drain while-loop never exits and
+        // `await draining` hangs past the test timeout.
+        if (released) {
+          resolve()
+          return
+        }
+        release = resolve
+      })
+    const draining = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length === 1)
+    return {
+      release: () => {
+        released = true
+        release?.()
+      },
+      draining,
+    }
+  }
+
+  test('injects a mid-turn plain-text inbound into the running turn after the quiet window', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(30) })
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    // when: a follow-up engages while the turn is mid-flight
+    await router.route(inbound({ text: 'and also run the tests', externalMessageId: 'm2' }))
+    await waitFor(() => sessions[0]!.steered.length === 1)
+
+    // then: it was injected into the RUNNING turn, not queued as a second one
+    expect(sessions[0]!.steered[0]).toContain('## New message that arrived while the current turn was running')
+    expect(sessions[0]!.steered[0]).toContain('alice')
+    expect(sessions[0]!.steered[0]).toContain('and also run the tests')
+    expect(sessions[0]!.prompts).toHaveLength(1)
+
+    release()
+    await draining
+    // and: the steered message never spawns a follow-up turn of its own
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sessions[0]!.steered).toHaveLength(1)
+  })
+
+  test('coalesces a burst of mid-turn inbounds into ONE steer injection', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(150) })
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    await router.route(inbound({ text: 'first follow-up', externalMessageId: 'm2' }))
+    await router.route(inbound({ text: 'second follow-up', externalMessageId: 'm3' }))
+    await waitFor(() => sessions[0]!.steered.length === 1)
+
+    expect(sessions[0]!.steered[0]).toContain('## New messages that arrived while the current turn was running')
+    expect(sessions[0]!.steered[0]).toContain('first follow-up')
+    expect(sessions[0]!.steered[0]).toContain('second follow-up')
+    expect(sessions[0]!.prompts).toHaveLength(1)
+
+    release()
+    await draining
+  })
+
+  test('falls back to the queued turn when the turn finishes during the quiet window', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(400) })
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    await router.route(inbound({ text: 'and also run the tests', externalMessageId: 'm2' }))
+    expect(sessions[0]!.steered).toHaveLength(0)
+
+    // when: the turn ends before the quiet window elapses
+    release()
+    await draining
+
+    // then: the buffered inbound became the next batched turn, not a steer
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('and also run the tests')
+  })
+
+  test('queues a mid-turn inbound when steer is not configured (default behavior unchanged)', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, {})
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    await router.route(inbound({ text: 'and also run the tests', externalMessageId: 'm2' }))
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(1)
+
+    release()
+    await draining
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+  })
+
+  test('queues an inbound carrying attachments even when steer is enabled', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(30) })
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    await router.route(
+      inbound({
+        text: 'see screenshot',
+        externalMessageId: 'm2',
+        attachments: [{ id: 1, kind: 'file', ref: 'F1', filename: 'shot.png' }],
+      }),
+    )
+    // A non-steerable inbound arms no quiet-window timer at all (the steer
+    // gate rejects it inside route()), so the absence of a steer is
+    // deterministic the moment route() returns — no timer exists to fire.
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(1)
+
+    release()
+    await draining
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+  })
+
+  test('does not steer when no turn is in flight', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(30) })
+
+    await router.route(inbound({ text: 'hello' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sessions[0]!.prompts[0]).toContain('hello')
+    expect(sessions[0]!.steered).toHaveLength(0)
+  })
+
+  test('falls back to the queued turn when session.steer rejects', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(30), logs })
+    const { release, draining } = await holdFirstTurn(router, sessions)
+    sessions[0]!.steerError = new Error('extension command "/x" cannot be queued')
+
+    await router.route(inbound({ text: 'and also run the tests', externalMessageId: 'm2' }))
+    // when: the quiet window elapses and the steer rejects
+    await waitFor(() => logs.some((m) => m.includes('steer rejected')))
+    // steer rejected mid-turn; the message is back on the queue, not dropped
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(1)
+
+    release()
+    await draining
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('and also run the tests')
+    expect(logs.some((m) => m.includes('steer rejected'))).toBe(true)
+  })
+
+  test('/stop drops a pending steer buffer like queued prompts', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(150) })
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    await router.route(inbound({ text: 'and also run the tests', externalMessageId: 'm2' }))
+    expect(sessions[0]!.steered).toHaveLength(0)
+
+    // when: the user stops the turn while the steer is still in its window
+    await router.route(inbound({ text: '/stop', externalMessageId: 'm-stop' }))
+    release()
+    await draining
+
+    // then: the buffered steer is dropped with the queued prompts, and the
+    // cleared quiet-window timer never fires a steer afterwards. Negative
+    // assertion on a cleared timer: no event signals an absence, so the only
+    // proof the timer is gone is a bounded real wait past the 150ms window
+    // (deterministic fake timers would freeze the router's live debounce
+    // machinery this harness drives through real callbacks).
+    await Bun.sleep(250)
+    expect(sessions[0]!.aborted).toBe(1)
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(1)
   })
 })

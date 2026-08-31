@@ -125,6 +125,7 @@ typeclaw channel reauth kakaotalk
 - **Provisional registration**: chats not surfaced by `getChats` are registered provisionally on first message.
 - **No combined send**: files are sent first, then text, as separate API calls.
 - **Split messages**: users often send one thought as several rapid bubbles, and the default router debounce (600ms/1500ms) can start a turn on the first bubble alone. Set `inboundBatching` (`quietMs: 2500`, `maxWaitMs: 6000` is a good start) to wait for a quiet gap and answer all bubbles in one turn.
+- **Steer (mid-turn injection)**: by default a bubble that arrives while the agent is still answering waits for the next turn. `steer: { "enabled": true }` injects it into the RUNNING turn instead (after a `quietMs` coalescing window), so a follow-up like "그리고 테스트도 돌려줘" lands while the work is still in progress. Attachments and reply-quotes always take the normal queued path. See [/reference/channel-adapters](/docs/reference/channel-adapters).
 - **Reactions**: `channel_react` posts an emoticon-pack reaction through KakaoTalk's HTTP reaction endpoint (independent of the LOCO device profile). Four reactions are live-verified — like (`1200282_026`), eyes (`1200509_012`), heart (`1200281_001`), laugh (`1200282_002`) — and other emoji names map to `unsupported` rather than guessing an ID. The endpoint rejects integer reaction values with HTTP 400, so only these catalog string IDs are sent.
 - **Message editing**: `channel_edit` maps to LOCO `MODIFYMSG` and can edit only a message authored by the agent. A raw test-account probe accepted the exact text packet with status `0`; the CLI/SDK must omit `extra` for default text edits because Kakao returned `-303` when `{}` was sent. Verify the replacement in the KakaoTalk client before enabling progress.
 
@@ -156,7 +157,8 @@ typeclaw channel reauth kakaotalk
         "successReaction": "like",
         "errorReaction": "like"
       },
-      "reactionTrace": { "enabled": true, "maxEvents": 100, "includeUnknownMethods": true }
+      "reactionTrace": { "enabled": true, "maxEvents": 100, "includeUnknownMethods": true },
+      "steer": { "enabled": true, "quietMs": 2500 }
     }
   }
 }

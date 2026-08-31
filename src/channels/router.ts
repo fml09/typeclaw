@@ -929,6 +929,15 @@ type LiveSession = {
   // Wait (ms) computed by the most recent scheduleDebouncedDrain call.
   // Test-observable via __testing.scheduledDrainDelay; not read by logic.
   debounceWaitMs: number
+  // Mid-turn steer buffer (`channels.<adapter>.steer.enabled`). An engaged
+  // plain-text inbound that arrives while `promptInFlight` is held here for
+  // `steer.quietMs` and then injected into the RUNNING turn via the pi SDK's
+  // steering queue (`session.steer()`), instead of waiting for the next drain
+  // iteration. Buffered items are the exact QueuedInbound shape enqueue()
+  // builds, so every fallback path (turn ended during the quiet window,
+  // steer rejection, /stop) can treat them as ordinary queued prompts.
+  steerBuffer: QueuedInbound[]
+  steerTimer: ReturnType<typeof setTimeout> | null
   typingTimer: ReturnType<typeof setInterval> | null
   typingStartedAt: number
   typingTimedOut: boolean
@@ -2523,6 +2532,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         draining: false,
         debounceTimer: null,
         debounceWaitMs: 0,
+        steerBuffer: [],
+        steerTimer: null,
         typingTimer: null,
         typingStartedAt: 0,
         typingTimedOut: false,
@@ -3658,6 +3669,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.firstUnprocessedAt = 0
     live.promptQueue.length = 0
     live.pendingSystemReminders.length = 0
+    // /stop cancels every pending turn input, and a buffered steer inbound is
+    // exactly that: drop it with the queued prompts above. A steer that was
+    // already delivered stays delivered — this only clears the quiet window.
+    clearSteerTimer(live)
+    live.steerBuffer.length = 0
     live.continueReplyTurn = null
     void dropContinuationReactions(live)
     enqueueTodoOutcomeWrite(live, {
@@ -4073,6 +4089,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.lastQuestionSignal = null
         } finally {
           live.promptInFlight = false
+          // The turn is over: buffered steer inbounds can no longer be injected
+          // mid-turn, so hand them to the ordinary queue. The drain while-loop
+          // below picks them up as the next batched turn, and the
+          // pendingTeardown carry moves them to the reload successor.
+          flushSteerBufferToQueue(live)
           const sentReplyThisTurn = live.successfulChannelSends > successfulSendsBeforePrompt
           // The engage reaction is a transient "working" signal. A configured
           // progress reaction must remain present across reminder-only retries,
@@ -4585,9 +4606,32 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       event.replyToBotMessageId === null &&
       !live.multiHumanGroup
 
-    const engageReaction = autoReactOnEngage(event)
-
     updateLoopGuard(live, event)
+
+    // Steer gate: with `channels.<adapter>.steer.enabled`, a plain-text
+    // inbound that engages while a turn is mid-flight is injected into the
+    // RUNNING turn (after a short quiet window) instead of queueing a
+    // separate follow-up turn. Reload-teardown and aborting turns fall back
+    // to the queue so the message is never steered into a session that is
+    // about to die.
+    if (
+      options.configForAdapter(live.key.adapter)?.steer?.enabled === true &&
+      live.promptInFlight &&
+      !live.pendingTeardown &&
+      !live.destroyed &&
+      isSteerableInbound(event)
+    ) {
+      bufferSteerInbound(live, event)
+      startTypingHeartbeat(live)
+      return
+    }
+
+    // A non-steerable inbound (attachment, reply-quote, review round) must not
+    // jump ahead of buffered steer inbounds: deliver the buffer onto the queue
+    // first so the next turn sees both in arrival order.
+    if (live.steerBuffer.length > 0) flushSteerBufferToQueue(live)
+
+    const engageReaction = autoReactOnEngage(event)
 
     enqueue(live, event, engageReaction)
 
@@ -4701,25 +4745,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     engageReaction: Promise<ReactionRef | null> | null,
   ): void => {
     clearQueuedEngageReactions(live)
-    live.promptQueue.push({
-      text: event.text,
-      ...(event.referenceContext !== undefined ? { referenceContext: event.referenceContext } : {}),
-      ...(event.attachments !== undefined && event.attachments.length > 0 ? { attachments: event.attachments } : {}),
-      authorId: event.authorId,
-      authorName: event.authorName,
-      authorIsBot: event.authorIsBot,
-      externalMessageId: event.externalMessageId,
-      ...(event.reactionRef !== undefined ? { reactionRef: event.reactionRef } : {}),
-      ...(engageReaction !== null ? { engageReaction } : {}),
-      isBotMention: event.isBotMention,
-      ...(event.isBotMentionOnly !== undefined ? { isBotMentionOnly: event.isBotMentionOnly } : {}),
-      replyToBotMessageId: event.replyToBotMessageId,
-      isDm: event.isDm,
-      ...(event.typingThread !== undefined ? { typingThread: event.typingThread } : {}),
-      ...(event.githubReviewRound !== undefined ? { githubReviewRound: event.githubReviewRound } : {}),
-      receivedAt: now(),
-      ts: event.ts,
-    })
+    live.promptQueue.push(toQueuedInbound(event, engageReaction))
     if (event.githubReviewRound !== undefined) {
       live.githubReviewRound = registerGithubReviewRound(event.githubReviewRound)
       persistGithubReviewRound(live, live.githubReviewRound)
@@ -4728,6 +4754,134 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // starts the heartbeat right after enqueue, ahead of drain). drain() later
     // refreshes it to the last inbound of a coalesced batch.
     if (event.typingThread !== undefined) live.currentTurnTypingThread = event.typingThread
+  }
+
+  // The exact shape every pending-inbound consumer expects — enqueue() pushes
+  // it onto promptQueue, bufferSteerInbound() parks it in the steer buffer so
+  // the fallback paths can hand it to promptQueue verbatim.
+  const toQueuedInbound = (
+    event: InboundMessage,
+    engageReaction: Promise<ReactionRef | null> | null,
+  ): QueuedInbound => ({
+    text: event.text,
+    ...(event.referenceContext !== undefined ? { referenceContext: event.referenceContext } : {}),
+    ...(event.attachments !== undefined && event.attachments.length > 0 ? { attachments: event.attachments } : {}),
+    authorId: event.authorId,
+    authorName: event.authorName,
+    authorIsBot: event.authorIsBot,
+    externalMessageId: event.externalMessageId,
+    ...(event.reactionRef !== undefined ? { reactionRef: event.reactionRef } : {}),
+    ...(engageReaction !== null ? { engageReaction } : {}),
+    isBotMention: event.isBotMention,
+    ...(event.isBotMentionOnly !== undefined ? { isBotMentionOnly: event.isBotMentionOnly } : {}),
+    replyToBotMessageId: event.replyToBotMessageId,
+    isDm: event.isDm,
+    ...(event.typingThread !== undefined ? { typingThread: event.typingThread } : {}),
+    ...(event.githubReviewRound !== undefined ? { githubReviewRound: event.githubReviewRound } : {}),
+    receivedAt: now(),
+    ts: event.ts,
+  })
+
+  // --- Steer (mid-turn injection) ------------------------------------------
+  //
+  // With `channels.<adapter>.steer.enabled`, an engaged plain-text inbound
+  // that arrives while the live session's turn is still running (promptInFlight)
+  // is parked in `steerBuffer` for a short quiet window (split-bubble platforms
+  // keep coalescing) and then injected into the RUNNING turn via the pi SDK's
+  // steering queue: `session.steer()` delivers after the current assistant
+  // message's tool calls settle, before the next model call, so the model folds
+  // the follow-up into the work it is already doing instead of answering it as
+  // a separate late turn.
+  //
+  // Every failure path lands the buffered inbounds on the ordinary queued
+  // path rather than dropping them:
+  //   - the turn finishes during the quiet window → drain()'s prompt-finally
+  //     flushes the buffer onto promptQueue, where the next iteration processes
+  //     it as a normal batched turn;
+  //   - the turn is aborting, marked for reload teardown, or already destroyed
+  //     at flush time → promptQueue (the teardown carry hands it to the
+  //     successor session);
+  //   - `session.steer()` rejects → promptQueue. The composed steer text is
+  //     wrapped in an H2 section, so it never trips the SDK's extension-command
+  //     guard, but the belt stays on.
+  // /stop drops the buffer alongside the queued prompts it already cancels.
+
+  const isSteerableInbound = (event: InboundMessage): boolean =>
+    event.referenceContext === undefined &&
+    (event.attachments === undefined || event.attachments.length === 0) &&
+    event.githubReviewRound === undefined &&
+    event.text.trim().length > 0
+
+  const steerQuietMsFor = (live: LiveSession): number => {
+    const adapterConfig = options.configForAdapter(live.key.adapter)
+    return adapterConfig?.steer?.quietMs ?? adapterConfig?.inboundBatching?.quietMs ?? HOT_DEBOUNCE_MS
+  }
+
+  // route() calls this INSTEAD of enqueue() when steer is enabled and the turn
+  // is mid-flight. The engage ack reaction is deliberately skipped: the message
+  // is consumed within the current turn, so the transient :eyes: would be added
+  // and removed in the same breath.
+  const bufferSteerInbound = (live: LiveSession, event: InboundMessage): void => {
+    live.steerBuffer.push(toQueuedInbound(event, null))
+    clearTimeout(live.steerTimer ?? undefined)
+    live.steerTimer = setTimeout(() => {
+      live.steerTimer = null
+      void flushSteerBufferMidTurn(live)
+    }, steerQuietMsFor(live))
+  }
+
+  // Push buffered steer inbounds onto the ordinary queue. Fallback paths only —
+  // never the happy path. Safe at any point in the turn lifecycle: pushing to
+  // promptQueue never disturbs an in-flight prompt, and the drain while-loop
+  // (or the teardown carry) picks the items up.
+  const flushSteerBufferToQueue = (live: LiveSession): void => {
+    clearTimeout(live.steerTimer ?? undefined)
+    live.steerTimer = null
+    const buffered = live.steerBuffer.splice(0, live.steerBuffer.length)
+    if (buffered.length === 0) return
+    live.promptQueue.push(...buffered)
+  }
+
+  // Quiet-window timer callback. By construction the buffer is non-empty here:
+  // the timer is armed only by bufferSteerInbound and cleared by every flush.
+  // Async because session.steer() is: the SDK's extension-command guard and
+  // template expansion surface as REJECTIONS, never sync throws, so the
+  // fallback below is a catch on the awaited call, not on a sync error.
+  const flushSteerBufferMidTurn = async (live: LiveSession): Promise<void> => {
+    if (live.steerBuffer.length === 0) return
+    if (live.destroyed) {
+      live.steerBuffer.length = 0
+      return
+    }
+    const turnStillRunning = live.promptInFlight && !live.pendingTeardown && live.session.agent.signal?.aborted !== true
+    if (!turnStillRunning) {
+      flushSteerBufferToQueue(live)
+      if (!live.draining) scheduleDebouncedDrain(live)
+      return
+    }
+    const text = composeSteerPrompt(live.steerBuffer, live.key.adapter)
+    const buffered = live.steerBuffer.splice(0, live.steerBuffer.length)
+    try {
+      await live.session.steer(text)
+      // The steered authors are participants of the RUNNING turn now: reply
+      // targeting and the post-turn sticky grant must see them, exactly like
+      // the batch authors drain() seeded at turn start. add() is idempotent,
+      // so a burst of same-author bubbles needs no dedup pass.
+      for (const item of buffered) live.currentTurnAuthorIds.add(item.authorId)
+      logger.info(`[channels] ${live.keyId}: steered ${buffered.length} inbound(s) into the running turn`)
+    } catch (err) {
+      logger.warn(`[channels] ${live.keyId}: steer rejected (${describeError(err)}); falling back to the queued turn`)
+      live.promptQueue.push(...buffered)
+      if (!live.draining) scheduleDebouncedDrain(live)
+    }
+  }
+
+  // Drop the pending quiet-window timer without touching the buffer. /stop
+  // clears both (it cancels queued prompts the same way); teardown only needs
+  // the timer gone — normal turn end flushes the buffer through drain().
+  const clearSteerTimer = (live: LiveSession): void => {
+    clearTimeout(live.steerTimer ?? undefined)
+    live.steerTimer = null
   }
 
   const registerOutbound = (adapter: ChannelKey['adapter'], cb: OutboundCallback): void => {
@@ -6296,6 +6450,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     dropEngageReactions(live, live.currentTurnEngageReactions)
     live.currentTurnEngageReactions = []
     void dropContinuationReactions(live)
+    clearSteerTimer(live)
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
     if (live.progressMessage?.editTimer !== null && live.progressMessage?.editTimer !== undefined) {
       clearTimeout(live.progressMessage.editTimer)
@@ -7675,6 +7830,39 @@ function formatInboundPromptLines(
     ),
   )
   return lines.join('\n')
+}
+
+// Composes the user-turn message the router injects via `session.steer()` when
+// `channels.<adapter>.steer` is enabled and an inbound engages while a turn is
+// mid-flight. The pi SDK delivers it after the current assistant message's
+// tool calls settle, so the model reads it as a follow-up arriving DURING its
+// work: the header says exactly that, and the closing line points back to the
+// current turn's reply rules (channel_reply, send caps, NO_REPLY) rather than
+// re-deriving them. Author lines reuse formatAuthorLine so attribution matches
+// the `## Current message(s)` block byte-for-byte (defusing included). This is
+// conversation content from a human, so per the SYSTEM MESSAGE convention it
+// uses an H2 section, never the `[SYSTEM MESSAGE]` framing. Exported for tests.
+export function composeSteerPrompt(
+  batch: readonly Pick<QueuedInbound, 'ts' | 'authorId' | 'authorName' | 'authorIsBot' | 'text'>[],
+  adapter: AdapterId,
+): string {
+  const parts: string[] = []
+  parts.push(
+    batch.length === 1
+      ? '## New message that arrived while the current turn was running'
+      : '## New messages that arrived while the current turn was running',
+    '',
+  )
+  for (const item of batch) {
+    parts.push(formatAuthorLine(item.ts, adapter, item.authorId, item.authorName, item.authorIsBot, item.text))
+  }
+  parts.push(
+    '',
+    'This arrived after the current turn started, so it was not part of the original request.',
+    'Fold it into the work you are already doing and answer it together with everything else this',
+    'turn still owes, using the same reply rules as the current message.',
+  )
+  return parts.join('\n')
 }
 
 export type { QuoteAnchorSource } from './types'
