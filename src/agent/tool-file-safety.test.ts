@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -60,6 +60,29 @@ test('plugin collisions cannot inherit first-party no-file-operand shortcuts', a
       }),
     ).rejects.toThrow(/blocked:|ambiguous local file operand/)
   } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('look_at pinned snapshots preserve the image extension', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-look-at-extension-'))
+  const imagePath = path.join(agentDir, 'screen.jpg')
+  const image = Buffer.from([0xff, 0xd8, 0xff, 0xd9])
+  await writeFile(imagePath, image)
+  const args = { images: [{ path: imagePath }] }
+
+  const pinned = await enforceAndPinToolFiles({
+    tool: 'look_at',
+    args,
+    agentDir,
+    genericInputs: true,
+    toolProvenance: 'first-party',
+  })
+  try {
+    expect(path.extname(args.images[0]!.path)).toBe('.jpg')
+    expect(await Bun.file(args.images[0]!.path).bytes()).toEqual(image)
+  } finally {
+    await pinned.cleanup()
     await rm(agentDir, { recursive: true, force: true })
   }
 })

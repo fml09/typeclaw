@@ -150,7 +150,10 @@ export async function enforceAndPinToolFiles(
     let copiedBytes = 0
     for (let i = 0; i < verified.length; i++) {
       const input = verified[i] as VerifiedInput
-      const pinned = path.join(dir, String(i))
+      // Tools such as look_at infer media type from the execution path. Keep
+      // the original suffix while changing the basename and file identity.
+      const suffix = input.kind === 'file' ? path.extname(input.original) : ''
+      const pinned = path.join(dir, `${i}${suffix}`)
       if (input.kind === 'file') {
         const source = await openInput(input.resolved, input.original)
         try {
