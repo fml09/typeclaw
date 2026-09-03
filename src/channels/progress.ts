@@ -3,6 +3,7 @@ export const CHANNEL_PROGRESS_THINKING_TEXT = '💭 Thinking…'
 export const CHANNEL_PROGRESS_WRITING_TEXT = '✍️ Writing the response…'
 export const CHANNEL_PROGRESS_WORKING_TEXT = '🛠️ Working…'
 export const CHANNEL_PROGRESS_REVIEWING_TEXT = '🔍 Reviewing the result…'
+export const CHANNEL_PROGRESS_COMPLETE_TEXT = '✅ Done.'
 export const CHANNEL_PROGRESS_FAILURE_TEXT = '⚠️ I could not finish this response.'
 
 // Base delay for the first progress-edit retry, doubling per consecutive

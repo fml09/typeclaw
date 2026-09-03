@@ -94,6 +94,7 @@ import {
   type ChannelSessionRecord,
 } from './persistence'
 import {
+  CHANNEL_PROGRESS_COMPLETE_TEXT,
   CHANNEL_PROGRESS_FAILURE_TEXT,
   CHANNEL_PROGRESS_INITIAL_TEXT,
   progressEditRetryDelayMs,
@@ -230,6 +231,13 @@ export const SESSION_GC_INTERVAL_MS = 60 * 1000
 export const MAX_CHANNEL_SENDS_PER_TURN = 10
 export const ENGAGE_REACTION_EMOJI = 'eyes'
 export const CONTINUATION_REACTION_EMOJI = 'hourglass_flowing_sand'
+// Kakao has only four verified reaction ids. Mid-turn delivery uses two of
+// them as a compact, message-local routing receipt: eyes means the bubble was
+// folded into the turn already running; like means it is waiting on the next
+// queued turn. These override Kakao's normal "typing replaces eager reaction"
+// rule only for a mid-turn delivery decision, not for every inbound.
+const KAKAO_STEER_REACTION_EMOJI = 'eyes'
+const KAKAO_QUEUE_REACTION_EMOJI = 'like'
 // Best-effort "zipping it / going quiet" ack dropped on the triggering message
 // when the model disengages (channel_disengage); fire-and-forget like engage :eyes:.
 export const DISENGAGE_REACTION_EMOJI = 'zipper_mouth_face'
@@ -3109,6 +3117,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (phase === 'stop' && typingThread !== null) live.dirtyTypingThreads.delete(typingThread)
   }
 
+  // Kakao clears its composing dots whenever a message is delivered. Runtime
+  // progress posts/edits bypass send()'s ordinary post-delivery re-arm, so keep
+  // the rule in one helper and use it from every delivery surface. The prompt
+  // gate prevents a terminal cleanup edit from resurrecting typing after work
+  // has ended; the timer gate preserves teardown/timeout stops.
+  const rearmTypingAfterDelivery = (live: LiveSession): void => {
+    if (!live.promptInFlight || live.typingTimer === null) return
+    void fireTyping(live, 'tick')
+  }
+
   // A 'stop' must clear EVERY flat-DM typingThread a tick set a status on this
   // session — not just the current anchor — or a migrated-away anchor strands
   // its "is typing..." (see `dirtyTypingThreads`). Clears run concurrently; each
@@ -3216,7 +3234,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const callback of Array.from(callbacks)) {
       try {
         const result = await callback(message)
-        if (result.ok) return result
+        if (result.ok) {
+          rearmTypingAfterDelivery(live)
+          return result
+        }
         lastError = result.error
       } catch (err) {
         lastError = describeError(err)
@@ -3248,8 +3269,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     )
   }
 
-  const applyProgressEdit = async (live: LiveSession, state: ProgressMessageState, text: string): Promise<boolean> => {
+  const applyProgressEdit = async (
+    live: LiveSession,
+    state: ProgressMessageState,
+    text: string,
+    rearmTyping = true,
+  ): Promise<boolean> => {
     let result: EditMessageResult
+    // Record attempts, not only successes. Otherwise a rejected MODIFYMSG
+    // leaves lastEditAt stale and the terminal cleanup retries immediately,
+    // which is exactly the burst Kakao rejects with -303.
+    state.lastEditAt = now()
     try {
       result = await editMessage({
         adapter: live.key.adapter,
@@ -3270,8 +3300,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.progressEditFailures = 0
     if (live.progressMessage === state) {
       state.lastText = text
-      state.lastEditAt = now()
     }
+    if (rearmTyping) rearmTypingAfterDelivery(live)
     return true
   }
 
@@ -3359,6 +3389,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const subscribeProgressActivity = (session: AgentSession, live: LiveSession): (() => void) =>
     session.subscribe((event: unknown) => {
       if (!live.promptInFlight || live.destroyed || live.progressReplyFinalized) return
+      // channel_reply is itself the delivery boundary, not work whose lifecycle
+      // should open another progress bubble. In particular, Kakao status replies
+      // are sealed below; the tool's trailing execution_end event must not
+      // immediately follow that reply with a stranded "Reviewing…" message.
+      if (typeof event === 'object' && event !== null && 'toolName' in event && event.toolName === 'channel_reply') {
+        return
+      }
       const toolName = progressToolLogEnabledFor(live) ? toolNameForEvent(event) : null
       if (toolName !== null) {
         live.progressToolLog.push(toolName)
@@ -3368,7 +3405,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (phase !== null) requestProgressUpdate(live, renderProgressText(phase, live.progressToolLog))
     })
 
-  const flushProgressEditNow = (live: LiveSession, state: ProgressMessageState): Promise<boolean> => {
+  const flushProgressEditNow = (
+    live: LiveSession,
+    state: ProgressMessageState,
+    rearmTyping = true,
+  ): Promise<boolean> => {
     if (state.flushInFlight !== null) return state.flushInFlight
 
     const flush = (async (): Promise<boolean> => {
@@ -3388,14 +3429,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // Pacing: the awaited in-flight edit and this one would otherwise fire
       // back-to-back, which Kakao's MODIFYMSG rate limit rejects with -303.
       const intervalMs = progressConfigFor(live)?.updateIntervalMs ?? 750
-      const gap = Math.max(0, Math.max(intervalMs, PROGRESS_EDIT_MIN_GAP_MS) - (now() - state.lastEditAt))
+      const retryGapMs =
+        live.progressEditFailures > 0
+          ? progressEditRetryDelayMs(live.progressEditFailures)
+          : Math.max(intervalMs, PROGRESS_EDIT_MIN_GAP_MS)
+      const gap = Math.max(0, retryGapMs - (now() - state.lastEditAt))
       if (gap > 0) await delay(gap)
       if (live.destroyed || live.progressMessage !== state || live.progressDisabled || state.pendingText === null) {
         return false
       }
       const text = state.pendingText
       state.pendingText = null
-      return await applyProgressEdit(live, state, text)
+      return await applyProgressEdit(live, state, text, rearmTyping)
     })()
 
     state.flushInFlight = flush
@@ -3421,10 +3466,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // two MODIFYMSG packets in the same tick is what tripped Kakao's -303.
     if (state.lastText !== text) {
       state.pendingText = text
-      const edited = await flushProgressEditNow(live, state)
+      // This path terminalizes the progress bubble. A final message must leave
+      // Kakao typing cleared, so unlike an intermediate phase/status edit it
+      // deliberately does not emit a post-edit typing tick.
+      const edited = await flushProgressEditNow(live, state, false)
       if (!edited || live.progressDisabled || live.progressMessage !== state || state.lastText !== text) {
         state.pendingText = null
-        if (live.progressMessage === state) live.progressMessage = null
+        // Keep a transiently-failed message addressable. The caller can deliver
+        // the answer as a fresh post, then terminal cleanup can retry this old
+        // bubble as Done/failed instead of stranding it at Working/Reviewing.
         return false
       }
     }
@@ -3432,6 +3482,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.progressMessage = null
     live.progressPendingText = null
     return true
+  }
+
+  const finishProgressMessageWithRetries = async (live: LiveSession, text: string): Promise<boolean> => {
+    while (!live.progressDisabled && live.progressMessage !== null) {
+      if (await finishProgressMessage(live, text)) return true
+      // A changed/detached state cannot be retried by this terminalizer. A
+      // stable state retries with the pacing in flushProgressEditNow; repeated
+      // failures trip recordProgressEditFailure's bounded disable latch.
+      if (live.progressDisabled || live.progressMessage === null) return false
+    }
+    return false
   }
 
   const deliverProgressReply = async (
@@ -3447,6 +3508,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       state.pendingText = text
       const edited = await flushProgressEditNow(live, state)
       if (!edited || live.progressDisabled || live.progressMessage !== state) return null
+      // Kakao surfaces MODIFYMSG replacements as conspicuous message changes.
+      // Once model-authored prose has landed, that bubble is immutable from the
+      // runtime's perspective: later tool work starts a fresh progress message
+      // instead of replacing the answer with Working/Reviewing phases.
+      if (live.key.adapter === 'kakaotalk') {
+        live.progressMessage = null
+        live.progressPendingText = null
+      }
       return { ok: true, messageId: state.messageId, messageIds: [state.messageId] }
     }
     const messageId = state.messageId
@@ -3668,10 +3737,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           thread: live.key.thread,
           text: EMPTY_TURN_FALLBACK_TEXT,
         },
-        { source: 'system', outputKind: 'meta' },
+        { source: 'system', outputKind: 'meta', progressReply: 'final' },
       )
       if (!result.ok) {
         logger.warn(`[channels] ${live.keyId}: empty-turn fallback send failed: ${result.error}`)
+      }
+      if (live.progressMessage !== null) {
+        await finishProgressMessageWithRetries(
+          live,
+          result.ok ? CHANNEL_PROGRESS_COMPLETE_TEXT : CHANNEL_PROGRESS_FAILURE_TEXT,
+        )
       }
     } finally {
       void dropContinuationReactions(live)
@@ -3793,7 +3868,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (round === null || isGithubReviewRoundComplete(round)) return
     if (hasGithubReviewRoundDismissalAttempt(round)) {
       const key = githubReviewRoundKey(round)
-      for (const sibling of liveSessions.values()) {
+      for (const sibling of Array.from(liveSessions.values())) {
         if (sibling.githubReviewRound !== null && githubReviewRoundKey(sibling.githubReviewRound) === key) {
           persistGithubReviewRound(sibling, sibling.githubReviewRound)
         }
@@ -3835,7 +3910,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     const promoted = promoteGithubReviewRound(round, waiter.key.thread)
     if (promoted === null) return
-    for (const sibling of liveSessions.values()) {
+    for (const sibling of Array.from(liveSessions.values())) {
       if (
         sibling.githubReviewRound !== null &&
         githubReviewRoundKey(sibling.githubReviewRound) === githubReviewRoundKey(round)
@@ -3995,13 +4070,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         thread: live.key.thread,
         text: `⚠️ ${pending.safeMessage}`,
       },
-      { source: 'system', outputKind: 'meta' },
+      { source: 'system', outputKind: 'meta', progressReply: 'final' },
     ).catch((sendErr) => {
       logger.warn(`[channels] ${live.keyId}: provider-error notice send threw: ${describeError(sendErr)}`)
       return null
     })
     if (result !== null && !result.ok) {
       logger.warn(`[channels] ${live.keyId}: provider-error notice send failed: ${result.error}`)
+    }
+    if (live.progressMessage !== null) {
+      await finishProgressMessageWithRetries(
+        live,
+        result?.ok === true ? CHANNEL_PROGRESS_COMPLETE_TEXT : CHANNEL_PROGRESS_FAILURE_TEXT,
+      )
     }
   }
 
@@ -4369,21 +4450,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             !keepProgressForContinuation &&
             (live.progressMessage !== null || live.progressStartPromise !== null)
           ) {
-            // A turn that delivered a real reply must not ALSO surface the leftover
-            // progress bubble as a trailing "Done." message: the reply itself is the
-            // completion signal, and on Kakao every MODIFYMSG lands as a fresh
-            // message event, so the tombstone reads as a spurious extra bubble
-            // after the answer. Release the state silently — the bubble keeps
-            // showing the last phase (or the ack text it was edited to) — and
-            // reserve the failure text for turns that genuinely produced nothing.
+            // A Kakao status reply is sealed and detached in deliverProgressReply,
+            // so any progress state still active here is a distinct, later bubble.
+            // It must receive a terminal phase rather than strand the conversation
+            // at Working/Reviewing. Other adapters retain the historical silent
+            // release because their progress bubble may itself be the visible reply.
             if (usableReplyThisTurn) {
-              if (live.progressMessage?.editTimer !== null && live.progressMessage?.editTimer !== undefined) {
-                clearTimeout(live.progressMessage.editTimer)
+              if (live.key.adapter === 'kakaotalk') {
+                await finishProgressMessageWithRetries(live, CHANNEL_PROGRESS_COMPLETE_TEXT)
+              } else {
+                if (live.progressMessage?.editTimer !== null && live.progressMessage?.editTimer !== undefined) {
+                  clearTimeout(live.progressMessage.editTimer)
+                }
+                live.progressMessage = null
+                live.progressPendingText = null
               }
-              live.progressMessage = null
-              live.progressPendingText = null
             } else {
-              await finishProgressMessage(live, CHANNEL_PROGRESS_FAILURE_TEXT)
+              await finishProgressMessageWithRetries(live, CHANNEL_PROGRESS_FAILURE_TEXT)
             }
           }
           const postReplyReaction = options.configForAdapter(live.key.adapter)?.postReplyReaction
@@ -4886,7 +4969,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // first so the next turn sees both in arrival order.
     if (live.steerBuffer.length > 0) flushSteerBufferToQueue(live)
 
-    const engageReaction = autoReactOnEngage(event)
+    const engageReaction =
+      live.promptInFlight && event.adapter === 'kakaotalk'
+        ? autoReactOnEngage(event, KAKAO_QUEUE_REACTION_EMOJI)
+        : autoReactOnEngage(event)
 
     enqueue(live, event, engageReaction)
 
@@ -5074,9 +5160,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const steerQuietMsFor = (live: LiveSession): number => resolveDeliveryMode(live.key).quietMs
 
   // route() calls this INSTEAD of enqueue() when steer is enabled and the turn
-  // is mid-flight. The engage ack reaction is deliberately skipped: the message
-  // is consumed within the current turn, so the transient :eyes: would be added
-  // and removed in the same breath.
+  // is mid-flight. The reaction is delayed until the quiet window resolves so
+  // Kakao can show the actual delivery decision: eyes on a successful steer,
+  // like when the message falls back to the queued turn.
   //
   // `immediate` is the explicit `/steer <text>` form: the operator already said
   // "now", so there is nothing left to coalesce and the quiet window is zero.
@@ -5102,6 +5188,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.steerTimer = null
     const buffered = live.steerBuffer.splice(0, live.steerBuffer.length)
     if (buffered.length === 0) return
+    for (const item of buffered) {
+      const engageReaction = autoReactOnKakaoDelivery(live, item, 'queue')
+      if (engageReaction !== null) item.engageReaction = engageReaction
+    }
     live.promptQueue.push(...buffered)
   }
 
@@ -5130,10 +5220,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // targeting and the post-turn sticky grant must see them, exactly like
       // the batch authors drain() seeded at turn start. add() is idempotent,
       // so a burst of same-author bubbles needs no dedup pass.
-      for (const item of buffered) live.currentTurnAuthorIds.add(item.authorId)
+      const engageReactions: Array<Promise<ReactionRef | null>> = []
+      for (const item of buffered) {
+        live.currentTurnAuthorIds.add(item.authorId)
+        const engageReaction = autoReactOnKakaoDelivery(live, item, 'steer')
+        if (engageReaction !== null) engageReactions.push(engageReaction)
+      }
+      if (live.promptInFlight) {
+        // engageAddPromises captures this array by reference at prompt start,
+        // so appending here makes the current turn's terminal cleanup own the
+        // late-arriving steer receipts too.
+        live.currentTurnEngageReactions.push(...engageReactions)
+      } else {
+        // session.steer() can resolve on the same edge as prompt completion.
+        // If turn cleanup already passed, retire the just-added receipts here
+        // instead of leaving them attached with no future owner.
+        void dropEngageReactions(live, engageReactions)
+      }
       logger.info(`[channels] ${live.keyId}: steered ${buffered.length} inbound(s) into the running turn`)
     } catch (err) {
       logger.warn(`[channels] ${live.keyId}: steer rejected (${describeError(err)}); falling back to the queued turn`)
+      for (const item of buffered) {
+        const engageReaction = autoReactOnKakaoDelivery(live, item, 'queue')
+        if (engageReaction !== null) item.engageReaction = engageReaction
+      }
       live.promptQueue.push(...buffered)
       if (!live.draining) scheduleDebouncedDrain(live)
     }
@@ -5265,7 +5375,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // A queued delivery must not jump ahead of inbounds already parked in the
     // steer buffer — same arrival-order rule a non-steerable inbound follows.
     if (live.steerBuffer.length > 0) flushSteerBufferToQueue(live)
-    enqueue(live, carried, null)
+    const engageReaction = key.adapter === 'kakaotalk' ? autoReactOnEngage(carried, KAKAO_QUEUE_REACTION_EMOJI) : null
+    enqueue(live, carried, engageReaction)
     startTypingHeartbeat(live)
     if (!live.draining) scheduleDebouncedDrain(live)
   }
@@ -5385,36 +5496,74 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return lastError ?? { ok: false, error: 'no reaction removal callback handled request', code: 'unsupported' }
   }
 
-  // Best-effort acknowledgment: drop a configured progress reaction on the
-  // triggering inbound when the adapter opts into runtime-owned progress.
-  // Without a configured progress reaction, preserve the historical fallback:
-  // :eyes: is used only when the adapter has no visible typing indicator.
-  // Fire-and-forget so a reaction failure can never block engagement.
-  const autoReactOnEngage = (event: InboundMessage): Promise<ReactionRef | null> | null => {
-    if (event.reactionRef === undefined) return null
-    const progress = options.configForAdapter(event.adapter)?.progress
-    const progressEmoji = progress?.enabled === true ? progress.startReaction : undefined
-    if (progressEmoji === undefined && typingCapableAdapters.has(event.adapter)) return null
-    const emoji = progressEmoji ?? ENGAGE_REACTION_EMOJI
+  type AutomaticReactionTarget = Pick<InboundMessage, 'adapter' | 'workspace' | 'chat' | 'thread' | 'reactionRef'>
+
+  // Shared best-effort add path for ordinary engagement and Kakao's explicit
+  // steer/queue receipts. Returning the per-instance ref lets the normal turn
+  // lifecycle remove the transient marker before a configured terminal
+  // reaction is added.
+  const addAutomaticReaction = (
+    target: AutomaticReactionTarget,
+    emoji: string,
+    logLabel: string,
+  ): Promise<ReactionRef | null> | null => {
+    if (target.reactionRef === undefined) return null
     const addResult = react({
-      adapter: event.adapter,
-      workspace: event.workspace,
-      chat: event.chat,
-      thread: event.thread,
-      reactionRef: event.reactionRef,
+      adapter: target.adapter,
+      workspace: target.workspace,
+      chat: target.chat,
+      thread: target.thread,
+      reactionRef: target.reactionRef,
       emoji,
     })
     const addReactionRef = addResult.then((r) => (r.ok ? (r.reactionRef ?? null) : null)).catch(() => null)
     void addResult
       .then((result) => {
         if (!result.ok && result.code !== 'unsupported') {
-          logger.info(`[channels] engage-react failed adapter=${event.adapter} chat=${event.chat}: ${result.error}`)
+          logger.info(
+            `[channels] ${logLabel}-react failed adapter=${target.adapter} chat=${target.chat}: ${result.error}`,
+          )
         }
       })
       .catch((err) => {
-        logger.info(`[channels] engage-react threw adapter=${event.adapter} chat=${event.chat}: ${describeError(err)}`)
+        logger.info(
+          `[channels] ${logLabel}-react threw adapter=${target.adapter} chat=${target.chat}: ${describeError(err)}`,
+        )
       })
     return addReactionRef
+  }
+
+  // Best-effort acknowledgment: drop a configured progress reaction on the
+  // triggering inbound when the adapter opts into runtime-owned progress.
+  // Without a configured progress reaction, preserve the historical fallback:
+  // :eyes: is used only when the adapter has no visible typing indicator.
+  // A forced emoji is reserved for Kakao's mid-turn delivery receipt, which
+  // must remain visible even though Kakao also has a typing surface.
+  const autoReactOnEngage = (event: InboundMessage, forcedEmoji?: string): Promise<ReactionRef | null> | null => {
+    const progress = options.configForAdapter(event.adapter)?.progress
+    const progressEmoji = progress?.enabled === true ? progress.startReaction : undefined
+    if (forcedEmoji === undefined && progressEmoji === undefined && typingCapableAdapters.has(event.adapter))
+      return null
+    return addAutomaticReaction(event, forcedEmoji ?? progressEmoji ?? ENGAGE_REACTION_EMOJI, 'engage')
+  }
+
+  const autoReactOnKakaoDelivery = (
+    live: LiveSession,
+    item: QueuedInbound,
+    mode: ChannelDeliveryMode,
+  ): Promise<ReactionRef | null> | null => {
+    if (live.key.adapter !== 'kakaotalk') return null
+    return addAutomaticReaction(
+      {
+        adapter: live.key.adapter,
+        workspace: live.key.workspace,
+        chat: live.key.chat,
+        thread: live.key.thread,
+        ...(item.reactionRef !== undefined ? { reactionRef: item.reactionRef } : {}),
+      },
+      mode === 'steer' ? KAKAO_STEER_REACTION_EMOJI : KAKAO_QUEUE_REACTION_EMOJI,
+      `${mode}-delivery`,
+    )
   }
 
   // Returns a promise that settles only once every engage removal has REACHED
@@ -6027,6 +6176,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     let messageId: string | undefined
     let messageIds: readonly string[] | undefined
     let reactionRef: ReactionRef | undefined
+    let progressDeliveryRearmedTyping = false
     if (
       opts?.progressReply !== undefined &&
       text !== undefined &&
@@ -6037,6 +6187,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const progressResult = await deliverProgressReply(live, text, opts.progressReply)
       if (progressResult !== null) {
         delivered = true
+        // The progress edit path re-arms immediately after its own successful
+        // adapter call. Remember that here so the shared send tail does not
+        // emit a duplicate ACTION pulse in the same tick.
+        progressDeliveryRearmedTyping = true
         messageId = progressResult.messageId
         messageIds = progressResult.messageIds
         reactionRef = progressResult.reactionRef
@@ -6108,15 +6262,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // about to send another reply. drain()'s finally block owns turn-end
       // stop. But Slack's adapter outbound callback explicitly clears
       // platform-side typing after every successful postMessage (to defeat
-      // the heartbeat-vs-postMessage race fixed in PR #52), so a fresh
+      // the heartbeat-vs-postMessage race fixed in PR #52), and Kakao clears
+      // its composing dots client-side after a delivered message. A fresh
       // 'tick' must land in the FIFO right after that clear — otherwise
-      // the indicator stays cleared until the next 8s interval, leaving a
-      // visible idle gap between mid-turn sends on Slack. The await on
+      // the indicator stays cleared until the next interval, leaving a
+      // visible idle gap between mid-turn sends. The await on
       // cb(msg) above already drained the outbound callback's clearAfterSend
       // through the per-(chat,thread) FIFO, so this tick is guaranteed to
-      // land after it. Discord and Telegram treat the extra tick as a
-      // no-op refresh of their already-armed (auto-expiring) indicators.
-      if (live.typingTimer) void fireTyping(live, 'tick')
+      // land after it. A final progress reply is excluded because it should
+      // leave typing cleared; Discord and Telegram treat the extra mid-turn
+      // tick as a no-op refresh of their already-armed indicators.
+      if (!progressDeliveryRearmedTyping && opts?.progressReply !== 'final') {
+        rearmTypingAfterDelivery(live)
+      }
       // Disengage is binding for the rest of the turn: if the model dropped
       // sticky via `channel_disengage` this turn, a same-turn ack reply must NOT
       // silently re-grant the credit it just cleared. Skipped only for the live
@@ -6877,7 +7035,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const runIdleGc = async (): Promise<void> => {
     const t = now()
     const victims: LiveSession[] = []
-    for (const live of liveSessions.values()) {
+    for (const live of Array.from(liveSessions.values())) {
       if (live.destroyed) continue
       if (live.draining) continue
       if (live.promptQueue.length > 0) continue
@@ -7310,7 +7468,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     hasRecoverableOutput?: boolean
     channelKey?: { adapter: string; workspace: string; chat: string; thread: string | null }
   }): { kind: 'delivered'; keyId: string } | { kind: 'no-live-session' } => {
-    for (const live of liveSessions.values()) {
+    for (const live of Array.from(liveSessions.values())) {
       if (live.destroyed) continue
       if (live.sessionId !== args.parentSessionId) continue
       return deliverCompletionReminder(live, args)
@@ -7342,7 +7500,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }): { kind: 'delivered'; count: number } => {
     const chat = `pr:${args.prNumber}`
     let count = 0
-    for (const live of liveSessions.values()) {
+    for (const live of Array.from(liveSessions.values())) {
       if (live.destroyed) continue
       if (live.key.adapter !== 'github') continue
       if (live.key.workspace !== args.workspace || live.key.chat !== chat) continue
@@ -7418,7 +7576,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     completeGithubReviewRound(activeRound)
     const key = githubReviewRoundKey(round)
-    for (const live of liveSessions.values()) {
+    for (const live of Array.from(liveSessions.values())) {
       if (live.githubReviewRound === null || githubReviewRoundKey(live.githubReviewRound) !== key) continue
       live.pendingSystemReminders = live.pendingSystemReminders.filter(
         (reminder) => reminder.githubReviewRoundKey !== key,
@@ -7440,7 +7598,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const key = githubReviewRoundKey(round)
     const state = githubReviewRoundPersistence(round)
     let changed = false
-    for (const [idx, record] of mappings.entries()) {
+    for (const [idx, record] of Array.from(mappings.entries())) {
       if (record.githubReviewRound === undefined) continue
       if (githubReviewRoundKey(record.githubReviewRound) !== key) continue
       if (state === null) {
@@ -7462,7 +7620,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // replayed here once the round actually completes.
   const replayPendingRoundCloseouts = (round: GithubReviewFollowupRound): void => {
     const key = githubReviewRoundKey(round)
-    for (const live of liveSessions.values()) {
+    for (const live of Array.from(liveSessions.values())) {
       if (live.pendingGithubReviewRoundCloseout !== key) continue
       live.pendingGithubReviewRoundCloseout = null
       finishGithubReviewRoundCloseout({
@@ -7526,7 +7684,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     state: ReviewOutputState
   }): { kind: 'stamped' | 'no-live-session' } => {
     const chat = `pr:${args.prNumber}`
-    for (const live of liveSessions.values()) {
+    for (const live of Array.from(liveSessions.values())) {
       if (live.destroyed) continue
       if (live.sessionId !== args.sessionId) continue
       if (live.key.adapter !== 'github') continue
@@ -7545,7 +7703,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     | { kind: 'recorded'; keyId: string }
     | { kind: 'recorded-after-send'; keyId: string }
     | { kind: 'no-live-session' } => {
-    for (const live of liveSessions.values()) {
+    for (const live of Array.from(liveSessions.values())) {
       if (live.destroyed) continue
       if (live.sessionId !== args.parentSessionId) continue
       if (live.successfulChannelSends > live.successfulSendsAtTurnStart) {
@@ -8590,7 +8748,7 @@ export function resolveLiveSessionForCommand(
   if (key.thread !== null) return { kind: 'none' }
 
   const matches: LiveSession[] = []
-  for (const candidate of liveSessions.values()) {
+  for (const candidate of Array.from(liveSessions.values())) {
     if (candidate.destroyed) continue
     if (
       candidate.key.adapter === key.adapter &&

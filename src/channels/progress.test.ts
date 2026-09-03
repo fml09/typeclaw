@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  CHANNEL_PROGRESS_COMPLETE_TEXT,
   CHANNEL_PROGRESS_FAILURE_TEXT,
   CHANNEL_PROGRESS_INITIAL_TEXT,
   CHANNEL_PROGRESS_LOG_MAX_ENTRIES,
@@ -58,6 +59,7 @@ describe('progress phase texts', () => {
       CHANNEL_PROGRESS_WRITING_TEXT,
       CHANNEL_PROGRESS_WORKING_TEXT,
       CHANNEL_PROGRESS_REVIEWING_TEXT,
+      CHANNEL_PROGRESS_COMPLETE_TEXT,
       CHANNEL_PROGRESS_FAILURE_TEXT,
     ]) {
       expect(/\p{Extended_Pictographic}/u.test(text)).toBe(true)

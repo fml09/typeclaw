@@ -187,7 +187,9 @@ const postReplyReactionSchema = z.object({
 })
 // Runtime-owned progress message settings. When enabled, the router creates
 // one short status message after generation starts and edits that same
-// bot-authored message for safe lifecycle phases and the final reply. With
+// bot-authored message for safe lifecycle phases and the final reply. Kakao
+// seals a continuing status reply and opens a new message for later work so a
+// tool phase can never overwrite prose the user has already read. With
 // `toolLog` (default on), the most recent tool executions render as name-only
 // `· <tool>` lines under the phase so the chat can watch the work happen;
 // tool arguments and results never cross the boundary.

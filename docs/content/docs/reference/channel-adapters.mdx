@@ -72,7 +72,10 @@ Adapters come in two shapes. **Bot adapters** authenticate as a platform bot/app
 return an outbound message id and support editing. The router creates the
 message only after generation produces a progress event, coalesces repeated
 events into coarse safe labels, and edits that same message with the terminal
-`channel_reply`. Raw model thinking is never forwarded to a channel.
+`channel_reply`. On KakaoTalk, a continuing `channel_reply` seals the current
+message; a later tool call starts a new progress message instead of replacing
+the delivered prose with `Working…` or `Reviewing…`. Raw model thinking is never
+forwarded to a channel.
 
 `progress.updateIntervalMs` limits intermediate edits. Failed edits retry with
 exponential backoff (1.5s base, doubling to a 12s cap, ±25% jitter) so a
@@ -146,7 +149,7 @@ Fallbacks keep the invariant that a message is never lost:
 - the turn is aborting (`/stop` drops the buffer like queued prompts) or the session is being recreated by a reload → the queued path, which hands the message to the successor session;
 - the SDK rejects the injection → the queued path.
 
-Attachments, reply-quotes, and GitHub review rounds never steer — their composition runs at turn start, so they always take the queued path (and any buffered steers flush to the queue ahead of them to preserve arrival order). The engage ack reaction (the transient `:eyes:`) is skipped on the steer path: the message is consumed within the current turn, so the ack would be added and removed in the same breath.
+Attachments, reply-quotes, and GitHub review rounds never steer — their composition runs at turn start, so they always take the queued path (and any buffered steers flush to the queue ahead of them to preserve arrival order). KakaoTalk adds a transient, message-local delivery receipt once that decision is known: `eyes` means the message was injected into the running turn, while `like` means it is waiting on the queued turn. The receipt is removed when that turn finishes; configured progress terminal reactions still apply normally.
 
 ```json
 {

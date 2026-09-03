@@ -206,7 +206,7 @@ class FakeSession {
     return () => this.subscribers.delete(cb)
   }
   emit = (event: Record<string, unknown> & { type: string }): void => {
-    for (const cb of this.subscribers) cb(event)
+    for (const cb of Array.from(this.subscribers)) cb(event)
   }
 
   setAssistantText(text: string): void {
@@ -2870,6 +2870,64 @@ describe('ChannelRouter auto-react on engage', () => {
   })
 })
 describe('ChannelRouter runtime progress', () => {
+  test('re-arms Kakao typing immediately after the runtime progress post', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = {
+      ...baseConfig,
+      progress: { enabled: true, updateIntervalMs: 250 },
+    }
+    const { router, sessions } = makeRouter(dir, { config })
+    const events: string[] = []
+    const progressPosted = Promise.withResolvers<void>()
+    const releasePrompt = Promise.withResolvers<void>()
+
+    router.registerTyping('kakaotalk', async (target) => {
+      events.push(`typing:${target.phase}`)
+    })
+    router.registerOutbound('kakaotalk', async (message) => {
+      events.push(`outbound:${message.text}`)
+      progressPosted.resolve()
+      return { ok: true, messageId: 'progress-message', messageIds: ['progress-message'] }
+    })
+    router.registerEditMessage('kakaotalk', async (request) => {
+      events.push(`edit:${request.text}`)
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '시간이 걸리는 작업',
+        externalMessageId: 'kakao-inbound',
+        isDm: true,
+      }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.emit({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
+      })
+      await progressPosted.promise
+      sessions[0]!.setAssistantText('NO_REPLY')
+      await releasePrompt.promise
+    }
+    const draining = router.__testing!.flushDebounce(key)
+
+    // Kakao clears composing dots as soon as the progress message lands. The
+    // next tick must therefore follow the outbound immediately, not wait for
+    // the adapter's four-second heartbeat interval.
+    await waitFor(() => events.filter((event) => event === 'typing:tick').length >= 2)
+    expect(events.slice(0, 3)).toEqual(['typing:tick', 'outbound:⏳ Processing…', 'typing:tick'])
+
+    releasePrompt.resolve()
+    await draining
+    // Terminal cleanup edits happen after promptInFlight=false and must not
+    // resurrect typing after the final message.
+    expect(events.at(-1)).toBe('typing:stop')
+    await router.stop()
+  })
+
   test('creates one progress message, edits it through safe phases, and finalizes it', async () => {
     const dir = await tempDir()
     const config: ChannelAdapterConfig = {
@@ -2994,6 +3052,7 @@ describe('ChannelRouter runtime progress', () => {
     await waitFor(() => outbound.length >= 2)
 
     expect(outbound.map((message) => message.text)).toEqual(['⏳ Processing…', 'first final'])
+    expect(edits).toContain('✅ Done.')
 
     await router.route(
       inbound({
@@ -3257,18 +3316,18 @@ describe('ChannelRouter runtime progress', () => {
     expect(edits).toContain('final answer')
     await router.stop()
   })
-  test('reuses one progress bubble across a queued continuation', async () => {
+  test('seals a Kakao reply and starts the next tool in a new progress bubble', async () => {
     const dir = await tempDir()
     const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
     const config: ChannelAdapterConfig = {
       ...baseConfig,
       progress: { enabled: true, updateIntervalMs: 50 },
     }
-    const { router, sessions } = makeRouter(dir, { config })
     const outbound: OutboundMessage[] = []
     const edits: string[] = []
     const editMessageIds: string[] = []
-    let promptCount = 0
+    const nowRef = { value: 1_000 }
+    const { router, sessions } = makeRouter(dir, { config, nowRef })
 
     router.registerOutbound('kakaotalk', async (message) => {
       outbound.push(message)
@@ -3290,24 +3349,41 @@ describe('ChannelRouter runtime progress', () => {
       }),
     )
     sessions[0]!.onPrompt = async () => {
-      promptCount++
       sessions[0]!.emit({
         type: 'message_update',
         assistantMessageEvent: { type: 'thinking_delta', delta: 'private reasoning' },
       })
       const reply = createChannelReplyTool({ router, origin: key })
-      if (promptCount === 1) {
-        sessions[0]!.setAssistantText('확인해볼게요')
-        await reply.execute(
-          'ack-call',
-          { text: '확인해볼게요', more_work_this_turn: true },
-          undefined,
-          undefined,
-          {} as Parameters<typeof reply.execute>[4],
-        )
-        router.__testing!.injectContinuationReminder(key, 'continue the current work')
-        return
-      }
+      await waitFor(() => outbound.length === 1)
+      nowRef.value = 3_000
+      await reply.execute(
+        'ack-call',
+        { text: '확인해볼게요', more_work_this_turn: true },
+        undefined,
+        undefined,
+        {} as Parameters<typeof reply.execute>[4],
+      )
+
+      // The channel_reply tool's own completion is not subsequent work and
+      // must not create a new Reviewing bubble by itself.
+      sessions[0]!.emit({
+        type: 'tool_execution_end',
+        toolCallId: 'ack-call',
+        toolName: 'channel_reply',
+        result: 'ok',
+        isError: false,
+      })
+      await Promise.resolve()
+      expect(outbound).toHaveLength(1)
+
+      sessions[0]!.emit({
+        type: 'tool_execution_start',
+        toolCallId: 'search-call',
+        toolName: 'web_search',
+        args: { query: 'answer boundary' },
+      })
+      await waitFor(() => outbound.length === 2)
+      nowRef.value = 5_000
       sessions[0]!.setAssistantText('final answer')
       await reply.execute(
         'reply-call',
@@ -3320,9 +3396,9 @@ describe('ChannelRouter runtime progress', () => {
     await router.__testing!.flushDebounce(key)
     await waitFor(() => edits.includes('final answer'))
 
-    expect(promptCount).toBe(2)
-    expect(outbound.map((message) => message.text)).toEqual(['⏳ Processing…'])
-    expect(editMessageIds.every((messageId) => messageId === 'message-1')).toBe(true)
+    expect(outbound.map((message) => message.text)).toEqual(['⏳ Processing…', '⏳ Processing…'])
+    expect(editMessageIds.at(edits.indexOf('확인해볼게요'))).toBe('message-1')
+    expect(editMessageIds.at(edits.indexOf('final answer'))).toBe('message-2')
     expect(edits).toContain('확인해볼게요')
     expect(edits).toContain('final answer')
     await router.stop()
@@ -18407,6 +18483,106 @@ describe('steer (mid-turn injection)', () => {
     expect(sessions[0]!.steered).toHaveLength(1)
   })
 
+  test('marks a successfully steered Kakao message with eyes until the running turn ends', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(30) })
+    const reactions: string[] = []
+    const reactionInstance: ReactionRef = { adapter: 'kakaotalk', value: 'steer-instance' }
+    router.setTypingCapability('kakaotalk', true)
+    router.registerReaction('kakaotalk', async (request) => {
+      reactions.push(`add:${request.emoji}`)
+      return { ok: true, reactionRef: reactionInstance }
+    })
+    router.registerRemoveReaction('kakaotalk', async () => {
+      reactions.push('remove')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ ...key, text: '오래 걸리는 작업', isDm: true }))
+    let released = false
+    let releasePrompt: (() => void) | undefined
+    sessions[0]!.onPrompt = () =>
+      new Promise<void>((resolve) => {
+        if (released) {
+          resolve()
+          return
+        }
+        releasePrompt = resolve
+      })
+    const draining = router.__testing!.flushDebounce(key)
+    await waitFor(() => releasePrompt !== undefined)
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '그리고 테스트도 돌려줘',
+        externalMessageId: 'kakao-steer',
+        isDm: true,
+        reactionRef: { adapter: 'kakaotalk', value: 'kakao-steer-target' },
+      }),
+    )
+    await waitFor(() => sessions[0]!.steered.length === 1 && reactions.length > 0)
+
+    expect(reactions).toEqual(['add:eyes'])
+    released = true
+    releasePrompt!()
+    await draining
+    await waitFor(() => reactions.includes('remove'))
+    expect(reactions).toEqual(['add:eyes', 'remove'])
+  })
+
+  test('marks a Kakao mid-turn message with like when it is queued', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const config: ChannelAdapterConfig = { ...baseConfig, steer: { enabled: false, quietMs: 30 } }
+    const { router, sessions } = makeRouter(dir, { config })
+    const reactions: string[] = []
+    router.setTypingCapability('kakaotalk', true)
+    router.registerReaction('kakaotalk', async (request) => {
+      reactions.push(`add:${request.emoji}`)
+      return { ok: true, reactionRef: { adapter: 'kakaotalk', value: 'queue-instance' } }
+    })
+    router.registerRemoveReaction('kakaotalk', async () => {
+      reactions.push('remove')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ ...key, text: '오래 걸리는 작업', isDm: true }))
+    let released = false
+    let releasePrompt: (() => void) | undefined
+    sessions[0]!.onPrompt = () =>
+      new Promise<void>((resolve) => {
+        if (released) {
+          resolve()
+          return
+        }
+        releasePrompt = resolve
+      })
+    const draining = router.__testing!.flushDebounce(key)
+    await waitFor(() => releasePrompt !== undefined)
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '이건 다음에 처리해줘',
+        externalMessageId: 'kakao-queue',
+        isDm: true,
+        reactionRef: { adapter: 'kakaotalk', value: 'kakao-queue-target' },
+      }),
+    )
+    await waitFor(() => reactions.length > 0)
+
+    expect(reactions).toEqual(['add:like'])
+    expect(sessions[0]!.steered).toHaveLength(0)
+    released = true
+    releasePrompt!()
+    await draining
+    await waitFor(() => reactions.includes('remove'))
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(reactions).toEqual(['add:like', 'remove'])
+  })
+
   test('coalesces a burst of mid-turn inbounds into ONE steer injection', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir, { config: steerConfig(150) })
@@ -19146,6 +19322,71 @@ describe('/steer and /queue (per-channel delivery mode)', () => {
     expect(sessions[0]!.prompts[1]).toContain('and also run the tests')
     expect(sessions[0]!.prompts[1]).not.toContain('/queue')
     expect(sent).toHaveLength(0)
+  })
+
+  test('Kakao /steer <text> and /queue <text> react on the carried message with the chosen route', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'kakaotalk' as const, workspace: '@kakao-dm', chat: 'k1', thread: null }
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(false) })
+    const reactions: ReactionRequest[] = []
+    let removeCount = 0
+    router.setTypingCapability('kakaotalk', true)
+    router.registerReaction('kakaotalk', async (request) => {
+      reactions.push(request)
+      return {
+        ok: true,
+        reactionRef: { adapter: 'kakaotalk', value: `reaction-instance-${reactions.length}` },
+      }
+    })
+    router.registerRemoveReaction('kakaotalk', async () => {
+      removeCount++
+      return { ok: true }
+    })
+
+    await router.route(inbound({ ...key, text: '오래 걸리는 작업', isDm: true }))
+    let released = false
+    let releasePrompt: (() => void) | undefined
+    sessions[0]!.onPrompt = () =>
+      new Promise<void>((resolve) => {
+        if (released) {
+          resolve()
+          return
+        }
+        releasePrompt = resolve
+      })
+    const draining = router.__testing!.flushDebounce(key)
+    await waitFor(() => releasePrompt !== undefined)
+
+    await router.route(
+      inbound({
+        ...key,
+        text: '/steer 그리고 테스트도 돌려줘',
+        externalMessageId: 'kakao-command-steer',
+        isDm: true,
+        reactionRef: { adapter: 'kakaotalk', value: 'kakao-command-steer-target' },
+      }),
+    )
+    await waitFor(() => sessions[0]!.steered.length === 1 && reactions.length === 1)
+    await router.route(
+      inbound({
+        ...key,
+        text: '/queue 이건 다음 차례에 처리해줘',
+        externalMessageId: 'kakao-command-queue',
+        isDm: true,
+        reactionRef: { adapter: 'kakaotalk', value: 'kakao-command-queue-target' },
+      }),
+    )
+    await waitFor(() => reactions.length === 2)
+
+    expect(reactions.map((request) => ({ emoji: request.emoji, target: request.reactionRef.value }))).toEqual([
+      { emoji: 'eyes', target: 'kakao-command-steer-target' },
+      { emoji: 'like', target: 'kakao-command-queue-target' },
+    ])
+
+    released = true
+    releasePrompt!()
+    await draining
+    await waitFor(() => removeCount === 2)
   })
 
   test('both commands are gated on session.control and listed in /help', async () => {
