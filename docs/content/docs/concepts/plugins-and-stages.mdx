@@ -38,6 +38,7 @@ A plugin's factory returns a `PluginExports` object with optional fields:
 - **`cronJobs`** — scheduled prompts, exec commands, or in-process handlers contributed at boot
 - **`hooks`** — session- and tool-lifecycle observers (see below)
 - **`doctorChecks`** — `typeclaw doctor` checks, optionally with a `--fix` apply step
+- **`channelCommands`** — slash commands on the channel surface (`/desktop`), alongside the built-in `/help`, `/stop`, `/steer`, `/queue`, `/reload`, `/restart`
 
 Plus, declared on the `definePlugin` envelope itself (not inside the factory):
 
@@ -57,5 +58,17 @@ The tool hooks are the important ones for security. `tool.before` and `tool.afte
 Plugins can't drive the agent. They contribute tools the agent might call; they don't issue tool calls themselves. If you need scheduled work, contribute a cron. If you need reactive work, install a hook. The agent's autonomy is the agent's; plugins are how you give it more capabilities, not how you put it on rails.
 
 Plugins also can't change other plugins' contributions, mutate the Dockerfile, or open new mounts. These are container-stage facts captured at boot, owned by the host-stage launcher, and not exposed to plugin code.
+
+Nor can a plugin take the container down at boot by claiming a name the runtime owns. A `channelCommands` entry that collides with a built-in command, or with another plugin's, is logged and skipped — the plugin's command is the thing that loses, never the runtime.
+
+## Platform Extensions
+
+A plugin normally lives in the Agent Folder: an npm package the agent installed, or a local file under `plugins/`. A **Platform Extension** is the third case — administrator-owned code the platform mounts read-only into an immutable managed image, listed in `TYPECLAW_PLATFORM_EXTENSIONS` as a colon-separated list of absolute paths.
+
+The point is that nothing is written into the Agent Folder. An operator shipping a capability into a managed runtime — a computer-use plugin bound to a VM, say — does not need the Agent Folder to be writable, does not need `typeclaw.json#plugins` edited, and does not need the extension to survive the agent rewriting its own config.
+
+Extensions load after the config-declared plugins, take their name from the path's basename — or from the containing directory when the entry file is named `index`, so `<name>/index.ts` and `<name>` name the same extension — and read their config block from `typeclaw.json` under that name if one is present. They are honored **only** in the `managed` deployment profile, and they load through a trusted path that skips the Agent Folder containment check every config-declared local plugin is subject to. That is not a hole in the guard: containment exists to stop a plugin entry the model or the Agent Folder authored from escaping the Agent Folder, and this list is process environment the platform set before the runtime started, in a profile where the agent cannot edit it. The guard on config-declared entries is unchanged.
+
+Because they are administrator-owned rather than agent-owned, they fail like bundled plugins rather than like user plugins: a missing mount, an unreadable path, or a module that is not a `definePlugin(...)` result aborts the boot with the path named. See [Managed runtime](/docs/internals/managed-runtime).
 
 For the practical "add your first plugin" walkthrough see [Add a plugin](/docs/guides/write-a-plugin).

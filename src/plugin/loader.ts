@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -51,6 +51,109 @@ export class PluginSecurityError extends Error {
   }
 }
 
+// Thrown when a platform-declared extension cannot be loaded. Separate from
+// PluginNotFoundError because a platform extension is administrator-owned,
+// image-mounted code: a path that is missing, unreadable, or not a plugin is a
+// misconfigured deployment, and skipping it silently would boot a runtime that
+// looks healthy while the capability the administrator shipped is simply gone.
+export class PlatformExtensionError extends Error {
+  readonly path: string
+  constructor(path: string, message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = 'PlatformExtensionError'
+    this.path = path
+  }
+}
+
+// The trusted-local load path used ONLY for TYPECLAW_PLATFORM_EXTENSIONS.
+//
+// Why this is not a hole in loadLocal's containment check: that check exists to
+// stop a plugin entry AUTHORED BY THE MODEL OR THE AGENT FOLDER — a
+// `typeclaw.json#plugins` string the agent can rewrite at will — from escaping
+// the Agent Folder and importing arbitrary host files. This list is not
+// agent-authored: it is process environment set by the platform before the
+// runtime starts, in the `managed` deployment profile, where the agent has no
+// way to edit the environment of its own process (the caller gates on
+// resolveDeploymentProfile() for exactly this reason). The path is therefore
+// already outside the agent's reach before it gets here, so the containment
+// check has nothing left to protect. The guard on config-declared entries is
+// unchanged: loadLocal still refuses every path outside agentDir, and
+// PluginSecurityError stays fatal there.
+export async function loadPlatformExtension(path: string): Promise<ResolvedPlugin> {
+  if (!isAbsolute(path)) {
+    throw new PlatformExtensionError(path, `platform extension path must be absolute: ${path}`)
+  }
+  const resolved = resolve(path)
+  let isDirectory: boolean
+  try {
+    isDirectory = statSync(resolved).isDirectory()
+  } catch (err) {
+    throw new PlatformExtensionError(resolved, `platform extension path is missing or unreadable: ${resolved}`, {
+      cause: err,
+    })
+  }
+  const entryFile = isDirectory ? resolveDirectoryEntryFile(resolved) : resolved
+  let mod: { default?: unknown }
+  try {
+    mod = (await import(toModuleSpecifier(entryFile))) as { default?: unknown }
+  } catch (err) {
+    throw new PlatformExtensionError(resolved, `platform extension failed to import: ${entryFile}`, { cause: err })
+  }
+  let defined: DefinedPlugin<any>
+  try {
+    defined = expectDefined(mod, resolved)
+  } catch (err) {
+    throw new PlatformExtensionError(resolved, describeError(err), { cause: err })
+  }
+  // The name is the basename so the administrator can address the extension's
+  // config block in typeclaw.json without knowing the mount layout.
+  const name = isDirectory ? basename(resolved) : platformExtensionNameForFile(resolved)
+  if (name.length === 0) {
+    throw new PlatformExtensionError(resolved, `platform extension path has no usable plugin name: ${resolved}`)
+  }
+  return { name, version: undefined, source: resolved, defined }
+}
+
+// A platform mounts one extension per directory and may point the env var at
+// either the directory or its entry file. Naming a file `index` after its own
+// basename would make both spellings of the SAME mount produce different names:
+// the typeclaw.json config block would be looked up under `index` instead of
+// the directory name the administrator wrote, and a second mount in the same
+// `<name>/index.ts` shape would collide on `index` and abort boot at the
+// plugin-name-conflict check. Falling back to the containing directory (Node's
+// own module-resolution convention) makes the two spellings agree.
+function platformExtensionNameForFile(file: string): string {
+  const stripped = stripModuleExtension(basename(file))
+  return stripped === 'index' ? basename(dirname(file)) : stripped
+}
+
+const DIRECTORY_ENTRY_CANDIDATES = ['index.ts', 'index.tsx', 'index.js', 'index.mjs', 'index.cjs'] as const
+
+function resolveDirectoryEntryFile(dir: string): string {
+  const pkgJsonPath = join(dir, 'package.json')
+  if (existsSync(pkgJsonPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf8')) as { main?: unknown; module?: unknown }
+      const main = typeof pkg.module === 'string' ? pkg.module : typeof pkg.main === 'string' ? pkg.main : null
+      if (main !== null) {
+        const candidate = join(dir, main)
+        if (existsSync(candidate)) return candidate
+      }
+    } catch {
+      // A malformed package.json is not fatal on its own — fall through to the
+      // index.* candidates and let the miss below name the directory.
+    }
+  }
+  for (const candidate of DIRECTORY_ENTRY_CANDIDATES) {
+    const full = join(dir, candidate)
+    if (existsSync(full)) return full
+  }
+  throw new PlatformExtensionError(
+    dir,
+    `platform extension directory has no entry file (looked for package.json main/module and ${DIRECTORY_ENTRY_CANDIDATES.join(', ')}): ${dir}`,
+  )
+}
+
 export async function loadPluginEntry(
   entry: string,
   agentDir: string,
@@ -79,8 +182,12 @@ async function loadLocal(entry: string, agentDir: string): Promise<ResolvedPlugi
   }
   const mod = (await import(toModuleSpecifier(resolved))) as { default?: unknown }
   const defined = expectDefined(mod, entry)
-  const name = basename(resolved).replace(/\.(ts|tsx|js|mjs|cjs)$/i, '')
+  const name = stripModuleExtension(basename(resolved))
   return { name, version: undefined, source: entry, defined }
+}
+
+function stripModuleExtension(name: string): string {
+  return name.replace(/\.(ts|tsx|js|mjs|cjs)$/i, '')
 }
 
 async function loadNpm(entry: string, agentDir: string, options: LoadPluginEntryOptions): Promise<ResolvedPlugin> {

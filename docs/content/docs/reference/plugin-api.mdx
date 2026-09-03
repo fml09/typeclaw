@@ -67,10 +67,11 @@ type PluginExports = {
   skillsDirs?: string[]
   hooks?: Hooks
   doctorChecks?: Record<string, PluginDoctorCheck>
+  channelCommands?: Record<string, PluginChannelCommand>
 }
 ```
 
-Commands are declared on `definePlugin` (by-value), not returned here.
+CLI commands are declared on `definePlugin` (by-value), not returned here. Channel slash commands are a different surface — see [Channel commands](#channel-commands) below.
 
 ### Tool
 
@@ -222,6 +223,43 @@ type PluginCommand = ContainerCommand | HostCommand | EitherCommand
 | `'either'`    | whichever stage was invoked | intersection of the two                               |
 
 `defineCommand(cmd)` infers the context type from `surface` and types `args` from a `z.ZodObject` (v1 constraint: primitive leaves so `--help` can render `--<name>=<type>`). Container commands may set `isolated: true` to spawn a fresh Bun subprocess (~150ms cold-start) for isolation from the agent.
+
+## Channel commands
+
+`channelCommands` contributes slash commands to the **channel** surface (`/desktop`, `/deploy`), alongside the built-in `/help`, `/stop`, `/steer`, `/queue`, `/reload`, and `/restart`. Unlike `commands`, these are returned from the factory: they run inside the container against live runtime state.
+
+```ts
+type PluginChannelCommandPermission = 'none' | 'session.control' | 'session.admin'
+
+type PluginChannelCommandContext = {
+  readonly args: string // everything after the command name, trimmed of the name only
+  readonly sessionId: string | null // the live channel session, or null on a cold channel
+  readonly invokerId: string | null
+  readonly origin: SessionOrigin // the same origin the router authorized against
+  readonly adapter: string
+  readonly permissions: PermissionService
+  readonly logger: PluginLogger
+  readonly signal: AbortSignal
+}
+
+type PluginChannelCommand = {
+  readonly description: string // rendered verbatim in /help
+  readonly aliases?: readonly string[]
+  readonly permission?: PluginChannelCommandPermission // default 'session.admin'
+  readonly run: (ctx: PluginChannelCommandContext) => Promise<string | void> | string | void
+}
+```
+
+A returned string is posted back to the originating conversation as the reply; returning nothing replies nothing.
+
+The rules the runtime enforces around them:
+
+- **The default tier is `session.admin`.** A plugin command reaches whatever the plugin reaches, so an author who has not thought about the tier does not hand that to every `member` in a public channel. Declare `permission` explicitly to widen it.
+- **A name or alias collision is logged and skipped, never fatal.** The registry throws on a duplicate command name, so the router filters plugin declarations against the built-ins and against each other before building it — a third-party plugin shipping a `/help` loses its command, and the container still boots. First declaration wins. A declaration that repeats itself (an alias equal to its own command name, or the same alias twice) is not a collision with anyone: the repeat is dropped and the command registers once.
+- **Every plugin command is session-optional** (`requiresLiveSession: false`, `wantsLiveSession: true`): it acts on something outside the turn, so it runs from a cold channel too, with `sessionId: null`.
+- **Text-prefix only.** The Discord and Slack native slash-command declaration lists stay static, so a plugin command is invoked by typing it. (`executeCommand` still resolves it by name, but the native path carries no arguments.)
+- **Failures and hangs are reported, not swallowed.** A handler that throws replies `/<name> failed: <message>`; one that runs past 30s is aborted through `ctx.signal` and reported the same way, so a wedged handler cannot hold the channel open.
+- The set is read once at boot. A plugin set changed by `/reload` takes effect on the next restart.
 
 ## Lifecycle
 

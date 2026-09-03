@@ -42,6 +42,13 @@ export type LoadPluginsOptions = {
   // plugin (e.g. "memory") is consumed by the bundled plugin, and so plugin-
   // name conflicts with a user-declared entry surface as a clear error.
   bundled?: ResolvedPlugin[]
+  // Platform Extensions (TYPECLAW_PLATFORM_EXTENSIONS), already resolved by the
+  // run stage. Loaded AFTER the config-declared entries so an Agent Folder
+  // plugin keeps the name it always had and the collision is reported against
+  // the platform's own declaration. Treated as trusted like `bundled`: they are
+  // administrator-owned image content, so a failure is a deployment error and
+  // must abort boot rather than degrade to a warning.
+  platformExtensions?: ResolvedPlugin[]
 }
 
 export type LoadPluginsResult = {
@@ -86,30 +93,39 @@ export async function loadPlugins(opts: LoadPluginsOptions): Promise<LoadPlugins
       }
     }),
   )
-  const allPlugins: { entry: string; resolved: ResolvedPlugin; isBundled: boolean }[] = [
-    ...(opts.bundled?.map((resolved) => ({ entry: `<bundled:${resolved.name}>`, resolved, isBundled: true })) ?? []),
+  // `trusted` marks a plugin the runtime or the platform supplied, not the
+  // Agent Folder: bundled plugins and Platform Extensions. Its two consequences
+  // are that a failure stays fatal and that the plugin's declared permissions
+  // may seed the permission service before registration runs.
+  const allPlugins: { entry: string; resolved: ResolvedPlugin; trusted: boolean }[] = [
+    ...(opts.bundled?.map((resolved) => ({ entry: `<bundled:${resolved.name}>`, resolved, trusted: true })) ?? []),
     ...resolvedEntries
       .filter((e): e is { entry: string; resolved: ResolvedPlugin } => e !== null)
-      .map((e) => ({ ...e, isBundled: false })),
+      .map((e) => ({ ...e, trusted: false })),
+    ...(opts.platformExtensions?.map((resolved) => ({
+      entry: `<platform-extension:${resolved.source}>`,
+      resolved,
+      trusted: true,
+    })) ?? []),
   ]
 
-  // Seed the permission service from BUNDLED plugins only. A user plugin's
+  // Seed the permission service from TRUSTED plugins only. A user plugin's
   // declared permissions / owner-wildcard exclusions must not enter the live
   // service until the plugin actually survives registration — otherwise a
   // plugin reported as disabled could still widen the allowed set or (worse)
-  // strip an owner-wildcard bypass. Bundled plugins are always survivors:
+  // strip an owner-wildcard bypass. Trusted plugins are always survivors:
   // their failure is fatal, so the boot aborts before this service is used.
-  const bundledPlugins = allPlugins.filter((p) => p.isBundled)
+  const trustedPlugins = allPlugins.filter((p) => p.trusted)
   const permissions = createPermissionService({
     ...(opts.roles !== undefined ? { roles: opts.roles } : {}),
-    pluginPermissions: collectDeclaredPermissions(bundledPlugins),
-    ownerWildcardExclusions: collectOwnerWildcardExclusions(bundledPlugins),
+    pluginPermissions: collectDeclaredPermissions(trustedPlugins),
+    ownerWildcardExclusions: collectOwnerWildcardExclusions(trustedPlugins),
   })
 
-  const survivors: { entry: string; resolved: ResolvedPlugin; isBundled: boolean }[] = []
+  const survivors: { entry: string; resolved: ResolvedPlugin; trusted: boolean }[] = []
 
   for (const plugin of allPlugins) {
-    const { entry, resolved, isBundled } = plugin
+    const { entry, resolved, trusted } = plugin
     // Name conflict is a global invariant (two plugins claiming one name make
     // every later name-keyed lookup ambiguous), so it stays fatal regardless of
     // origin — never demoted to a per-plugin skip.
@@ -136,9 +152,10 @@ export async function loadPlugins(opts: LoadPluginsOptions): Promise<LoadPlugins
     } catch (err) {
       const phase = err instanceof PluginPhaseError ? err.phase : 'factory'
       const message = err instanceof PluginPhaseError ? err.detail : err instanceof Error ? err.message : String(err)
-      // Bundled/core plugin failures are typeclaw bugs (or a compromised
-      // runtime) — fail loud. Only user plugin failures are isolated.
-      if (isBundled || !isToleratedUserError(err instanceof PluginPhaseError ? err.original : err)) {
+      // Bundled/core and platform-extension failures are typeclaw bugs, a
+      // compromised runtime, or a broken deployment — fail loud. Only user
+      // plugin failures are isolated.
+      if (trusted || !isToleratedUserError(err instanceof PluginPhaseError ? err.original : err)) {
         throw err instanceof PluginPhaseError ? err.original : err
       }
       discardRegistrationsBy(resolved.name, registry, hooks)
@@ -344,6 +361,7 @@ export function summarizeLoaded(loaded: LoadPluginsResult['loadedPlugins'], regi
     `${registry.skillsDirs.length} skills dir(s)`,
     `${registry.doctorChecks.length} doctor check(s)`,
     `${registry.commands.length} command(s)`,
+    `${registry.channelCommands.length} channel command(s)`,
   ].join(', ')
   return `${loaded.length} plugin(s): ${head} [${counts}]`
 }

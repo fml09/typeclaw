@@ -307,6 +307,42 @@ export type PluginGithubServices = {
   getAppSelfLogin?: () => string | null
 }
 
+// The permission tier a plugin channel command is gated on, mirroring the
+// router's built-in tiers. Defaults to 'session.admin' — the operate-the-agent
+// tier — because a plugin command reaches whatever the plugin can reach, and a
+// plugin author who has not thought about the tier should not be handing that
+// to every `member` in a public channel.
+export type PluginChannelCommandPermission = 'none' | 'session.control' | 'session.admin'
+
+// What a plugin channel command handler is given. Deliberately narrower than
+// the router's own ChannelCommandContext: a plugin gets identity, permissions
+// and its argument string, never the LiveSession object (whose shape is
+// internal and changes freely).
+//
+// `sessionId` is the live channel session's id when one exists and null on a
+// cold channel — the command runs either way (`requiresLiveSession: false`), so
+// a handler that needs a running turn must check it.
+export type PluginChannelCommandContext = {
+  readonly args: string
+  readonly sessionId: string | null
+  readonly invokerId: string | null
+  readonly origin: SessionOrigin
+  readonly adapter: string
+  readonly permissions: PermissionService
+  readonly logger: PluginLogger
+  readonly signal: AbortSignal
+}
+
+// A slash command a plugin contributes to the channel surface (`/desktop`,
+// `/deploy`, …). A returned string is posted back to the originating
+// conversation as the reply; returning nothing replies nothing.
+export type PluginChannelCommand = {
+  readonly description: string
+  readonly aliases?: readonly string[]
+  readonly permission?: PluginChannelCommandPermission
+  readonly run: (ctx: PluginChannelCommandContext) => Promise<string | void> | string | void
+}
+
 export type PluginExports = {
   tools?: Record<string, Tool<any>>
   subagents?: Record<string, Subagent<any>>
@@ -315,6 +351,10 @@ export type PluginExports = {
   skillsDirs?: string[]
   hooks?: Hooks
   doctorChecks?: Record<string, PluginDoctorCheck>
+  // Channel slash commands, keyed by command name (no leading `/`). Registered
+  // on the text-prefix path only; the Discord/Slack native slash-command
+  // declaration lists stay static, so a plugin command is invoked by typing it.
+  channelCommands?: Record<string, PluginChannelCommand>
   // Released once when the agent stops, for plugin-lifetime resources a GC can't
   // reclaim deterministically (open DB handles, timers). Disposers are isolated:
   // one throwing never blocks the others.

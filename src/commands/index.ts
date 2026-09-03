@@ -65,7 +65,12 @@ export type CommandRegistry<Context> = {
   execute: (text: string, context: Context) => Promise<CommandResult>
 }
 
-// TODO: Add plugin-contributed commands once the public command context is stable.
+// Plugin-contributed commands exist on the CHANNEL surface only
+// (`PluginExports.channelCommands`). The channel router adapts each declaration
+// into a `Command<ChannelCommandContext>` and appends it to its own list before
+// building this registry — which is why the duplicate-name throw below is a
+// runtime-owned invariant the router must pre-filter for, never a boot crash a
+// third-party plugin can trigger. The TUI and CLI registries stay built-in-only.
 
 export function createCommandRegistry<Context>(commands: readonly Command<Context>[]): CommandRegistry<Context> {
   const byName = new Map<string, Command<Context>>()

@@ -30,6 +30,9 @@ export type {
   Hooks,
   HostCommand,
   HostCommandContext,
+  PluginChannelCommand,
+  PluginChannelCommandContext,
+  PluginChannelCommandPermission,
   PluginCheckResult,
   PluginCheckStatus,
   PluginCommand,
@@ -76,7 +79,14 @@ export {
 } from './manager'
 export type { PermissionService } from '@/permissions'
 export type { LoadPluginEntryFn, PluginEntrySpec, ResolvedPlugin } from './loader'
-export { derivePluginNameFromPackage, loadPluginEntry, PluginNotFoundError, splitPluginEntrySpec } from './loader'
+export {
+  derivePluginNameFromPackage,
+  loadPlatformExtension,
+  loadPluginEntry,
+  PlatformExtensionError,
+  PluginNotFoundError,
+  splitPluginEntrySpec,
+} from './loader'
 export { materializeSkills, type MaterializedSkills, type SkillEntry } from './skills'
 export {
   createLoadSkillTool,
@@ -87,9 +97,11 @@ export {
 export {
   buildPluginCronGlobalId,
   RESERVED_COMMAND_NAMES,
+  validateChannelCommandDeclaration,
   validateCommandDeclaration,
   type GuardAcknowledgementRegistry,
   type PluginRegistry,
+  type RegisteredChannelCommand,
   type RegisteredCommand,
   type RegisteredCronJob,
   type RegisteredDoctorCheck,
