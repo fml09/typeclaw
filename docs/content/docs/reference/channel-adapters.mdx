@@ -159,6 +159,27 @@ Attachments, reply-quotes, and GitHub review rounds never steer — their compos
 }
 ```
 
+### Per-channel control: `/steer` and `/queue`
+
+`steer.enabled` is an adapter-wide default. One conversation can override it from the channel itself, without a config edit or a restart. Both commands are `session.control`, work from a cold channel, and appear in `/help`.
+
+| Typed           | Effect                                                                                                                                                                                                                                                                            |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/steer`        | Same as `/steer on`                                                                                                                                                                                                                                                               |
+| `/steer on`     | Mid-turn messages in this channel are folded into the running turn                                                                                                                                                                                                                |
+| `/steer off`    | Mid-turn messages in this channel are queued for the next turn                                                                                                                                                                                                                    |
+| `/queue`        | Same as `/queue on` — and `/queue on` is `/steer off`, `/queue off` is `/steer on`                                                                                                                                                                                                |
+| `/steer status` | Reports the effective mode and its source (this channel / adapter config / default); `/queue status` is identical                                                                                                                                                                 |
+| `/steer reset`  | Drops the override so the adapter config decides again (`/steer auto`, `/queue reset` are the same)                                                                                                                                                                               |
+| `/steer <text>` | Injects `<text>` into the running turn **now**, bypassing the quiet window; no reply of its own. With no turn running — or when the message also carries an attachment, a reply-quote, or a GitHub review round, which steering cannot render — it takes the ordinary queued path |
+| `/queue <text>` | Queues `<text>` for the next turn even when steering is on; no reply of its own                                                                                                                                                                                                   |
+
+Only the bare words `on`, `off`, `status`, `reset`, and `auto` are read as control words. Anything else — including a sentence that happens to start with one — is a message to deliver, and only its payload reaches the model, never the command itself.
+
+The override is per channel key (adapter + workspace + chat + thread), persisted at `<agentDir>/channels/delivery-modes.json` with an atomic write, and reloaded at boot, so a channel keeps its choice across restarts.
+
+Both are typed as text. The Discord and Slack native slash-command registrations stay `/help`, `/stop`, `/reload`, `/restart` — a native invocation carries no argument text, so the `<text>` forms would be unreachable there anyway.
+
 ## Cross-channel reads
 
 Reading splits across two tools. `channel_history` fetches older messages of the **current** conversation (the chat the session is already engaged in). `channel_read` reaches a **different** chat the agent isn't necessarily in — "check the messages in #general", "what's this message id" — and folds three modes into one tool to keep the per-turn schema small:

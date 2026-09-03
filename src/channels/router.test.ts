@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile as writeFileFs } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile as writeFileFs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -29,9 +29,17 @@ import {
   setReviewObserver,
 } from '@/channels/github-review-turn-ledger'
 import type { PermissionService } from '@/permissions'
-import type { HookBus, SessionIdleEvent } from '@/plugin'
+import type {
+  HookBus,
+  PluginChannelCommand,
+  PluginChannelCommandContext,
+  RegisteredChannelCommand,
+  SessionIdleEvent,
+} from '@/plugin'
+import { createStream, type Stream } from '@/stream'
 import { waitFor } from '@/test-helpers/wait-for'
 
+import { channelDeliveryModesPath } from './delivery-modes'
 import {
   __resetReviewVerdictGuardForTest,
   configureReviewVerdictCoordinator,
@@ -430,6 +438,9 @@ function makeRouter(
     listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
     runIdleContinuation?: CreateChannelRouterOptions['runIdleContinuation']
     recordTurnOutcome?: CreateChannelRouterOptions['recordTurnOutcome']
+    pluginCommands?: CreateChannelRouterOptions['pluginCommands']
+    pluginCommandTimeoutMs?: number
+    stream?: Stream
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
@@ -455,6 +466,9 @@ function makeRouter(
       : {}),
     ...(options.runIdleContinuation !== undefined ? { runIdleContinuation: options.runIdleContinuation } : {}),
     ...(options.recordTurnOutcome !== undefined ? { recordTurnOutcome: options.recordTurnOutcome } : {}),
+    ...(options.pluginCommands !== undefined ? { pluginCommands: options.pluginCommands } : {}),
+    ...(options.pluginCommandTimeoutMs !== undefined ? { pluginCommandTimeoutMs: options.pluginCommandTimeoutMs } : {}),
+    ...(options.stream !== undefined ? { stream: options.stream } : {}),
     permissions: options.permissions ?? grantAllPermissions,
     now: () => nowRef.value,
     logger: {
@@ -17151,6 +17165,32 @@ describe('resumeRestartHandoff', () => {
     expect(prompts.some((p) => p.includes('container just restarted'))).toBe(false)
   })
 
+  test('a /steer <text> delivery counts as the real inbound, so no synthetic wake is stacked on it', async () => {
+    // given: the command path returns before route() reaches its reservation
+    //   marking, so the delivery itself has to record that a real inbound
+    //   landed — otherwise resume() pushes its "I'm back" turn on top of the
+    //   turn this message already triggers.
+    const dir = await tempDir()
+    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
+    const { router, sessions } = makeRouter(dir, {
+      transcriptPathFor: (sessionId) => `/tmp/fake/2026-05-02T16-56-52-380Z_${sessionId}.jsonl`,
+    })
+    const reservation = router.reserveRestartHandoff(channelHandoff())!
+    const inboundDone = router.route(inbound({ authorId: 'alice', authorName: 'alice', text: '/steer hi there' }))
+    await waitFor(() => reservation.sawInbound)
+
+    // when
+    await reservation.resume()
+    await inboundDone
+    await router.__testing!.flushDebounce(KEY)
+
+    // then
+    expect(sessions).toHaveLength(1)
+    const prompts = sessions[0]!.prompts
+    expect(prompts.some((p) => p.includes('hi there'))).toBe(true)
+    expect(prompts.some((p) => p.includes('container just restarted'))).toBe(false)
+  })
+
   test('still wakes when no inbound races during boot', async () => {
     // given: a reservation with no racing inbound
     const dir = await tempDir()
@@ -18498,5 +18538,657 @@ describe('steer (mid-turn injection)', () => {
     expect(sessions[0]!.aborted).toBe(1)
     expect(sessions[0]!.steered).toHaveLength(0)
     expect(sessions[0]!.prompts).toHaveLength(1)
+  })
+})
+
+describe('plugin-contributed channel commands', () => {
+  const pluginLogger = { info: () => {}, warn: () => {}, error: () => {} }
+
+  const pluginCommand = (
+    pluginName: string,
+    commandName: string,
+    command: Partial<PluginChannelCommand> & Pick<PluginChannelCommand, 'run'>,
+  ): RegisteredChannelCommand => ({
+    pluginName,
+    commandName,
+    command: { description: `${commandName} command`, ...command },
+    logger: pluginLogger,
+  })
+
+  const outboundSink = (router: ChannelRouter): Array<{ text: string }> => {
+    const sent: Array<{ text: string }> = []
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+    return sent
+  }
+
+  test('registers the command, its aliases and its description in /help', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir, {
+      pluginCommands: [
+        pluginCommand('personal-desktop', 'desktop', {
+          description: 'Control the personal desktop.',
+          aliases: ['vnc'],
+          permission: 'none',
+          run: () => 'ok',
+        }),
+      ],
+    })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/help' }))
+
+    expect(sent[0]!.text).toContain('/desktop — Control the personal desktop.')
+  })
+
+  test('runs the handler with the invocation context and posts a returned string as the reply', async () => {
+    const dir = await tempDir()
+    const seen: PluginChannelCommandContext[] = []
+    const abortedDuringRun: boolean[] = []
+    const { router, sessions } = makeRouter(dir, {
+      pluginCommands: [
+        pluginCommand('personal-desktop', 'desktop', {
+          permission: 'none',
+          run: (ctx) => {
+            seen.push(ctx)
+            abortedDuringRun.push(ctx.signal.aborted)
+            return `desktop args=${ctx.args} session=${ctx.sessionId ?? 'none'}`
+          },
+        }),
+      ],
+    })
+    const sent = outboundSink(router)
+
+    // A live session first, so sessionId is the running one and not null.
+    await router.route(inbound({ text: 'hello' }))
+    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ text: '/desktop status', externalMessageId: 'm2', authorId: 'alice' }))
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]!.args).toBe('status')
+    expect(seen[0]!.adapter).toBe('discord-bot')
+    expect(seen[0]!.invokerId).toBe('alice')
+    expect(seen[0]!.origin).toMatchObject({ kind: 'channel', adapter: 'discord-bot', chat: 'c1' })
+    // Live while the handler runs; aborted afterwards so a handler that leaked
+    // work learns its result is no longer wanted.
+    expect(abortedDuringRun).toEqual([false])
+    expect(seen[0]!.signal.aborted).toBe(true)
+    expect(sent.at(-1)!.text).toBe(`desktop args=status session=${sessions[0] ? 'ses_fake_1' : 'none'}`)
+  })
+
+  test('runs on a cold channel and reports a null sessionId rather than refusing', async () => {
+    const dir = await tempDir()
+    const seen: Array<string | null> = []
+    const { router, sessions } = makeRouter(dir, {
+      pluginCommands: [
+        pluginCommand('personal-desktop', 'desktop', {
+          permission: 'none',
+          run: (ctx) => {
+            seen.push(ctx.sessionId)
+          },
+        }),
+      ],
+    })
+
+    await router.route(inbound({ text: '/desktop' }))
+
+    expect(seen).toEqual([null])
+    expect(sessions).toHaveLength(0)
+  })
+
+  test('returning nothing posts no reply', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir, {
+      pluginCommands: [pluginCommand('p', 'quiet', { permission: 'none', run: () => {} })],
+    })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/quiet' }))
+
+    expect(sent).toHaveLength(0)
+  })
+
+  test('defaults to the session.admin tier when the plugin declares none', async () => {
+    const dir = await tempDir()
+    const denied: string[] = []
+    const permissions: PermissionService = {
+      // Respond-capable, but nothing above it: exactly the `member` an
+      // undeclared plugin command must not be reachable by.
+      has: (_origin, permission) => {
+        denied.push(permission)
+        return permission === 'channel.respond'
+      },
+      resolveRole: () => 'member',
+      compareRoleSeverity: () => undefined,
+      permissionsForRole: () => undefined,
+      describe: () => ({ role: 'member', permissions: [] }),
+      replaceRoles: () => {},
+    }
+    let ran = false
+    const { router } = makeRouter(dir, {
+      permissions,
+      pluginCommands: [
+        pluginCommand('p', 'desktop', {
+          run: () => {
+            ran = true
+          },
+        }),
+      ],
+    })
+
+    await router.route(inbound({ text: '/desktop' }))
+
+    expect(ran).toBe(false)
+    expect(denied).toContain('session.admin')
+  })
+
+  test('a name colliding with a built-in is logged and skipped, and the built-in still works', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    let ran = false
+    const { router } = makeRouter(dir, {
+      logs,
+      pluginCommands: [
+        pluginCommand('rogue', 'help', {
+          permission: 'none',
+          run: () => {
+            ran = true
+            return 'hijacked'
+          },
+        }),
+      ],
+    })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/help' }))
+
+    expect(ran).toBe(false)
+    expect(sent[0]!.text).toContain('Available commands:')
+    expect(logs.some((m) => m.includes('channel command /help skipped'))).toBe(true)
+  })
+
+  test('an alias colliding with another plugin is logged and skipped, first declaration wins', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const ran: string[] = []
+    const { router } = makeRouter(dir, {
+      logs,
+      pluginCommands: [
+        pluginCommand('first', 'desktop', {
+          aliases: ['pc'],
+          permission: 'none',
+          run: () => {
+            ran.push('first')
+          },
+        }),
+        pluginCommand('second', 'screen', {
+          aliases: ['pc'],
+          permission: 'none',
+          run: () => {
+            ran.push('second')
+          },
+        }),
+      ],
+    })
+
+    await router.route(inbound({ text: '/pc' }))
+    await router.route(inbound({ text: '/screen', externalMessageId: 'm2' }))
+
+    expect(ran).toEqual(['first'])
+    expect(logs.some((m) => m.includes('channel command /screen skipped'))).toBe(true)
+  })
+
+  test('a plugin whose alias repeats its own command name registers once instead of aborting boot', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const ran: string[] = []
+    // createCommandRegistry registers name and aliases into one map and throws
+    // on a repeat, and that throw propagates out of createChannelRouter into
+    // startAgentRuntime. A redundant self-alias is the plugin's own declaration
+    // problem; it must cost the plugin nothing and the container nothing.
+    const { router } = makeRouter(dir, {
+      logs,
+      pluginCommands: [
+        pluginCommand('rogue', 'desktop', {
+          description: 'Control the personal desktop.',
+          aliases: ['desktop', 'pc', 'pc'],
+          permission: 'none',
+          run: (ctx) => {
+            ran.push(ctx.args)
+          },
+        }),
+      ],
+    })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/desktop status' }))
+    await router.route(inbound({ text: '/pc', externalMessageId: 'm2' }))
+    await router.route(inbound({ text: '/help', externalMessageId: 'm3' }))
+
+    expect(ran).toEqual(['status', ''])
+    expect(logs.some((m) => m.includes('skipped'))).toBe(false)
+    expect(sent.at(-1)!.text).toContain('/desktop — Control the personal desktop.')
+  })
+
+  test('a self-alias still loses to a built-in that already owns the name', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    let ran = false
+    // De-duplicating within one declaration must not soften the real collision
+    // rule: /help belongs to the runtime.
+    const { router } = makeRouter(dir, {
+      logs,
+      pluginCommands: [
+        pluginCommand('rogue', 'help', {
+          aliases: ['help'],
+          permission: 'none',
+          run: () => {
+            ran = true
+            return 'hijacked'
+          },
+        }),
+      ],
+    })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/help' }))
+
+    expect(ran).toBe(false)
+    expect(sent[0]!.text).toContain('Available commands:')
+    expect(logs.some((m) => m.includes('channel command /help skipped'))).toBe(true)
+  })
+
+  test('a handler that never resolves is aborted and reported as a timeout', async () => {
+    const dir = await tempDir()
+    let sawAbort = false
+    const { router } = makeRouter(dir, {
+      pluginCommandTimeoutMs: 20,
+      pluginCommands: [
+        pluginCommand('p', 'desktop', {
+          permission: 'none',
+          run: (ctx) =>
+            new Promise<string>(() => {
+              ctx.signal.addEventListener('abort', () => {
+                sawAbort = true
+              })
+            }),
+        }),
+      ],
+    })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/desktop' }))
+    // Routing survives the wedged handler: an ordinary message still gets through.
+    await router.route(inbound({ text: 'hello', externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent[0]!.text).toBe('/desktop failed: timed out after 20ms')
+    expect(sawAbort).toBe(true)
+  })
+
+  test('a handler that throws is reported to the channel instead of breaking routing', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir, {
+      pluginCommands: [
+        pluginCommand('p', 'desktop', {
+          permission: 'none',
+          run: () => {
+            throw new Error('gateway unreachable')
+          },
+        }),
+      ],
+    })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/desktop' }))
+    // Routing survives: an ordinary message still gets through afterwards.
+    await router.route(inbound({ text: 'hello', externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent[0]!.text).toBe('/desktop failed: gateway unreachable')
+  })
+
+  test('is reachable from the native slash surface with a key-derived context', async () => {
+    const dir = await tempDir()
+    const seen: PluginChannelCommandContext[] = []
+    const { router } = makeRouter(dir, {
+      pluginCommands: [
+        pluginCommand('p', 'desktop', {
+          permission: 'none',
+          run: (ctx) => {
+            seen.push(ctx)
+            return 'ok'
+          },
+        }),
+      ],
+    })
+
+    const result = await router.executeCommand(KEY, 'desktop', { invokerId: 'alice' })
+
+    expect(result).toEqual({ kind: 'handled', name: 'desktop', reply: 'ok' })
+    expect(seen[0]!.adapter).toBe('discord-bot')
+    expect(seen[0]!.invokerId).toBe('alice')
+    expect(seen[0]!.args).toBe('')
+  })
+})
+
+describe('/steer and /queue (per-channel delivery mode)', () => {
+  const steerConfig = (enabled: boolean, quietMs = 30): ChannelAdapterConfig => ({
+    ...baseConfig,
+    steer: { enabled, quietMs },
+  })
+
+  const outboundSink = (router: ChannelRouter): Array<{ text: string }> => {
+    const sent: Array<{ text: string }> = []
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+    return sent
+  }
+
+  // Route the first inbound and hold its prompt mid-flight, so route() and the
+  // command handlers see promptInFlight=true.
+  const holdFirstTurn = async (router: ChannelRouter, sessions: FakeSession[]) => {
+    await router.route(inbound({ text: 'long running request' }))
+    let released = false
+    let release: (() => void) | undefined
+    sessions[0]!.onPrompt = () =>
+      new Promise<void>((resolve) => {
+        if (released) {
+          resolve()
+          return
+        }
+        release = resolve
+      })
+    const draining = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length === 1)
+    return {
+      release: () => {
+        released = true
+        release?.()
+      },
+      draining,
+    }
+  }
+
+  test('/steer turns mid-turn injection on for a channel whose adapter has it off', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(false) })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/steer', externalMessageId: 'm-on' }))
+    expect(sent[0]!.text).toBe(
+      'Mid-turn steer is on for this channel: messages sent while I am working are folded into the running turn.',
+    )
+
+    const { release, draining } = await holdFirstTurn(router, sessions)
+    await router.route(inbound({ text: 'and also run the tests', externalMessageId: 'm2' }))
+    await waitFor(() => sessions[0]!.steered.length === 1)
+
+    expect(sessions[0]!.steered[0]).toContain('and also run the tests')
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    release()
+    await draining
+  })
+
+  test('/steer off turns it back off for a channel whose adapter has it on', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(true) })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/steer off', externalMessageId: 'm-off' }))
+    expect(sent[0]!.text).toBe(
+      'Mid-turn steer is off for this channel: messages sent while I am working are queued for the next turn.',
+    )
+
+    const { release, draining } = await holdFirstTurn(router, sessions)
+    await router.route(inbound({ text: 'and also run the tests', externalMessageId: 'm2' }))
+    expect(sessions[0]!.steered).toHaveLength(0)
+
+    release()
+    await draining
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+  })
+
+  test('/queue is /steer off, and /queue off is /steer on', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(true) })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/queue', externalMessageId: 'm1' }))
+    expect(sent[0]!.text).toContain('Mid-turn steer is off')
+
+    await router.route(inbound({ text: '/queue off', externalMessageId: 'm2' }))
+    expect(sent[1]!.text).toContain('Mid-turn steer is on')
+
+    const { release, draining } = await holdFirstTurn(router, sessions)
+    await router.route(inbound({ text: 'follow-up', externalMessageId: 'm3' }))
+    await waitFor(() => sessions[0]!.steered.length === 1)
+    release()
+    await draining
+  })
+
+  test('/steer status names the effective mode and where it came from', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir, { config: baseConfig })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/steer status', externalMessageId: 'm1' }))
+    expect(sent[0]!.text).toContain('Mid-turn delivery for this channel: queue')
+    expect(sent[0]!.text).toContain('Source: the default.')
+
+    await router.route(inbound({ text: '/steer on', externalMessageId: 'm2' }))
+    await router.route(inbound({ text: '/queue status', externalMessageId: 'm3' }))
+    expect(sent[2]!.text).toContain('Mid-turn delivery for this channel: steer')
+    expect(sent[2]!.text).toContain('Source: this channel (set with /steer or /queue).')
+  })
+
+  test('status reports the adapter config when no override is set', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir, { config: steerConfig(true) })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/steer status' }))
+
+    expect(sent[0]!.text).toContain('Mid-turn delivery for this channel: steer')
+    expect(sent[0]!.text).toContain('Source: adapter config (channels.<adapter>.steer.enabled).')
+  })
+
+  test('/steer reset drops the override so the adapter config decides again', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir, { config: steerConfig(true) })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/steer off', externalMessageId: 'm1' }))
+    await router.route(inbound({ text: '/steer reset', externalMessageId: 'm2' }))
+
+    expect(sent[1]!.text).toContain('follows the adapter config again')
+    expect(sent[1]!.text).toContain('Mid-turn delivery for this channel: steer')
+    expect(sent[1]!.text).toContain('Source: adapter config')
+  })
+
+  test('the override is persisted and reloaded by a fresh router over the same agent dir', async () => {
+    const dir = await tempDir()
+    const first = makeRouter(dir, { config: steerConfig(false) })
+    outboundSink(first.router)
+    await first.router.route(inbound({ text: '/steer on' }))
+
+    const raw = await readFile(channelDeliveryModesPath(dir), 'utf8')
+    expect(JSON.parse(raw)).toEqual({ version: 1, modes: { 'discord-bot:g1:c1:': 'steer' } })
+
+    // A second router reads the same file at construction: the channel keeps
+    // steering across a restart without the adapter config changing.
+    const second = makeRouter(dir, { config: steerConfig(false) })
+    const { release, draining } = await holdFirstTurn(second.router, second.sessions)
+    await second.router.route(inbound({ text: 'follow-up', externalMessageId: 'm2' }))
+    await waitFor(() => second.sessions[0]!.steered.length === 1)
+
+    expect(second.sessions[0]!.steered[0]).toContain('follow-up')
+    release()
+    await draining
+  })
+
+  test('the override is per channel key: another chat still follows the adapter config', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir, { config: steerConfig(false) })
+    outboundSink(router)
+
+    await router.route(inbound({ text: '/steer on', chat: 'c1' }))
+
+    const raw = await readFile(channelDeliveryModesPath(dir), 'utf8')
+    expect(Object.keys((JSON.parse(raw) as { modes: Record<string, string> }).modes)).toEqual(['discord-bot:g1:c1:'])
+  })
+
+  test('/steer <text> injects into the running turn immediately, with no reply of its own', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(false) })
+    const sent = outboundSink(router)
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    await router.route(inbound({ text: '/steer and also run the tests', externalMessageId: 'm2' }))
+    await waitFor(() => sessions[0]!.steered.length === 1)
+
+    // The payload reaches the model; the command text itself never does.
+    expect(sessions[0]!.steered[0]).toContain('and also run the tests')
+    expect(sessions[0]!.steered[0]).not.toContain('/steer')
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toHaveLength(0)
+    // The mode itself is untouched: the next plain inbound still queues.
+    release()
+    await draining
+    expect(sessions[0]!.steered).toHaveLength(1)
+  })
+
+  test('/steer <text> carrying an attachment queues instead of steering, so the attachment survives', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(true, 400) })
+    const sent = outboundSink(router)
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    const photo = { id: 7, kind: 'photo' as const, ref: 'https://example.test/screenshot.png', mimetype: 'image/png' }
+    await router.route(inbound({ text: '/steer look at this', externalMessageId: 'm2', attachments: [photo] }))
+
+    // composeSteerPrompt renders only the author line and the text, and the
+    // mid-turn flush then empties the buffer, so steering this payload would
+    // throw the attachment away for good — the same reason route()'s passive
+    // gate refuses it. The lookup only walks the turn snapshot, promptQueue and
+    // the context buffer, never the steer buffer, so a hit here IS the proof
+    // that the message took the queued path.
+    expect(router.lookupInboundAttachment({ ...KEY, id: 7 })).not.toBeNull()
+
+    release()
+    await draining
+
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('look at this')
+    expect(sessions[0]!.prompts[1]).not.toContain('/steer')
+    expect(sent).toHaveLength(0)
+  })
+
+  test('/steer <text> publishes the carried payload on the inbound stream', async () => {
+    const dir = await tempDir()
+    const stream = createStream()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(false), stream })
+    outboundSink(router)
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    await router.route(inbound({ text: '/steer and also run the tests', externalMessageId: 'm2' }))
+    await waitFor(() => sessions[0]!.steered.length === 1)
+
+    // Unlike every other channel command, this one hands real user content to
+    // the model, so `typeclaw inspect` must not show a turn whose triggering
+    // message never appeared on the stream.
+    const inbounds = stream
+      .scan()
+      .map((m) => m.payload as { kind?: string; text?: string; decision?: string })
+      .filter((p) => p.kind === 'channel-inbound')
+    expect(inbounds.map((p) => p.text)).toEqual(['long running request', 'and also run the tests'])
+    expect(inbounds[1]!.decision).toBe('engage')
+
+    release()
+    await draining
+  })
+
+  test('/steer <text> falls back to the queued path when no turn is running', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(false) })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/steer look at the logs' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sessions[0]!.prompts[0]).toContain('look at the logs')
+    expect(sent).toHaveLength(0)
+  })
+
+  test('/queue <text> always queues, even while steer is on and a turn is running', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { config: steerConfig(true, 400) })
+    const sent = outboundSink(router)
+    const { release, draining } = await holdFirstTurn(router, sessions)
+
+    await router.route(inbound({ text: '/queue and also run the tests', externalMessageId: 'm2' }))
+    expect(sessions[0]!.steered).toHaveLength(0)
+
+    release()
+    await draining
+
+    expect(sessions[0]!.steered).toHaveLength(0)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('and also run the tests')
+    expect(sessions[0]!.prompts[1]).not.toContain('/queue')
+    expect(sent).toHaveLength(0)
+  })
+
+  test('both commands are gated on session.control and listed in /help', async () => {
+    const dir = await tempDir()
+    const denied: string[] = []
+    const permissions: PermissionService = {
+      has: (_origin, permission) => {
+        denied.push(permission)
+        return permission === 'channel.respond'
+      },
+      resolveRole: () => 'guest',
+      compareRoleSeverity: () => undefined,
+      permissionsForRole: () => undefined,
+      describe: () => ({ role: 'guest', permissions: ['channel.respond'] }),
+      replaceRoles: () => {},
+    }
+    const { router } = makeRouter(dir, { permissions })
+    const sent = outboundSink(router)
+
+    await router.route(inbound({ text: '/steer on', externalMessageId: 'm1' }))
+    await router.route(inbound({ text: '/queue on', externalMessageId: 'm2' }))
+    expect(sent).toHaveLength(0)
+    expect(denied).toContain('session.control')
+
+    await router.route(inbound({ text: '/help', externalMessageId: 'm3' }))
+    expect(sent[0]!.text).toContain('/steer —')
+    expect(sent[0]!.text).toContain('/queue —')
+  })
+
+  test('a bare native slash invocation turns steering on, the only form that surface can express', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+
+    // executeCommand dispatches `/steer` with no argument text — ExecuteCommandOptions
+    // has no args field — so a native invocation can only ever reach the mode
+    // switch. The injection form needs a real channel message behind it.
+    const result = await router.executeCommand(KEY, 'steer', { invokerId: 'alice' })
+
+    expect(result).toEqual({
+      kind: 'handled',
+      name: 'steer',
+      reply:
+        'Mid-turn steer is on for this channel: messages sent while I am working are folded into the running turn.',
+    })
   })
 })

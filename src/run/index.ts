@@ -108,6 +108,7 @@ import { BUNDLED_PLUGINS } from './bundled-plugins'
 import { buildChannelSessionFactory } from './channel-session-factory'
 import { installFatalGuard } from './fatal-guard'
 import { installLlmFetchObserver } from './llm-fetch-observer'
+import { loadPlatformExtensions, resolvePlatformExtensionPaths } from './platform-extensions'
 import { createPluginRuntime, type PluginRuntime, type PluginSubagentEntry } from './plugin-runtime'
 import { logResourceReport } from './resource-report'
 import { createRuntimeShutdownHandler } from './shutdown'
@@ -375,6 +376,13 @@ async function startAgentRuntime(
       : null
   const mcpManagerOpt = mcpManager !== null ? { mcpManager } : {}
 
+  // Platform Extensions resolve BEFORE the background MCP warm-up starts: a
+  // missing or unreadable mount aborts boot with the path named, and doing it
+  // here means that abort cannot leak an MCP subprocess the warm-up spawned.
+  const platformExtensions = await loadPlatformExtensions(
+    resolvePlatformExtensionPaths(caps.deploymentProfile, process.env),
+  )
+
   // Warm up MCP connections in the BACKGROUND so boot doesn't block on each
   // server's subprocess spawn + listTools() (worst case the 15s connect
   // timeout). Tool calls lazily ensureConnected() and the catalog render awaits
@@ -404,6 +412,7 @@ async function startAgentRuntime(
     configsByName: pluginConfigsByName,
     ...(managedDefaultPluginLoader !== undefined ? { loadEntry: managedDefaultPluginLoader } : {}),
     bundled: BUNDLED_PLUGINS,
+    ...(platformExtensions.length > 0 ? { platformExtensions } : {}),
     resolveGithubTokenForRepo: githubTokenBridge.resolveTokenForRepo,
     hasGithubAppTokenResolver: githubTokenBridge.hasAppTokenResolver,
     getGithubAppSelfLogin: githubTokenBridge.getAppSelfLogin,
@@ -606,6 +615,7 @@ async function startAgentRuntime(
         .list({ parentSessionId: sessionId })
         .filter((child) => child.status === 'running' && child.background === true)
         .map((child) => child.subagentName),
+    pluginCommands: pluginsLoaded.registry.channelCommands,
     onReload: async () => {
       const { results } = await reloadRegistry.reloadAll()
       return formatChannelReloadSummary(results)

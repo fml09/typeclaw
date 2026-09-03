@@ -31,10 +31,16 @@ import {
 import { defuseRuntimeMarkers } from '@/agent/tools/runtime-notice'
 import { SUBAGENT_OUTPUT_TOOL_NAME } from '@/agent/tools/subagent-output'
 import { promptPersistentTurnWithFallback } from '@/agent/turn-runner'
-import { type Command, type CommandPermission, type CommandResult, createCommandRegistry } from '@/commands'
+import {
+  type Command,
+  type CommandHandlerResult,
+  type CommandPermission,
+  type CommandResult,
+  createCommandRegistry,
+} from '@/commands'
 import { getConfig, resolveModel } from '@/config'
 import { CORE_PERMISSIONS, type PermissionService } from '@/permissions'
-import type { HookBus } from '@/plugin'
+import type { HookBus, PluginChannelCommandContext, RegisteredChannelCommand } from '@/plugin'
 import { extractClaimCode } from '@/role-claim'
 import type { Stream } from '@/stream'
 
@@ -42,6 +48,7 @@ import { extractMentionedUserIds } from './adapters/mention-hints'
 import { formatChannelCommandHelp } from './commands'
 import { isQualifyingWorkResult } from './completion-claim'
 import { detectContinuationWillingness } from './continuation-willingness'
+import { loadChannelDeliveryModes, saveChannelDeliveryModes, type ChannelDeliveryMode } from './delivery-modes'
 import { describeError } from './describe-error'
 import {
   countEffectiveHumans,
@@ -692,6 +699,13 @@ export const HISTORY_ATTACHMENT_LIMIT = 50
 // degrades the current turn instead of bricking the channel until
 // container restart. Per-handler attribution lives in plugin/hooks.ts.
 export const SESSION_IDLE_TIMEOUT_MS = 30_000
+
+// Ceiling on one plugin-contributed channel command. Same reasoning and the
+// same number as the session.idle hook chain: a third-party handler that hangs
+// (an unreachable gateway with no timeout of its own) would otherwise hold
+// route() open for that channel forever, so it degrades to a reported failure
+// instead of a wedged conversation.
+export const PLUGIN_CHANNEL_COMMAND_TIMEOUT_MS = 30_000
 
 // Two-axis loop guard for peer-bot conversation. Peer bots route into
 // engagement under the SAME rules as humans, so a small ring (A→B→C→A) or
@@ -1392,6 +1406,16 @@ type LiveSession = {
 type ChannelCommandContext = {
   live: LiveSession | null
   event: InboundMessage | null
+  // The conversation the command was invoked in, supplied by BOTH dispatch
+  // paths. Present even when `live` and `event` are null (a native slash on a
+  // cold channel), so a handler that must act on the channel itself — the
+  // delivery-mode commands, plugin commands — always has an addressable key.
+  key: ChannelKey
+  // Permission-resolution origin for that same invocation, already carrying the
+  // invoker and (for a thread) its parent chat. Built once at each dispatch
+  // site next to the gate that uses it, so a handler cannot reconstruct a
+  // different origin than the one the router authorized against.
+  origin: SessionOrigin
   // The user who actually invoked the command, supplied by BOTH dispatch
   // paths (text: event.authorId; native slash: options.invokerId, where
   // event is null). /restart stamps the resume handoff's triggeringAuthorId
@@ -1855,6 +1879,19 @@ export type CreateChannelRouterOptions = {
   // work in the resume greeting. Background-only: a foreground child returns its
   // result inline, so it is not orphaned by the bounce. Omitted means none.
   listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
+  // Channel commands contributed by plugins (`PluginExports.channelCommands`),
+  // collected by the plugin manager and forwarded by the channel manager. They
+  // are appended AFTER the built-ins, and any whose name or alias is already
+  // taken is logged and skipped — createCommandRegistry throws on a duplicate,
+  // and a third-party plugin must never be able to crash the container at boot.
+  // Read once here: the registry is fixed for the router's lifetime, so a
+  // plugin set changed by `/reload` takes effect on the next restart.
+  pluginCommands?: readonly RegisteredChannelCommand[]
+  // Ceiling on one plugin channel-command handler. Production leaves this unset
+  // and takes PLUGIN_CHANNEL_COMMAND_TIMEOUT_MS; it exists so a test can assert
+  // the hang path without waiting 30s, because the router's `now` seam is a
+  // clock reader and does not reach setTimeout.
+  pluginCommandTimeoutMs?: number
 }
 
 export type RestartCommandContext = {
@@ -1951,6 +1988,80 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const reviewStateResolvers = new Map<ChannelKey['adapter'], ReviewStateResolver>()
   const reviewSubmitters = new Map<ChannelKey['adapter'], ReviewSubmitter>()
   const stickyLedger = new StickyLedger()
+
+  // --- Delivery-mode overrides (/steer, /queue) ----------------------------
+  //
+  // A per-channel-key override of the mid-turn delivery path, ahead of
+  // `channels.<adapter>.steer.enabled`. The load starts at construction rather
+  // than lazily on first use so the very first inbound after a boot is already
+  // decided by whatever the channel last chose; route() awaits it once, right
+  // before the steer gate, so a slow disk can't let one message slip through on
+  // the adapter default.
+  let deliveryModes = new Map<string, ChannelDeliveryMode>()
+  const deliveryModesLoaded = loadChannelDeliveryModes(options.agentDir, logger).then((loadedModes) => {
+    deliveryModes = loadedModes
+  })
+  let deliveryModesPersistChain: Promise<void> = Promise.resolve()
+  const persistDeliveryModes = async (): Promise<void> => {
+    // Serialized: two commands landing together would otherwise race on the
+    // single `.tmp` path the atomic write renames from.
+    const next = deliveryModesPersistChain.then(() => saveChannelDeliveryModes(options.agentDir, deliveryModes, logger))
+    deliveryModesPersistChain = next.catch(() => {})
+    await next
+  }
+
+  type DeliveryModeResolution = {
+    mode: ChannelDeliveryMode
+    // Where the mode came from, so `/steer status` can tell an operator whether
+    // this channel was configured by hand or is following the adapter.
+    source: 'override' | 'config' | 'default'
+    // The quiet window a steer buffer coalesces over. Lives here because an
+    // override can enable steering on an adapter that declares no `steer` block
+    // at all, and then there is no `steer.quietMs` to read.
+    quietMs: number
+  }
+
+  const resolveDeliveryMode = (key: ChannelKey): DeliveryModeResolution => {
+    const adapterConfig = options.configForAdapter(key.adapter)
+    const quietMs = adapterConfig?.steer?.quietMs ?? adapterConfig?.inboundBatching?.quietMs ?? HOT_DEBOUNCE_MS
+    const override = deliveryModes.get(channelKeyId(key))
+    if (override !== undefined) return { mode: override, source: 'override', quietMs }
+    const configured = adapterConfig?.steer?.enabled
+    if (configured === undefined) return { mode: 'queue', source: 'default', quietMs }
+    return { mode: configured ? 'steer' : 'queue', source: 'config', quietMs }
+  }
+
+  const setDeliveryMode = async (key: ChannelKey, mode: ChannelDeliveryMode | null): Promise<void> => {
+    await deliveryModesLoaded
+    const keyId = channelKeyId(key)
+    if (mode === null) deliveryModes.delete(keyId)
+    else deliveryModes.set(keyId, mode)
+    await persistDeliveryModes()
+  }
+
+  const describeDeliveryMode = (resolution: DeliveryModeResolution): string => {
+    const behavior =
+      resolution.mode === 'steer'
+        ? 'messages sent while I am working are folded into the running turn'
+        : 'messages sent while I am working are queued for the next turn'
+    const source =
+      resolution.source === 'override'
+        ? 'this channel (set with /steer or /queue)'
+        : resolution.source === 'config'
+          ? 'adapter config (channels.<adapter>.steer.enabled)'
+          : 'the default'
+    return `Mid-turn delivery for this channel: ${resolution.mode} — ${behavior}.\nSource: ${source}.`
+  }
+
+  const STEER_ON_REPLY =
+    'Mid-turn steer is on for this channel: messages sent while I am working are folded into the running turn.'
+  const STEER_OFF_REPLY =
+    'Mid-turn steer is off for this channel: messages sent while I am working are queued for the next turn.'
+  const DELIVERY_MODE_RESET_REPLY =
+    'Mid-turn delivery for this channel now follows the adapter config again (channels.<adapter>.steer.enabled).'
+  const DELIVERY_TEXT_NEEDS_MESSAGE_REPLY =
+    'Send this form as a normal channel message — a native slash command carries no text to deliver.'
+
   // The /help handler reads the live registry to enumerate commands, so it
   // forward-references `commands`. Safe at runtime — the handler only runs on
   // invocation, long after the assignment below completes.
@@ -1973,6 +2084,27 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         await stopCurrentChannelTurn(live!)
         return { reply: 'Stopped the current turn.' }
       },
+    },
+    {
+      name: 'steer',
+      description:
+        'Fold messages sent while I am working into the running turn (on/off/status/reset). /steer <text> injects one message now.',
+      permission: 'session.control',
+      requiresLiveSession: false,
+      // Resolve the live session when there is one so `/steer <text>` can reach
+      // the running turn, but never refuse from a cold channel: the mode switch
+      // and the fallback queued delivery both work without a session.
+      wantsLiveSession: true,
+      handler: async ({ live, event, key }, parsed) => runDeliveryModeCommand('steer', key, live, event, parsed.args),
+    },
+    {
+      name: 'queue',
+      description:
+        'Queue messages sent while I am working for the next turn (on/off/status/reset). /queue <text> queues one message.',
+      permission: 'session.control',
+      requiresLiveSession: false,
+      wantsLiveSession: true,
+      handler: async ({ live, event, key }, parsed) => runDeliveryModeCommand('queue', key, live, event, parsed.args),
     },
   ]
   // /reload and /restart are registered only when the operate-the-agent
@@ -2001,6 +2133,104 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         reply: await onRestart(live !== null ? buildRestartCommandContext(live, invokerId) : undefined),
       }),
     })
+  }
+  // Adapts one plugin declaration to the router's own command shape. Plugin
+  // commands are always session-optional (`requiresLiveSession: false`,
+  // `wantsLiveSession: true`): the plugin acts on something outside the turn —
+  // a desktop, a deployment — so refusing on a cold channel would be a
+  // capability gap, but a handler that wants the running session gets its id.
+  //
+  // `aliases` is the de-duplicated list the collision filter computed, not the
+  // plugin's raw array: createCommandRegistry registers name and aliases into
+  // one map and throws on a repeat, so the raw array must never reach it.
+  const toPluginChannelCommand = (
+    registration: RegisteredChannelCommand,
+    aliases: readonly string[],
+  ): Command<ChannelCommandContext> => ({
+    name: registration.commandName,
+    ...(aliases.length > 0 ? { aliases } : {}),
+    description: registration.command.description,
+    permission: registration.command.permission ?? 'session.admin',
+    requiresLiveSession: false,
+    wantsLiveSession: true,
+    handler: async ({ live, key, origin, invokerId }, parsed) =>
+      runPluginChannelCommand(registration, {
+        args: parsed.args,
+        sessionId: live?.sessionId ?? null,
+        invokerId,
+        origin,
+        adapter: key.adapter,
+        permissions,
+        logger: registration.logger,
+      }),
+  })
+
+  // Runs one plugin command with the two bounds a third-party handler needs:
+  // it can neither take the router down by throwing nor hold route() open
+  // forever. Both outcomes are reported to the channel rather than swallowed —
+  // an operator who typed a command must learn that it failed.
+  const runPluginChannelCommand = async (
+    registration: RegisteredChannelCommand,
+    ctx: Omit<PluginChannelCommandContext, 'signal'>,
+  ): Promise<CommandHandlerResult> => {
+    const timeoutMs = options.pluginCommandTimeoutMs ?? PLUGIN_CHANNEL_COMMAND_TIMEOUT_MS
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const result = await Promise.race([
+        Promise.resolve(registration.command.run({ ...ctx, signal: controller.signal })),
+        new Promise<never>((_resolve, reject) => {
+          controller.signal.addEventListener('abort', () => {
+            reject(new Error(`timed out after ${timeoutMs}ms`))
+          })
+        }),
+      ])
+      return typeof result === 'string' && result.length > 0 ? { reply: result } : {}
+    } catch (err) {
+      const detail = describeError(err)
+      registration.logger.warn(`channel command /${registration.commandName} failed: ${detail}`)
+      return { reply: `/${registration.commandName} failed: ${detail}` }
+    } finally {
+      clearTimeout(timer)
+      // Signals a handler that returned early but left work running that its
+      // result is no longer wanted.
+      controller.abort()
+    }
+  }
+
+  // Plugin-contributed commands are appended last, after every built-in, and a
+  // name or alias that is already spoken for is logged and skipped.
+  // createCommandRegistry THROWS on a duplicate, so without this filter a
+  // third-party plugin shipping a `/help` would take the container down at
+  // boot — the plugin's command is the thing that must lose, never the runtime.
+  const takenCommandNames = new Set<string>()
+  for (const command of channelCommands) {
+    takenCommandNames.add(command.name.toLowerCase())
+    for (const alias of command.aliases ?? []) takenCommandNames.add(alias.toLowerCase())
+  }
+  for (const registration of options.pluginCommands ?? []) {
+    const commandName = registration.commandName.toLowerCase()
+    // Lowercased and de-duplicated against each other BEFORE the clash check,
+    // because these names go on to createCommandRegistry, which throws on a
+    // repeat. A plugin that lists its own command name as an alias (or the same
+    // alias twice) is a redundant declaration, not a collision with anything
+    // else — checking each entry only against `takenCommandNames` would wave it
+    // through and then abort boot on the registry's duplicate throw, which is
+    // exactly the crash this filter exists to prevent. Registering the name once
+    // keeps the plugin working; only a clash with someone ELSE loses its command.
+    const aliases = Array.from(
+      new Set((registration.command.aliases ?? []).map((alias) => alias.toLowerCase())),
+    ).filter((alias) => alias !== commandName)
+    const names = [commandName, ...aliases]
+    const clash = names.find((name) => takenCommandNames.has(name))
+    if (clash !== undefined) {
+      logger.warn(
+        `[channels] plugin ${registration.pluginName}: channel command /${registration.commandName} skipped — /${clash} is already registered`,
+      )
+      continue
+    }
+    for (const name of names) takenCommandNames.add(name)
+    channelCommands.push(toPluginChannelCommand(registration, aliases))
   }
   const commands = createCommandRegistry<ChannelCommandContext>(channelCommands)
 
@@ -4400,7 +4630,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // Gating (channel.respond / session.control) and live-session resolution stay
   // at the call sites — this helper only runs the handler and delivers the reply.
   const runChannelCommand = async (event: InboundMessage, live: LiveSession | null): Promise<CommandResult> => {
-    const result = await commands.execute(event.text, { live, event, invokerId: event.authorId })
+    const key: ChannelKey = {
+      adapter: event.adapter,
+      workspace: event.workspace,
+      chat: event.chat,
+      thread: event.thread,
+    }
+    const result = await commands.execute(event.text, {
+      live,
+      event,
+      key,
+      origin: inboundAuthorOrigin(event),
+      invokerId: event.authorId,
+    })
     if (result.kind === 'handled' && result.reply !== undefined) {
       await send(
         {
@@ -4468,16 +4710,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const parsedCommand = commands.parse(event.text)
     const commandInfo = parsedCommand === null ? undefined : commands.get(parsedCommand.name)
 
-    // Public-command fast path: a known command that is both ungated
-    // (permission:'none') AND informational (requiresLiveSession:false) runs
-    // BEFORE the channel.respond gate, mirroring the native-slash path where
-    // such commands skip permissions entirely. Both conditions are required so
-    // a future "public but live-session-aware" command can't silently bypass
-    // the gate. It only reveals already-public command names — it never creates
-    // a session or prompts the agent — so it is not a channel.respond bypass in
-    // any meaningful sense. Unknown commands, /stop, //escaped text, and plain
-    // messages all fall through to the gate unchanged.
-    if (parsedCommand !== null && commandInfo?.permission === 'none' && !commandInfo.requiresLiveSession) {
+    // Public-command fast path: a known command that is ungated
+    // (permission:'none') AND touches no session at all (neither
+    // requiresLiveSession nor wantsLiveSession) runs BEFORE the channel.respond
+    // gate, mirroring the native-slash path where such commands skip
+    // permissions entirely. All three conditions are required so a "public but
+    // live-session-aware" command — which a plugin can declare — cannot
+    // silently bypass the gate. What remains here only reveals already-public
+    // command names; it never creates a session or prompts the agent, so it is
+    // not a channel.respond bypass in any meaningful sense. Unknown commands,
+    // /stop, //escaped text, and plain messages all fall through to the gate
+    // unchanged.
+    if (
+      parsedCommand !== null &&
+      commandInfo?.permission === 'none' &&
+      !commandInfo.requiresLiveSession &&
+      !commandInfo.wantsLiveSession
+    ) {
       await runChannelCommand(event, null)
       return
     }
@@ -4608,14 +4857,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     updateLoopGuard(live, event)
 
-    // Steer gate: with `channels.<adapter>.steer.enabled`, a plain-text
-    // inbound that engages while a turn is mid-flight is injected into the
-    // RUNNING turn (after a short quiet window) instead of queueing a
+    // Steer gate: when this channel's delivery mode resolves to `steer` — from
+    // its own /steer override, else `channels.<adapter>.steer.enabled` — a
+    // plain-text inbound that engages while a turn is mid-flight is injected
+    // into the RUNNING turn (after a short quiet window) instead of queueing a
     // separate follow-up turn. Reload-teardown and aborting turns fall back
     // to the queue so the message is never steered into a session that is
     // about to die.
+    //
+    // Awaited here and not at the top of route(): the overrides are only
+    // consulted from this point on, and an inbound that never reaches the gate
+    // must not pay for the read.
+    await deliveryModesLoaded
     if (
-      options.configForAdapter(live.key.adapter)?.steer?.enabled === true &&
+      resolveDeliveryMode(live.key).mode === 'steer' &&
       live.promptInFlight &&
       !live.pendingTeardown &&
       !live.destroyed &&
@@ -4812,22 +5067,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     event.githubReviewRound === undefined &&
     event.text.trim().length > 0
 
-  const steerQuietMsFor = (live: LiveSession): number => {
-    const adapterConfig = options.configForAdapter(live.key.adapter)
-    return adapterConfig?.steer?.quietMs ?? adapterConfig?.inboundBatching?.quietMs ?? HOT_DEBOUNCE_MS
-  }
+  // Goes through the same resolver as the gate, so a delivery-mode override is
+  // consulted ahead of `configForAdapter` here too: an override can turn
+  // steering on for an adapter that declares no `steer` block at all, and then
+  // there is no `steer.quietMs` and the batching cadence is the window.
+  const steerQuietMsFor = (live: LiveSession): number => resolveDeliveryMode(live.key).quietMs
 
   // route() calls this INSTEAD of enqueue() when steer is enabled and the turn
   // is mid-flight. The engage ack reaction is deliberately skipped: the message
   // is consumed within the current turn, so the transient :eyes: would be added
   // and removed in the same breath.
-  const bufferSteerInbound = (live: LiveSession, event: InboundMessage): void => {
+  //
+  // `immediate` is the explicit `/steer <text>` form: the operator already said
+  // "now", so there is nothing left to coalesce and the quiet window is zero.
+  // Anything already buffered rides along with it, preserving arrival order.
+  const bufferSteerInbound = (live: LiveSession, event: InboundMessage, immediate = false): void => {
     live.steerBuffer.push(toQueuedInbound(event, null))
     clearTimeout(live.steerTimer ?? undefined)
-    live.steerTimer = setTimeout(() => {
-      live.steerTimer = null
-      void flushSteerBufferMidTurn(live)
-    }, steerQuietMsFor(live))
+    live.steerTimer = setTimeout(
+      () => {
+        live.steerTimer = null
+        void flushSteerBufferMidTurn(live)
+      },
+      immediate ? 0 : steerQuietMsFor(live),
+    )
   }
 
   // Push buffered steer inbounds onto the ordinary queue. Fallback paths only —
@@ -4882,6 +5145,129 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const clearSteerTimer = (live: LiveSession): void => {
     clearTimeout(live.steerTimer ?? undefined)
     live.steerTimer = null
+  }
+
+  // --- /steer and /queue ---------------------------------------------------
+  //
+  // Two shapes share one handler because they are the same control surface seen
+  // from either end: `/steer` and `/queue` set (or report) this channel's
+  // delivery mode, and `/steer <text>` / `/queue <text>` force one message down
+  // the chosen path without changing the mode.
+  const runDeliveryModeCommand = async (
+    command: 'steer' | 'queue',
+    key: ChannelKey,
+    live: LiveSession | null,
+    event: InboundMessage | null,
+    args: string,
+  ): Promise<CommandHandlerResult> => {
+    await deliveryModesLoaded
+    const trimmed = args.trim()
+    const keyword = trimmed.toLowerCase()
+    // `on`/`off` are read relative to the command that was typed: /queue on is
+    // /steer off. Only these bare keywords are control words — anything else,
+    // including a longer sentence that starts with one, is a message.
+    if (trimmed === '' || keyword === 'on') {
+      const mode = command === 'steer' ? 'steer' : 'queue'
+      await setDeliveryMode(key, mode)
+      return { reply: mode === 'steer' ? STEER_ON_REPLY : STEER_OFF_REPLY }
+    }
+    if (keyword === 'off') {
+      const mode = command === 'steer' ? 'queue' : 'steer'
+      await setDeliveryMode(key, mode)
+      return { reply: mode === 'steer' ? STEER_ON_REPLY : STEER_OFF_REPLY }
+    }
+    if (keyword === 'status') {
+      return { reply: describeDeliveryMode(resolveDeliveryMode(key)) }
+    }
+    // Without this the override is a one-way door: once set, a channel could
+    // never go back to following its adapter config.
+    if (keyword === 'reset' || keyword === 'auto') {
+      await setDeliveryMode(key, null)
+      return { reply: `${DELIVERY_MODE_RESET_REPLY}\n${describeDeliveryMode(resolveDeliveryMode(key))}` }
+    }
+    // Unreachable today and deliberately kept: `event === null` is the native
+    // slash surface (executeCommand), which dispatches a bare `/steer` with no
+    // argument text, so `trimmed` is '' there and the mode switch above already
+    // answered. It stays because it is also what narrows `event` for the call
+    // below — and because a native surface that later grows an args field would
+    // otherwise reach deliverCommandText with no message to deliver.
+    if (event === null) return { reply: DELIVERY_TEXT_NEEDS_MESSAGE_REPLY }
+    await deliverCommandText(key, live, event, trimmed, command)
+    // No reply: the message was handed to the agent, and the model answers it
+    // in the turn it landed in.
+    return {}
+  }
+
+  // Delivers one command-carried message on the requested path. `steer` injects
+  // into the running turn when there is one and otherwise falls back to the
+  // ordinary queued path — the same never-lose-a-message invariant the passive
+  // steer buffer keeps. `queue` always queues, bypassing the gate entirely.
+  const deliverCommandText = async (
+    key: ChannelKey,
+    existing: LiveSession | null,
+    event: InboundMessage,
+    text: string,
+    mode: ChannelDeliveryMode,
+  ): Promise<void> => {
+    // The command text itself must not reach the model — only its payload does.
+    const carried: InboundMessage = { ...event, text }
+    // A boot restart-resume reservation must learn that a real inbound landed
+    // here too, exactly as route() marks it before engagement: this message IS
+    // the wake, so resume() would otherwise stack its synthetic "I'm back" turn
+    // on top of the turn this delivery already triggers.
+    const reservation = restartReservations.get(channelKeyId(key))
+    if (reservation !== undefined) reservation.sawInbound = true
+    // `isSteerableInbound` gates this branch for the same reason it gates
+    // route()'s passive steer path: composeSteerPrompt renders only the author
+    // line and the text, and flushSteerBufferMidTurn then empties the buffer,
+    // so an attachment, a reply-quote reference context, or a GitHub review
+    // round riding on this message would be dropped and never reach any later
+    // prompt either. Prefixing a message with /steer must not silently cost the
+    // user content the same message would have kept without the prefix — a
+    // non-steerable payload falls through to the queued path, which carries all
+    // three fields through toQueuedInbound.
+    if (
+      mode === 'steer' &&
+      isSteerableInbound(carried) &&
+      existing !== null &&
+      existing.promptInFlight &&
+      !existing.pendingTeardown &&
+      !existing.destroyed
+    ) {
+      publishInbound(carried, 'engage', existing.sessionId)
+      bufferSteerInbound(existing, carried, true)
+      startTypingHeartbeat(existing)
+      logger.info(`[channels] ${existing.keyId}: /steer injecting a message into the running turn`)
+      return
+    }
+    const live =
+      existing !== null && !existing.destroyed
+        ? existing
+        : await ensureLive(key, event.externalMessageId, event.authorId, undefined, event.room)
+    // Published with the carried payload rather than the raw command text.
+    // /steer and /queue are the only channel commands that hand real user
+    // content to the model, so an operator watching the channel-inbound
+    // broadcast (typeclaw inspect) must see the message the turn is actually
+    // answering rather than a turn with no visible trigger.
+    publishInbound(carried, 'engage', live.sessionId)
+    // Same bookkeeping route() does for an engaged inbound: the room shape
+    // scopes membership lookups, and the author must be a participant or reply
+    // targeting and the post-turn sticky grant will not see them.
+    live.room = event.room
+    live.participants = updateParticipants(
+      live.participants,
+      event.authorId,
+      event.authorName,
+      now(),
+      event.authorIsBot,
+    )
+    void persistParticipants(live)
+    // A queued delivery must not jump ahead of inbounds already parked in the
+    // steer buffer — same arrival-order rule a non-steerable inbound follows.
+    if (live.steerBuffer.length > 0) flushSteerBufferToQueue(live)
+    enqueue(live, carried, null)
+    startTypingHeartbeat(live)
+    if (!live.draining) scheduleDebouncedDrain(live)
   }
 
   const registerOutbound = (adapter: ChannelKey['adapter'], cb: OutboundCallback): void => {
@@ -6821,17 +7207,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // permission:'none' and skip both the gate and the lookup so they work in
     // channels with no live turn.
     const requiredPermission = commandPermissionString(commandInfo.permission)
+    const origin: SessionOrigin = {
+      kind: 'channel',
+      adapter: key.adapter,
+      workspace: key.workspace,
+      chat: key.chat,
+      thread: key.thread,
+      ...(options.parentChat !== undefined ? { parentChat: options.parentChat } : {}),
+      lastInboundAuthorId: options.invokerId,
+    }
     if (requiredPermission !== null) {
-      const partial: SessionOrigin = {
-        kind: 'channel',
-        adapter: key.adapter,
-        workspace: key.workspace,
-        chat: key.chat,
-        thread: key.thread,
-        ...(options.parentChat !== undefined ? { parentChat: options.parentChat } : {}),
-        lastInboundAuthorId: options.invokerId,
-      }
-      if (!permissions.has(partial, requiredPermission)) {
+      if (!permissions.has(origin, requiredPermission)) {
         return { kind: 'permission-denied' }
       }
     }
@@ -6856,7 +7242,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const resolved = resolveLiveSessionForCommand(liveSessions, key)
       live = resolved.kind === 'found' ? resolved.session : null
     }
-    const result = await commands.execute(`/${lowered}`, { live, event: null, invokerId: options.invokerId })
+    const result = await commands.execute(`/${lowered}`, {
+      live,
+      event: null,
+      key,
+      origin,
+      invokerId: options.invokerId,
+    })
     if (result.kind === 'handled') {
       return result.reply !== undefined
         ? { kind: 'handled', name: result.name, reply: result.reply }

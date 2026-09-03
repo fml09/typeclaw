@@ -22,6 +22,28 @@ The image contains:
 
 `TYPECLAW_CLI_ENTRY=/node_modules/typeclaw/src/cli/index.ts` is what makes the same entrypoint shim independent of `/agent/node_modules`. Host-generated images leave that variable unset and retain their existing `/agent/node_modules/typeclaw/...` path.
 
+## Platform extensions
+
+`TYPECLAW_PLATFORM_EXTENSIONS` is a colon-separated list of absolute paths to plugin files or directories the platform mounts into the image. It lets an administrator ship a plugin into an immutable runtime without writing the Agent Folder: no `typeclaw.json#plugins` edit, no writable plugin directory, and nothing the agent can rewrite.
+
+| Behavior              | Rule                                                                                                                                                                                                                                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Profile               | Honored **only** when `TYPECLAW_DEPLOYMENT_PROFILE=managed`; ignored with a warning otherwise                                                                                                                                                                                              |
+| Path form             | Absolute. A relative entry aborts boot; empty segments and repeats of one path are dropped                                                                                                                                                                                                 |
+| Order                 | Loaded **after** the config-declared `typeclaw.json#plugins` entries and after the bundled plugins                                                                                                                                                                                         |
+| Name                  | Basename: a file entry `/opt/x/desktop.ts` → `desktop`; a directory entry `/opt/x/desktop` → `desktop`. An entry file literally named `index` takes its containing directory instead, so `/opt/x/desktop/index.ts` → `desktop` — the same name the directory form gives, and never `index` |
+| Directory entry point | `package.json` `module`/`main` if present, else `index.ts`, `index.tsx`, `index.js`, `index.mjs`, `index.cjs`                                                                                                                                                                              |
+| Config                | `typeclaw.json[<name>]` when present, otherwise `undefined` — a plugin that requires config fails the normal way                                                                                                                                                                           |
+| Failure               | A missing or unreadable path, a directory with no entry file, or a module that is not a `definePlugin(...)` result **aborts boot** with the path named                                                                                                                                     |
+
+Each loaded extension emits one boot line: `[plugin] platform extension loaded: <name> (<path>)`.
+
+The `index` rule exists because a platform typically mounts one extension per directory and may point the variable at either the directory or its entry file. Without it the two spellings of the same mount would produce different names — the `typeclaw.json` block written under the directory name would never be applied, and two extensions in the usual `<name>/index.ts` shape would both claim `index` and abort boot on the plugin-name-conflict check.
+
+Extensions load through a trusted local path that skips the Agent Folder containment check `src/plugin/loader.ts` enforces on config-declared local entries. This is not a widening of that guard. The containment check exists to stop a plugin entry **the model or the Agent Folder authored** — a `typeclaw.json#plugins` string the agent can rewrite at will — from escaping the Agent Folder and importing arbitrary host files. `TYPECLAW_PLATFORM_EXTENSIONS` is not agent-authored: it is process environment the platform sets before the runtime starts, in a profile where the agent has no way to edit the environment of its own process. The path is already outside the agent's reach before the loader sees it, so containment has nothing left to protect there. Config-declared entries are unchanged: they still refuse every path outside `agentDir`, and that refusal is still fatal.
+
+Failures are loud for the same reason bundled-plugin failures are: administrator-owned image content that does not load is a broken deployment, and a silently skipped extension would leave an operator with a runtime that looks healthy while the capability it was configured to provide simply does not exist.
+
 ## Writable filesystem contract
 
 A read-only root filesystem is supported when the platform supplies these writable paths:

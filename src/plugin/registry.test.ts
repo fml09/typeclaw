@@ -246,6 +246,65 @@ describe('registerContributions', () => {
     discardRegistrationsBy('p1', registry, hooks)
     expect(registry.commands.map((c) => c.commandName)).toEqual(['p2-cmd'])
   })
+
+  test('collects channel commands with their plugin, logger and declaration', () => {
+    const opts = makeOptions('personal-desktop', {
+      channelCommands: {
+        desktop: {
+          description: 'Control the personal desktop.',
+          aliases: ['vnc', 'pc'],
+          permission: 'session.admin',
+          run: () => 'ok',
+        },
+      },
+    })
+    registerContributions(opts)
+
+    expect(opts.registry.channelCommands).toHaveLength(1)
+    const registered = opts.registry.channelCommands[0]!
+    expect(registered.pluginName).toBe('personal-desktop')
+    expect(registered.commandName).toBe('desktop')
+    expect(registered.command.aliases).toEqual(['vnc', 'pc'])
+    expect(registered.logger).toBe(noopLogger)
+  })
+
+  test('keeps a cross-plugin channel command name collision — the router logs and skips it', () => {
+    const registry = emptyRegistry()
+    const hooks = createHookBus()
+    const declaration = { description: 'x', run: () => {} }
+    for (const pluginName of ['p1', 'p2']) {
+      registerContributions({
+        pluginName,
+        logger: noopLogger,
+        exports: { channelCommands: { desktop: declaration } },
+        registry,
+        hooks,
+        agentDir: '/tmp',
+        pluginConfig: undefined,
+      })
+    }
+
+    expect(registry.channelCommands.map((c) => c.pluginName)).toEqual(['p1', 'p2'])
+  })
+
+  test('rejects a channel command name or alias the channel parser cannot tokenize', () => {
+    expect(() =>
+      registerContributions(
+        makeOptions('p1', { channelCommands: { 'Desktop!': { description: 'x', run: () => {} } } }),
+      ),
+    ).toThrow(/channel command "Desktop!"/)
+    expect(() =>
+      registerContributions(
+        makeOptions('p1', { channelCommands: { desktop: { description: 'x', aliases: ['9pc'], run: () => {} } } }),
+      ),
+    ).toThrow(/channel command "9pc"/)
+  })
+
+  test('rejects a channel command with an empty description', () => {
+    expect(() =>
+      registerContributions(makeOptions('p1', { channelCommands: { desktop: { description: '', run: () => {} } } })),
+    ).toThrow(/empty description/)
+  })
 })
 
 describe('discardRegistrationsBy', () => {
@@ -270,6 +329,7 @@ describe('discardRegistrationsBy', () => {
         skills: { sk1: { description: '', content: '' } },
         skillsDirs: ['/p1/skills'],
         hooks: { 'session.start': () => {} },
+        channelCommands: { desktop: { description: 'x', run: () => {} } },
         onDispose: () => {},
         doctorChecks: {
           ping: {
@@ -307,6 +367,7 @@ describe('discardRegistrationsBy', () => {
     expect(registry.skills).toEqual([])
     expect(registry.skillsDirs).toEqual([])
     expect(registry.doctorChecks).toEqual([])
+    expect(registry.channelCommands).toEqual([])
     expect(registry.disposers).toEqual([])
     expect(hooks.count('session.start')).toBe(0)
     expect(hooks.count('session.end')).toBe(1)

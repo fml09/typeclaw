@@ -6,6 +6,7 @@ import type { CronJob, PromptJob } from '@/cron'
 import { FIRST_PARTY_GUARD_ACKNOWLEDGEMENT_DECLARATIONS } from './guard-acknowledgements'
 import type { HookBus } from './hooks'
 import type {
+  PluginChannelCommand,
   PluginCommand,
   PluginCronJob,
   PluginDoctorCheck,
@@ -36,6 +37,12 @@ export type RegisteredCommand = {
   command: PluginCommand
   logger: PluginLogger
 }
+export type RegisteredChannelCommand = {
+  pluginName: string
+  commandName: string
+  command: PluginChannelCommand
+  logger: PluginLogger
+}
 export type RegisteredPluginDisposer = {
   pluginName: string
   logger: PluginLogger
@@ -52,6 +59,7 @@ export type PluginRegistry = {
   skillsDirs: RegisteredSkillDir[]
   doctorChecks: RegisteredDoctorCheck[]
   commands: RegisteredCommand[]
+  channelCommands: RegisteredChannelCommand[]
   disposers: RegisteredPluginDisposer[]
   guardAcknowledgements: Map<string, Set<string>>
   guardAcknowledgementOwners: Map<string, string>
@@ -72,6 +80,12 @@ export type RegisterContributionsOptions = {
 }
 
 const COMMAND_NAME_REGEX = /^[a-z][a-z0-9-]*$/
+
+// Channel slash commands are tokenized by `parseCommand` in src/commands, which
+// accepts underscores too. Kept separate from COMMAND_NAME_REGEX so the CLI
+// subcommand surface and the channel surface can diverge without silently
+// widening each other.
+const CHANNEL_COMMAND_NAME_REGEX = /^[a-z][a-z0-9_-]*$/
 
 // CLI subcommands plugins MUST NOT shadow. Derived from BUILTIN_COMMAND_NAMES
 // so cli/index.ts and registry.ts cannot drift apart.
@@ -175,6 +189,18 @@ export function registerContributions(opts: RegisterContributionsOptions): void 
     }
   }
 
+  if (ex.channelCommands) {
+    for (const [commandName, command] of Object.entries(ex.channelCommands)) {
+      validateChannelCommandDeclaration(pluginName, commandName, command)
+      // Cross-plugin and built-in name collisions are NOT resolved here: the
+      // channel router owns the one list that knows the built-ins, and it logs
+      // and skips a colliding entry so a third-party plugin can never crash the
+      // container at boot. Registering all of them keeps that decision in one
+      // place instead of splitting it across two conflict checks.
+      registry.channelCommands.push({ pluginName, commandName, command, logger })
+    }
+  }
+
   if (ex.onDispose) {
     registry.disposers.push({ pluginName, logger, dispose: ex.onDispose })
   }
@@ -188,6 +214,7 @@ export function discardRegistrationsBy(pluginName: string, registry: PluginRegis
   registry.skillsDirs = registry.skillsDirs.filter((d) => d.pluginName !== pluginName)
   registry.doctorChecks = registry.doctorChecks.filter((d) => d.pluginName !== pluginName)
   registry.commands = registry.commands.filter((c) => c.pluginName !== pluginName)
+  registry.channelCommands = registry.channelCommands.filter((c) => c.pluginName !== pluginName)
   registry.disposers = registry.disposers.filter((d) => d.pluginName !== pluginName)
   for (const [key, owner] of registry.guardAcknowledgementOwners) {
     if (owner !== pluginName) continue
@@ -209,6 +236,7 @@ export function emptyRegistry(): PluginRegistry {
     skillsDirs: [],
     doctorChecks: [],
     commands: [],
+    channelCommands: [],
     disposers: [],
     guardAcknowledgements: new Map(),
     guardAcknowledgementOwners: new Map(),
@@ -297,6 +325,28 @@ export function validateCommandDeclaration(pluginName: string, commandName: stri
     )
   }
   assertValidCommandArgsSchema(pluginName, commandName, command)
+}
+
+// A channel command name must survive `parseCommand`'s tokenizer, otherwise the
+// command is registered but can never be typed. Throwing names the plugin and
+// the offending key; a user plugin's registration failure is already isolated
+// to that plugin, so this cannot brick the boot.
+export function validateChannelCommandDeclaration(
+  pluginName: string,
+  commandName: string,
+  command: PluginChannelCommand,
+): void {
+  assertNotEmpty('channel command name', commandName, pluginName)
+  for (const name of [commandName, ...(command.aliases ?? [])]) {
+    if (!CHANNEL_COMMAND_NAME_REGEX.test(name)) {
+      throw new Error(
+        `plugin ${pluginName}: channel command "${name}" does not match ${CHANNEL_COMMAND_NAME_REGEX.source} (lowercase letters, digits, dashes and underscores; must start with a letter)`,
+      )
+    }
+  }
+  if (command.description.length === 0) {
+    throw new Error(`plugin ${pluginName}: channel command "${commandName}" has an empty description`)
+  }
 }
 
 function toCronJob(globalId: string, spec: PluginCronJob): CronJob {

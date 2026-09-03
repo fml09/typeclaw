@@ -109,6 +109,24 @@ export default definePlugin({
     }
   })
 
+  // The Platform Extension path (loadPlatformExtension) loads exactly this kind
+  // of absolute out-of-tree path. It must not have widened the guard for the
+  // config-declared route, which is the one an agent can rewrite.
+  test('still refuses an ABSOLUTE path outside the agent directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'typeclaw-loader-'))
+    try {
+      const agentDir = join(root, 'agent')
+      await mkdir(agentDir)
+      const outside = join(root, 'outside.ts')
+      await writeFile(outside, `export default { plugin: () => ({}) }`)
+      const promise = loadPluginEntry(outside, agentDir)
+      await expect(promise).rejects.toThrow(/escapes agent directory/)
+      await expect(loadPluginEntry(outside, agentDir)).rejects.not.toBeInstanceOf(PluginNotFoundError)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('throws a fatal (non-not-found) error when default export is not a definePlugin result', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'typeclaw-loader-'))
     try {

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
 import type { PermissionService } from '@/permissions'
+import type { RegisteredChannelCommand } from '@/plugin'
 import type { GithubSecretsBlock } from '@/secrets'
 import { SecretsDiscordCredentialStore } from '@/secrets/discord-store'
 import { SecretsInstagramCredentialStore } from '@/secrets/instagram-store'
@@ -142,6 +143,11 @@ export type ChannelManagerOptions = {
   // background subagents a session was still awaiting. Same wiring shape as
   // newestRunningChildSubagentStartedAt; tests omit it.
   listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
+  // Plugin-contributed channel commands, forwarded to the router as
+  // `pluginCommands`. Production wiring (src/run/index.ts) passes the loaded
+  // plugin registry's collection; tests omit it. See
+  // CreateChannelRouterOptions.pluginCommands for the collision rule.
+  pluginCommands?: readonly RegisteredChannelCommand[]
   // Persistent messenger SDKs usually reconnect themselves, but a host sleep/offline
   // cycle can leave a socket half-dead forever. The manager watches live adapters
   // and restarts one that stays disconnected past this grace period. Test seams are
@@ -259,6 +265,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     ...(options.listRunningBackgroundSubagentNames
       ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
       : {}),
+    ...(options.pluginCommands ? { pluginCommands: options.pluginCommands } : {}),
   })
   const createDiscordBot = options.createDiscordAdapter ?? createDiscordBotAdapter
   const createDiscordUser = options.createDiscordUserAdapter ?? createDiscordAdapter
