@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs'
 import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { fingerprintKey, generateKey } from './encryption'
@@ -24,11 +25,20 @@ export type KeyStoreOptions = {
   keysDir: string
 }
 
+// Shared by hostd and the managed runtime credential renewer. Keeping the
+// location next to KeyStore avoids making container-stage code import
+// hostd/paths merely to find the durable encryption-key directory.
+export function defaultKeyStoreDir(env: NodeJS.ProcessEnv = process.env, homeDir = homedir()): string {
+  const root = env.TYPECLAW_HOME && env.TYPECLAW_HOME.length > 0 ? env.TYPECLAW_HOME : join(homeDir, '.typeclaw')
+  return join(root, 'keys')
+}
+
 // Per-agent symmetric key store. Each container/agent gets its own 32-byte
 // random key under <keysDir>/<containerName>.key (file mode 0600, dir 0700).
-// The host CLI generates and reads these; hostd reads them during scheduled
-// renewal. The container never receives the key — that's load-bearing for the
-// encryption-vs-collocation argument in encryption.ts's threat model comment.
+// In the host profile, the host CLI generates and reads these and hostd uses
+// them for renewal; the container never receives the key. In the managed
+// profile, the trusted runtime receives the platform-provided durable home and
+// uses the same key only for credential renewal fallback.
 export function createKeyStore(opts: KeyStoreOptions): KeyStore {
   const ensureDir = async (): Promise<void> => {
     await mkdir(opts.keysDir, { recursive: true })

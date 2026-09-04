@@ -1035,8 +1035,41 @@ async function startAgentRuntime(
   }
 
   registerBootCleanup(() => channelManager.stop())
+  const credentialRenewer = caps.credentialRenewer ?? null
+  let channelsStarted = false
+  if (credentialRenewer !== null) {
+    // Managed profiles have no hostd renewal cron. Run the first check before
+    // adapters start so a five-day-old token is replaced before Kakao clients
+    // capture it. Later rotations bounce only the named adapter in process.
+    registerBootCleanup(() => credentialRenewer.stop())
+    await credentialRenewer.start({
+      shouldRenew: (adapter) => {
+        const config = getConfig().channels[adapter]
+        return config !== undefined && config.enabled !== false
+      },
+      onCredentialRotated: async ({ adapter }) => {
+        // The boot-time renewal already landed on disk; channelManager.start()
+        // below will read it directly. Periodic rotations need an explicit
+        // credential-rotation reload because a live client captured the old
+        // token in its closure.
+        if (!channelsStarted) return
+        const current = getConfig().channels[adapter]
+        if (current === undefined || current.enabled === false) return
+        const diff = await channelManager.reload({ applyCredentialRotation: adapter })
+        const applied = diff.credentialApply
+        if (applied?.adapter !== adapter) {
+          throw new Error(`channel reload did not report applying the ${adapter} credential`)
+        }
+        if (applied.outcome === 'stop-failed') {
+          throw new Error(`${adapter} adapter could not be stopped to apply the renewed credential`)
+        }
+      },
+    })
+    assertBootActive()
+  }
   assertBootActive()
   await channelManager.start()
+  channelsStarted = true
   assertBootActive()
 
   if (restartReservation !== null) {
@@ -1225,6 +1258,7 @@ async function startAgentRuntime(
       prVerdictActivityBridge.stop()
       setReviewObserver(null)
       await tunnelManager.stop()
+      await credentialRenewer?.stop()
       await channelManager.stop()
       await mcpManager?.closeAll()
     } finally {

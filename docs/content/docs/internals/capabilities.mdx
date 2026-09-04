@@ -32,6 +32,7 @@ ControlPlaneCapabilities   (host-stage; src/capabilities/control-plane.ts)
 RuntimeCapabilities        (container-stage; src/capabilities/runtime.ts)
   secrets: RuntimeSecretsProvider | null
   restarter?: RuntimeRestarter | null
+  credentialRenewer?: RuntimeCredentialRenewer | null
 ```
 
 Each is built by a factory that composes implementations for a `DeploymentProfile`:
@@ -116,6 +117,7 @@ The runtime half now has a concrete managed composition. The published workload 
 - **`Controller`** — extracted with two implementations (`createLocalDockerController`, `createNoopController`) and `resolveController(profile)`.
 - **`RuntimeSecretsProvider`** — extracted with read + write-back, file-based, with `createHostdSecretsProvider` and `createFileSecretsProvider`.
 - **`RuntimeRestarter`** — extracted with hostd and managed-file implementations. TUI, channel, cron, command, and fatal-guard paths receive the same bound adapter.
+- **`RuntimeCredentialRenewer`** — managed runtimes run the KakaoTalk renewal loop in-process against the writable Agent Folder and reload only the rotated adapter; host deployments retain the hostd-owned loop.
 - **`RuntimeCapabilities` is threaded through the container root.** `startAgentRuntime` (`src/run/index.ts`) assembles it once and hands each capability to its consumers. Call sites no longer discover a platform transport.
 - **Managed health** — startup, degradation, readiness, and shutdown state is exposed through `/health/live` and `/health/ready`.
 
@@ -123,11 +125,11 @@ The runtime half now has a concrete managed composition. The published workload 
 
 A capability is extracted into an interface only when its trigger fires (see Rules of thumb: a second implementation exists, it crosses a stage boundary, or the root must hide platform selection). Extracting earlier — against a single caller — bakes hostd-isms into a "neutral" interface. Current triggers:
 
-| Capability                                  | State                                              | Trigger to extract                                              |
-| ------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------------- |
-| `PortForwarder` (portbroker)                | hostd-owned                                        | when a managed ingress replacement is built                     |
-| `CredentialRenewer` (KakaoTalk/Webex crons) | hostd-owned                                        | host-only today; extract only if a managed renewal home appears |
-| `Ingress` (tunnels)                         | container-side (cloudflared) + host-side Tailscale | when a platform ingress replaces it                             |
+| Capability                              | State                                              | Trigger to extract                            |
+| --------------------------------------- | -------------------------------------------------- | --------------------------------------------- |
+| `PortForwarder` (portbroker)            | hostd-owned                                        | when a managed ingress replacement is built   |
+| `CredentialRenewer` (Webex/Teams crons) | hostd-owned                                        | extract when a managed renewal home is needed |
+| `Ingress` (tunnels)                     | container-side (cloudflared) + host-side Tailscale | when a platform ingress replaces it           |
 
 `ControlPlaneCapabilities` is **not** threaded through a single host-stage root, and that is intentional: each CLI command (`typeclaw start`/`stop`/…) is its own process-level composition root, so a per-command `resolveController()` already _is_ the root. Collapsing the ~14 call sites into a shared bag would be ceremony, not consolidation — revisit only when multiple commands need shared profile/config resolution beyond a one-line factory.
 

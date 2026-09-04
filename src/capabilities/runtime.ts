@@ -1,13 +1,15 @@
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { type DeploymentProfile, resolveDeploymentProfile } from '@/container/controller'
 import { createFileMcpOAuthStore, type McpOAuthStore, resolveContainerMcpOAuthStore } from '@/mcp'
+import { createKeyStore, defaultKeyStoreDir } from '@/secrets/keys'
 import {
   createFileSecretsProvider,
   type RuntimeSecretsProvider,
   resolveRuntimeSecretsProvider,
 } from '@/secrets/secrets-provider'
 
+import { createManagedRuntimeCredentialRenewer, type RuntimeCredentialRenewer } from './runtime-credential-renewer'
 import {
   resolveHostdRuntimeRestarter,
   resolveManagedRuntimeRestarter,
@@ -28,6 +30,10 @@ export type RuntimeCapabilities = {
   deploymentProfile: DeploymentProfile
   secrets: RuntimeSecretsProvider | null
   mcpOAuthStore: McpOAuthStore
+  // Host deployments keep renewal in hostd. Managed deployments have no
+  // hostd, so their bound implementation runs inside the foreground runtime.
+  // Optional preserves source compatibility for injected pre-renewer bags.
+  credentialRenewer?: RuntimeCredentialRenewer | null
   // Optional preserves source compatibility for callers that constructed the
   // pre-managed `{ secrets }` bag themselves. The production composer always
   // sets this field to an adapter or null.
@@ -44,12 +50,20 @@ export function createRuntimeCapabilities(
   secretsPath: string = join(process.cwd(), 'secrets.json'),
 ): RuntimeCapabilities {
   const profile = resolveDeploymentProfile(env)
+  const agentDir = dirname(secretsPath)
   return {
     deploymentProfile: profile,
     secrets:
       profile === 'managed' ? createFileSecretsProvider(secretsPath) : resolveRuntimeSecretsProvider(env, secretsPath),
     mcpOAuthStore:
       profile === 'managed' ? createFileMcpOAuthStore(secretsPath) : resolveContainerMcpOAuthStore(env, secretsPath),
+    credentialRenewer:
+      profile === 'managed'
+        ? createManagedRuntimeCredentialRenewer({
+            agentDir,
+            keyStore: createKeyStore({ keysDir: defaultKeyStoreDir(env) }),
+          })
+        : null,
     restarter:
       profile === 'managed'
         ? (resolveManagedRuntimeRestarter(env) ??

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from '@/bundled-plugins/agent-browser'
+import { createRuntimeCapabilities, type RuntimeCredentialRenewerStartOptions } from '@/capabilities'
 import { createChannelRouter, type ChannelManager, type ChannelManagerOptions } from '@/channels'
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { CronFile, CronJob, LoadCronResult, Scheduler } from '@/cron'
@@ -116,6 +117,76 @@ describe('startAgent', () => {
     })
 
     expect(listenersAtChannelStart).toBe(before + 1)
+  })
+
+  test('renews managed credentials before channel startup, then applies later rotations in process', async () => {
+    await Bun.write(join(testCwd, 'typeclaw.json'), JSON.stringify({ channels: { kakaotalk: { enabled: true } } }))
+    reloadConfig(testCwd)
+    const order: string[] = []
+    const renewalHooks: { current: RuntimeCredentialRenewerStartOptions | null } = { current: null }
+    const credentialRenewer = {
+      async start(options: RuntimeCredentialRenewerStartOptions): Promise<void> {
+        renewalHooks.current = options
+        order.push('renew:start')
+        expect(options.shouldRenew('kakaotalk')).toBe(true)
+        await options.onCredentialRotated({
+          adapter: 'kakaotalk',
+          accountId: 'account-1',
+          method: 'oauth_refresh',
+        })
+        order.push('renew:initial-applied-on-disk')
+      },
+      async stop(): Promise<void> {
+        order.push('renew:stop')
+      },
+    }
+    const createChannelManagerFor = (): ChannelManager => ({
+      router: createChannelRouter({ agentDir: testCwd, configForAdapter: () => undefined }),
+      start: async () => void order.push('channels:start'),
+      stop: async () => void order.push('channels:stop'),
+      reload: async (options) => {
+        order.push(`channels:reload:${options?.applyCredentialRotation ?? 'none'}`)
+        return {
+          started: [],
+          stopped: [],
+          restarted: ['kakaotalk'],
+          restartRequired: [],
+          credentialApply: { adapter: 'kakaotalk', outcome: 'restarted' },
+        }
+      },
+      restartAdapter: async () => {},
+    })
+    const caps = {
+      ...createRuntimeCapabilities({}, join(testCwd, 'secrets.json')),
+      credentialRenewer,
+    }
+
+    try {
+      running = await startAgent({
+        port: 0,
+        attachTui: false,
+        cwd: testCwd,
+        loadCron: noCron,
+        caps,
+        createChannelManager: createChannelManagerFor,
+      })
+
+      expect(order.slice(0, 3)).toEqual(['renew:start', 'renew:initial-applied-on-disk', 'channels:start'])
+      const hooks = renewalHooks.current
+      if (hooks === null) throw new Error('credential renewer hooks were not installed')
+      await hooks.onCredentialRotated({
+        adapter: 'kakaotalk',
+        accountId: 'account-1',
+        method: 'oauth_refresh',
+      })
+      expect(order).toContain('channels:reload:kakaotalk')
+
+      await running.stop()
+      running = null
+      expect(order.indexOf('renew:stop')).toBeLessThan(order.indexOf('channels:stop'))
+    } finally {
+      __resetConfigForTesting()
+    }
   })
 
   test('prepares channel handoff without requiring a self-restart identity', async () => {

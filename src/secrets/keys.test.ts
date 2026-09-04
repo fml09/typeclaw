@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import { isWindows } from '@/shared'
 
-import { createKeyStore, KeyStoreError } from './keys'
+import { createKeyStore, defaultKeyStoreDir, KeyStoreError } from './keys'
 
 const onWindows = isWindows()
 
@@ -15,6 +15,11 @@ async function withTempKeysDir<T>(fn: (keysDir: string) => Promise<T>): Promise<
 }
 
 describe('keys store', () => {
+  test('defaultKeyStoreDir honors TYPECLAW_HOME and otherwise uses the runtime home', () => {
+    expect(defaultKeyStoreDir({ TYPECLAW_HOME: '/durable/typeclaw' }, '/home/runtime')).toBe('/durable/typeclaw/keys')
+    expect(defaultKeyStoreDir({}, '/home/runtime')).toBe('/home/runtime/.typeclaw/keys')
+  })
+
   test('ensure creates a 32-byte key on first call and returns it on subsequent calls', async () => {
     await withTempKeysDir(async (keysDir) => {
       const store = createKeyStore({ keysDir })

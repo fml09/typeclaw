@@ -23,12 +23,14 @@ describe('createRuntimeCapabilities', () => {
     })
     expect(caps.secrets).not.toBeNull()
     expect(caps.restarter).not.toBeNull()
+    expect(caps.credentialRenewer).toBeNull()
   })
 
   test('degrades secrets to null when the hostd triple is absent', () => {
     const caps = createRuntimeCapabilities({})
     expect(caps.secrets).toBeNull()
     expect(caps.restarter).toBeNull()
+    expect(caps.credentialRenewer).toBeNull()
   })
 
   test('degrades secrets to null when the triple is only partially set', () => {
@@ -53,6 +55,7 @@ describe('createRuntimeCapabilities', () => {
 
     expect(caps.secrets).not.toBeNull()
     expect(caps.restarter).not.toBeNull()
+    expect(caps.credentialRenewer).not.toBeNull()
     await caps.secrets?.writeBackChannelBlock({ discord: { currentAccount: 'd1', accounts: {} } })
     expect(caps.secrets?.readChannels()?.discord?.currentAccount).toBe('d1')
 

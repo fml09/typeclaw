@@ -64,6 +64,18 @@ Only one TypeClaw process may own an Agent Folder at a time. File locks and atom
 
 With `TYPECLAW_DEPLOYMENT_PROFILE=managed`, `createRuntimeCapabilities()` selects the existing file-backed secrets provider for `<agentDir>/secrets.json`. Reads, provider OAuth refresh, MCP OAuth, and channel credential write-back therefore share one locked, atomic file.
 
+The same managed capability bag also owns KakaoTalk credential renewal. The
+runtime checks hourly, performs a real OAuth refresh only after the existing
+five-day threshold, atomically writes the rotated access and refresh tokens,
+and reloads only the KakaoTalk adapter. The first check completes before
+channel adapters start, so a stale credential is replaced before a client
+captures it. Host deployments keep the existing hostd-owned renewal loop.
+
+Password-login fallback uses the durable key under
+`<TYPECLAW_HOME>/keys/<agent-folder-name>.key`. A deployment that restores
+`secrets.json` without the matching runtime-home key can still use a valid
+`refresh_token`, but it must reauthenticate if Kakao rejects that refresh token.
+
 A projected Kubernetes Secret mounted directly at `/agent/secrets.json` is not compatible: projected volumes are read-only, while refresh and channel flows legitimately rewrite the envelope. The platform must instead materialize an initial envelope onto the writable Agent Folder volume before TypeClaw starts, then hand it to UID/GID `65532:65532` with mode `0600`. The Agent Folder and every parent the runtime must traverse also need runtime-readable ownership and permissions. After handoff, the runtime owns that file. A reconciler must not continuously overwrite it with the original Secret and erase newer refresh tokens.
 
 The platform also owns any export policy from the writable file back to a cluster secret store. TypeClaw does not call the Kubernetes API and does not define conflict resolution between two external writers.

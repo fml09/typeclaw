@@ -3,11 +3,11 @@ import { chmod, mkdir } from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
 import { join, resolve } from 'node:path'
 
+import { defaultKeyStoreDir } from '@/secrets/keys'
 import { isWindows } from '@/shared'
 
 const SOCKET_FILE = 'hostd.sock'
 const REGISTRATIONS_DIR = 'registrations'
-const KEYS_DIR = 'keys'
 const AGENT_OPERATION_LOCKS_DIR = 'agent-locks'
 
 // Defense-in-depth: containerName arrives from RPC payloads (some of which
@@ -80,7 +80,7 @@ export function agentOperationLockPath(containerName: string): string {
 }
 
 export function keysDir(): string {
-  return join(homeRoot(), KEYS_DIR)
+  return defaultKeyStoreDir()
 }
 
 export function modelsDir(): string {
