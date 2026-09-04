@@ -86,7 +86,10 @@ The dashboard is for **live observation and handoff**, not file delivery. If
 you just want to show the user a single page or a captured state:
 
 - **A static image?** Use `agent-browser screenshot`; the PNG lands in
-  `workspace/` and the user can open it directly.
+  `workspace/` and the user can open it directly. Verify it yourself the same
+  way: pass the PNG's path to `look_at` and read the returned description —
+  screenshot + `look_at` beats inferring visual results from window titles or
+  terminal output.
 - **A page's text/structure?** Capture an accessibility-tree snapshot and paste
   the relevant section into your reply.
 

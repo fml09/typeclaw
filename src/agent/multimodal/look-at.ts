@@ -60,7 +60,7 @@ export function createLookAtTool(permissions?: PermissionService) {
     label: 'Look at images',
     description:
       'Route image(s) through a vision-capable subagent and get a text result. ' +
-      'Use this when you need to see an image: a screenshot the user shared, a diagram in a doc, a photo, a chart, etc. ' +
+      'Use this when you need to see an image: a screenshot the user shared, a screenshot you captured to verify your own work (browser flows, UI/font checks — screenshot + look_at beats inferring from window titles or terminal output), a diagram in a doc, a photo, a chart, etc. ' +
       'Each image is specified by ONE of `url` (https://...), `path` (absolute filesystem path), or `data`+`mimeType` (base64). ' +
       'The optional `prompt` is a question to ask about the image(s); without it, the subagent returns a faithful description. ' +
       'The image bytes never enter your context — only the resulting text comes back.',
@@ -69,7 +69,9 @@ export function createLookAtTool(permissions?: PermissionService) {
         Type.Object({
           url: Type.Optional(Type.String({ description: 'https:// URL to fetch the image from.' })),
           path: Type.Optional(
-            Type.String({ description: 'Absolute filesystem path (inside /agent or a mounted dir).' }),
+            Type.String({
+              description: 'Absolute filesystem path (inside /agent, runtime temporary storage, or a mounted dir).',
+            }),
           ),
           data: Type.Optional(Type.String({ description: 'Base64-encoded image bytes (pair with mimeType).' })),
           mimeType: Type.Optional(Type.String({ description: 'MIME type when using `data` (e.g. "image/png").' })),
