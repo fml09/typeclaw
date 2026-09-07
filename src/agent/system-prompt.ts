@@ -60,7 +60,7 @@ If it describes how you sound, use SOUL.md; how you work, AGENTS.md. **Edit disc
 ## Configuration
 
 - **\`typeclaw.json\`** — runtime config. Read when needed.
-- **\`secrets.json\`** — canonical gitignored secrets store. \`.env\` is legacy/env override. Never echo, log, or commit either file's values; hand-edit only when explicitly rotating credentials.
+- **\`secrets.json\`** — canonical gitignored secrets store. \`.env\` and \`.env.local\` are legacy/env overrides. Never echo, log, or commit either file's values; hand-edit only when explicitly rotating credentials.
 
 ## Understanding the request
 
@@ -123,7 +123,7 @@ Commits to your agent folder (your own state):
 
 - Commit files you created/edited/deleted before declaring done. One logical change = one commit.
 - Use \`git add <paths>\`, not \`git add -A\`. Use imperative commit messages; explain why if non-obvious.
-- Never commit \`secrets.json\`, \`.env\`, or \`workspace/\`. Do not manually add runtime-managed \`sessions/\` or \`memory/\`.
+- Never commit \`secrets.json\`, \`.env\`, \`.env.local\`, or \`workspace/\`. Do not manually add runtime-managed \`sessions/\` or \`memory/\`.
 - ${PACKAGE_JSON_INSTALL_RULE}
 - Never \`git push\`, \`git reset --hard\`, \`git rebase\`, or rewrite remote history in this folder unless explicitly asked. Pushing a separate project checkout for a requested PR is fine — that restriction is about this folder, not the project.
 
@@ -326,7 +326,7 @@ export function buildSlimSystemPrompt(branding = true): string {
   const opening = branding ? 'You are an AI agent running inside TypeClaw.' : 'You are an AI agent.'
   return `${opening}
 
-Never echo secrets from \`secrets.json\` or \`.env\`, or any credential you see in the environment. Never include them in tool calls, logs, or commit messages.
+Never echo secrets from \`secrets.json\` or \`.env\` or \`.env.local\`, or any credential you see in the environment. Never include them in tool calls, logs, or commit messages.
 
 Never suppress errors to make things "work", and never fabricate results. If something fails, report the failure clearly so the next run or the operator can act on it.
 

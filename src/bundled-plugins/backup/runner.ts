@@ -3,6 +3,7 @@ import { join } from 'node:path'
 
 import { hooklessGitArgs } from '@/git/hookless'
 import { type AgentGit, resolveAgentGit } from '@/git/resolve-agent-git'
+import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
 
 export const COMMIT_TIMEOUT_MS = 30_000
 export const NETWORK_TIMEOUT_MS = 60_000
@@ -34,6 +35,8 @@ const BOUNDED_PACK_FLAGS = [
 
 const RUNTIME_OWNED_PREFIXES = ['memory/'] as const
 const FORCE_ADD_PREFIXES = ['sessions/', 'todo/'] as const
+const PROTECTED_AGENT_FILE_NAMES = new Set<string>(CANONICAL_AGENT_SECRET_FILES)
+const UNMERGED_GIT_STATUSES = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'])
 
 const NONINTERACTIVE_ENV = {
   GIT_TERMINAL_PROMPT: '0',
@@ -100,7 +103,18 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
     timeoutMs: COMMIT_TIMEOUT_MS,
   })
   if (status.exitCode !== 0) return { ok: false, kind: 'aborted', reason: `git status failed: ${shortErr(status)}` }
-  const snapshot = selectStagingSnapshot(parsePorcelain(status.stdout), cwd)
+  const entries = parsePorcelain(status.stdout)
+  const protectedPaths = selectStagedProtectedPaths(entries)
+  if (protectedPaths.length > 0) {
+    if (entries.some((entry) => UNMERGED_GIT_STATUSES.has(entry.status) && entry.paths.some(isProtectedAgentPath))) {
+      return { ok: false, kind: 'aborted', reason: 'protected credential path has an unresolved Git conflict' }
+    }
+    const unstaged = await unstageProtectedPaths(cwd, deps, repo, protectedPaths)
+    if (!unstaged) {
+      return { ok: false, kind: 'aborted', reason: 'could not remove protected credential paths from the Git index' }
+    }
+  }
+  const snapshot = selectStagingSnapshot(entries, cwd)
   if (snapshot.paths.length === 0 && snapshot.forcePaths.length === 0) return { ok: true, kind: 'clean' }
 
   if (snapshot.paths.length > 0) {
@@ -165,6 +179,17 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
     }
   }
 
+  // `git commit -m` includes every staged index entry, not just the paths this
+  // runner selected. Re-check immediately before committing so a protected
+  // credential file staged by another local actor during message selection
+  // cannot ride along with an otherwise safe backup.
+  const stagedProtectedPaths = await findStagedProtectedPaths(cwd, deps, repo)
+  if (stagedProtectedPaths === null) {
+    return { ok: false, kind: 'aborted', reason: 'could not inspect protected credential paths before commit' }
+  }
+  if (stagedProtectedPaths.length > 0 && !(await unstageProtectedPaths(cwd, deps, repo, stagedProtectedPaths))) {
+    return { ok: false, kind: 'aborted', reason: 'could not remove protected credential paths from the Git index' }
+  }
   const safeMessage = sanitizeCommitMessage(message)
   const commit = await deps.gitSpawn([...repo.gitArgs, 'commit', '-m', safeMessage], {
     cwd,
@@ -419,7 +444,7 @@ function selectStagingSnapshot(entries: readonly PorcelainEntry[], cwd: string):
   const untrackedPaths = new Set<string>()
   for (const entry of entries) {
     for (const path of entry.paths) {
-      if (isAgentOwned(path)) continue
+      if (isProtectedAgentPath(path) || isAgentOwned(path)) continue
       const forceAdded = FORCE_ADD_PREFIXES.some((prefix) => path.startsWith(prefix))
       if (entry.kind === 'untracked') {
         if (forceAdded || !hasDirectoryEntry(join(cwd, path))) continue
@@ -466,10 +491,50 @@ function selectForcePaths(
   return uniquePaths(
     entries.flatMap((entry) =>
       entry.paths.filter(
-        (path) => prefixes.some((prefix) => path.startsWith(prefix)) && hasDirectoryEntry(join(cwd, path)),
+        (path) =>
+          !isProtectedAgentPath(path) &&
+          prefixes.some((prefix) => path.startsWith(prefix)) &&
+          hasDirectoryEntry(join(cwd, path)),
       ),
     ),
   )
+}
+
+function selectStagedProtectedPaths(entries: readonly PorcelainEntry[]): string[] {
+  return uniquePaths(
+    entries.flatMap((entry) => {
+      if (entry.kind !== 'tracked' || entry.status[0] === ' ') return []
+      return entry.paths.filter(isProtectedAgentPath)
+    }),
+  )
+}
+
+async function unstageProtectedPaths(
+  cwd: string,
+  deps: BackupRunnerDeps,
+  repo: AgentGit,
+  paths: readonly string[],
+): Promise<boolean> {
+  const reset = await deps.gitSpawn([...repo.gitArgs, 'reset', '--', ...paths], {
+    cwd,
+    timeoutMs: COMMIT_TIMEOUT_MS,
+  })
+  return reset.exitCode === 0
+}
+
+async function findStagedProtectedPaths(cwd: string, deps: BackupRunnerDeps, repo: AgentGit): Promise<string[] | null> {
+  const staged = await deps.gitSpawn([...repo.gitArgs, 'diff', '--cached', '--name-only', '-z'], {
+    cwd,
+    timeoutMs: COMMIT_TIMEOUT_MS,
+  })
+  if (staged.exitCode !== 0) return null
+  return uniquePaths(staged.stdout.split('\0').filter((path) => path.length > 0 && isProtectedAgentPath(path)))
+}
+
+function isProtectedAgentPath(path: string): boolean {
+  const normalized = path.replaceAll('\\', '/')
+  const basename = normalized.slice(normalized.lastIndexOf('/') + 1)
+  return PROTECTED_AGENT_FILE_NAMES.has(basename)
 }
 
 function hasDirectoryEntry(path: string): boolean {

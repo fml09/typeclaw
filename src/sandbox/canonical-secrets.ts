@@ -33,7 +33,7 @@ export const OPERATOR_CLI_CREDENTIAL_DIRS = ['workspace/.config/gws', AGENT_MESS
 // use this; consumers that must respect the gate read the two lists above.
 export const CANONICAL_AGENT_SECRET_DIRS = [...OPERATOR_CLI_CREDENTIAL_DIRS, ...RUNTIME_OWNED_SECRET_DIRS] as const
 
-export const CANONICAL_AGENT_SECRET_FILES = ['.env', 'secrets.json', 'auth.json'] as const
+export const CANONICAL_AGENT_SECRET_FILES = ['.env', '.env.local', 'secrets.json', 'auth.json'] as const
 
 // Trusted runtime processes use this ephemeral container HOME. bwrap builds an
 // empty root and never binds /home, so model bash cannot see it; non-bash tools

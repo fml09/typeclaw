@@ -545,6 +545,7 @@ describe('private-surface-read guard — traversal + scope', () => {
 
   test('covers the secret files across ALL tools (one deny-list, not delegated to secretExfilRead)', () => {
     expect(check('read', { path: '/agent/.env' })?.block).toBe(true)
+    expect(check('read', { path: '/agent/.env.local' })?.block).toBe(true)
     expect(check('read', { path: '.env' })?.block).toBe(true)
     expect(check('edit', { path: '/agent/.env' })?.block).toBe(true)
     expect(check('write', { path: 'secrets.json' })?.block).toBe(true)
@@ -1240,7 +1241,7 @@ describe('private-surface-read guard — honors a tool author fileOperands.nonFi
   })
 
   test('blocks canonical secret files and directories despite declared nonFile operands', () => {
-    for (const value of ['secrets.json', '.env', '.typeclaw/home/credentials.json']) {
+    for (const value of ['secrets.json', '.env', '.env.local', '.typeclaw/home/credentials.json']) {
       expect(
         checkPrivateSurfaceReadGuard({
           tool: 'unknown_plugin_reader',
