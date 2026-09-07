@@ -440,9 +440,9 @@ export const KNOWN_PROVIDERS = {
   // ("insufficient balance"). Distinct env var (`ZAI_CODING_API_KEY`) so a
   // user can hold both a paygo and a Coding Plan key on different accounts.
   //
-  // Model lineup is exactly the five models the Coding Plan docs name as
-  // "All plans support" plus GLM-5 (Pro/Max only per docs). Listing other
-  // GLM models here would silently bill against the wrong surface.
+  // The registry includes the Coding Plan's current GLM-5.3 model plus the
+  // older models that remain valid aliases/routes. GLM-5 access is Pro/Max
+  // only per docs.z.ai; GLM-5.3 is available on all Coding Plan tiers.
   'zai-coding': {
     id: 'zai-coding',
     name: 'Z.AI (GLM Coding Plan)',
@@ -518,6 +518,39 @@ export const KNOWN_PROVIDERS = {
         cost: { input: 1.4, output: 4.4, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 128000,
+      },
+      // GLM-5.3 is the current Coding Plan flagship: text-only, 1M context,
+      // 128K maximum output, and low/high/max reasoning effort. The
+      // subscription is credit-based rather than token-priced in USD, so zero
+      // costs keep `typeclaw usage` from presenting credit multipliers as dollars.
+      // pi-ai's URL detection predates this API contract; these compat flags
+      // make it emit `max_tokens` and `reasoning_effort` for the Coding Plan.
+      'glm-5.3': {
+        id: 'glm-5.3',
+        name: 'GLM-5.3',
+        api: 'openai-completions',
+        provider: 'zai-coding',
+        baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+        reasoning: true,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: 'low',
+          medium: null,
+          high: 'high',
+          xhigh: 'max',
+        },
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_000_000,
+        maxTokens: 131_072,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: true,
+          maxTokensField: 'max_tokens',
+          thinkingFormat: 'openai',
+        },
       },
     },
   },
