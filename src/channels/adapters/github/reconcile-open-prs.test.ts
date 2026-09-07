@@ -197,6 +197,24 @@ describe('reconcileOpenPrs', () => {
     )
     expect(routed.map((m) => m.chat)).toEqual(['pr:7'])
   })
+  test('App decoy override matches the configured reviewer login', async () => {
+    const routed: InboundMessage[] = []
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        reviewOn: 'review_requested',
+        selfLogin: 'coltrane-code-reviewer[bot]',
+        authType: 'app',
+        reviewerLogin: 'coltrane-review',
+        fetchImpl: fakeGithub([
+          { number: 7, id: 700, requestedReviewers: ['coltrane-review'] },
+          { number: 8, id: 800, authorLogin: 'coltrane-review', requestedReviewers: ['coltrane-review'] },
+          { number: 9, id: 900, requestedReviewers: ['someone-else'] },
+        ]),
+      }),
+    )
+    expect(routed.map((m) => m.chat)).toEqual(['pr:7'])
+  })
 
   test('a null selfLogin replays nothing (identity not yet resolved)', async () => {
     const routed: InboundMessage[] = []

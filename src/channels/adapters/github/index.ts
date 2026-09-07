@@ -221,6 +221,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     authType: () => options.secrets.auth.type,
     allowApprove: () => options.configRef().review.approve,
     reviewOn: () => options.configRef().review.on,
+    reviewerLogin: () => options.configRef().review.reviewerLogin,
     isBotInTeam,
     authToken,
     fetchImpl,
@@ -394,6 +395,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
           route: routeInbound,
           logger,
           isBotInTeam,
+          reviewerLogin: options.configRef().review.reviewerLogin,
           fetchImpl,
           cooldownStore: store,
         }).catch((err: unknown) => {
