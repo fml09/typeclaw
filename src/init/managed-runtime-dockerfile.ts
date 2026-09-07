@@ -40,6 +40,10 @@ export function buildManagedRuntimeDockerfile(options: BuildManagedRuntimeDocker
 
 FROM ${baseImageRepository}:${options.baseImageVersion}
 
+# BuildKit provides TARGETARCH only when the Dockerfile declares it; the
+# cloudflared layer picks its per-arch download from this.
+ARG TARGETARCH
+
 WORKDIR /
 COPY typeclaw.tgz /tmp/typeclaw.tgz
 COPY typeclaw-gws-multi-account.tgz /tmp/typeclaw-gws-multi-account.tgz
