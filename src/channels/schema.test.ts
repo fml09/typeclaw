@@ -190,6 +190,20 @@ describe('channelsSchema', () => {
     const parsed = channelsSchema.parse({ github: { repos: ['owner/repo'], review: { approve: false } } })
     expect(parsed.github?.review.approve).toBe(false)
   })
+  test('accepts a custom App decoy reviewer login', () => {
+    const parsed = channelsSchema.parse({
+      github: { repos: ['owner/repo'], review: { reviewerLogin: 'coltrane-review' } },
+    })
+    expect(parsed.github?.review.reviewerLogin).toBe('coltrane-review')
+  })
+
+  test('rejects an invalid App decoy reviewer login', () => {
+    expect(() =>
+      channelsSchema.parse({
+        github: { repos: ['owner/repo'], review: { reviewerLogin: 'not a login' } },
+      } as unknown as Parameters<typeof channelsSchema.parse>[0]),
+    ).toThrow()
+  })
 
   test('github review defaults to { on: review_requested, approve: true } when omitted', () => {
     const parsed = channelsSchema.parse({ github: { repos: ['owner/repo'] } })

@@ -364,6 +364,12 @@ const githubReviewSchema = z
   .object({
     on: z.enum(GITHUB_REVIEW_ON_VALUES).default(DEFAULT_GITHUB_REVIEW_ON),
     approve: z.boolean().default(true),
+    // App-auth only: override the derived App-slug decoy when the real
+    // reviewer account uses a different GitHub login. PAT auth ignores it.
+    reviewerLogin: z
+      .string()
+      .regex(/^[A-Za-z0-9-]+$/)
+      .optional(),
   })
   .default({ on: DEFAULT_GITHUB_REVIEW_ON, approve: true })
 

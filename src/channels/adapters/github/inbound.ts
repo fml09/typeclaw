@@ -23,6 +23,9 @@ export type GithubWebhookHandlerOptions = {
   allowlist: () => readonly string[]
   selfId: () => string | null
   selfLogin: () => string | null
+  // App-auth only: explicit decoy reviewer login; when omitted, the adapter
+  // derives the bare App slug from selfLogin. PAT auth ignores this override.
+  reviewerLogin?: () => string | undefined
   // Defaults to 'pat' when omitted. In 'app' mode classifyReviewRequest also
   // matches the App's decoy reviewer login; see resolveDecoyReviewerLogin.
   authType?: () => 'pat' | 'app'
@@ -188,6 +191,7 @@ export async function processVerifiedGithubDelivery(
   const classified = classifyGithubInbound(event, payload, selfLogin, {
     teamIsBotMember,
     authType: options.authType?.() ?? 'pat',
+    reviewerLogin: options.reviewerLogin?.(),
     reviewOn: options.reviewOn?.() ?? 'review_requested',
     ...(reviewCommentParent !== null ? { reviewCommentParent } : {}),
   })
@@ -259,7 +263,7 @@ function maybeScheduleDecoyReviewerDrop(input: {
   const authToken = options.authToken
   if (authToken === undefined) return
   if ((options.authType?.() ?? 'pat') !== 'app') return
-  const decoyLogin = resolveDecoyReviewerLogin(selfLogin, 'app')
+  const decoyLogin = resolveDecoyReviewerLogin(selfLogin, 'app', options.reviewerLogin?.())
   if (decoyLogin === null) return
 
   const repository = readRepository(payload)
@@ -686,13 +690,14 @@ export function classifyGithubInbound(
   options?: {
     teamIsBotMember?: boolean
     authType?: 'pat' | 'app'
+    reviewerLogin?: string
     reviewOn?: GithubReviewOn
     reviewCommentParent?: ReviewCommentParent
   },
 ): InboundMessage | null {
   const repository = readRepository(payload)
   if (repository === null) return null
-  const mention = resolveBotMentionLogins(selfLogin, options?.authType ?? 'pat')
+  const mention = resolveBotMentionLogins(selfLogin, options?.authType ?? 'pat', options?.reviewerLogin)
   const base = {
     adapter: 'github' as const,
     workspace: `${repository.owner}/${repository.name}`,
@@ -739,7 +744,7 @@ export function classifyGithubInbound(
         : undefined
     const directedAtBot =
       parentId === null &&
-      isSelfPr(readUser(pr.user), selfLogin, options?.authType ?? 'pat') &&
+      isSelfPr(readUser(pr.user), selfLogin, options?.authType ?? 'pat', options?.reviewerLogin) &&
       commenter !== null &&
       !isSelfAuthor(commenter, null, selfLogin)
     return buildInbound(
@@ -825,6 +830,7 @@ export function classifyGithubInbound(
         base,
         selfLogin,
         authType: options?.authType ?? 'pat',
+        reviewerLogin: options?.reviewerLogin,
         teamIsBotMember: options?.teamIsBotMember,
       })
     }
@@ -848,6 +854,7 @@ export function classifyGithubInbound(
         base,
         selfLogin,
         authType: options?.authType ?? 'pat',
+        reviewerLogin: options?.reviewerLogin,
       })
       if (trigger !== null) return trigger
     }
@@ -942,6 +949,7 @@ type ReviewRequestInput = {
   base: Pick<InboundMessage, 'adapter' | 'workspace' | 'isDm' | 'mentionsOthers' | 'replyToOtherMessageId'>
   selfLogin: string | null
   authType: 'pat' | 'app'
+  reviewerLogin?: string
   teamIsBotMember: boolean | undefined
 }
 
@@ -962,18 +970,20 @@ type BuildInboundOptions = {
 
 // A GitHub App can never be a `requested_reviewer` — that field only holds
 // real user accounts, and the App actor (`slug[bot]`) is not one. The
-// supported workaround is a decoy user account named after the App that an
-// operator requests instead (see docs/content/docs/internals/github-decoy-reviewer.mdx).
-// Its login is, by convention, the App slug — i.e. `selfLogin` with the
-// `[bot]` suffix removed (`my-app[bot]` → `my-app`). This is the single seam
-// where that login is resolved: when the decoy account's real login diverges
-// from the slug, a future config field replaces this derivation without
-// touching the matcher. PAT auth has no decoy (the bot IS a real user that can
-// be requested directly), so it returns null.
+// supported workaround is a real decoy user account that an operator
+// requests instead (see docs/content/docs/internals/github-decoy-reviewer.mdx).
+// By default its login is the App slug (`my-app[bot]` → `my-app`). Deployments
+// whose decoy account uses another login set `review.reviewerLogin`; PAT auth
+// has no decoy because the bot IS a real user that can be requested directly.
 const BOT_LOGIN_SUFFIX = '[bot]'
 
-function resolveDecoyReviewerLogin(selfLogin: string, authType: 'pat' | 'app'): string | null {
+function resolveDecoyReviewerLogin(
+  selfLogin: string,
+  authType: 'pat' | 'app',
+  configuredReviewerLogin?: string,
+): string | null {
   if (authType !== 'app') return null
+  if (configuredReviewerLogin !== undefined && configuredReviewerLogin !== '') return configuredReviewerLogin
   if (!selfLogin.endsWith(BOT_LOGIN_SUFFIX)) return null
   const slug = selfLogin.slice(0, -BOT_LOGIN_SUFFIX.length)
   return slug !== '' ? slug : null
@@ -990,9 +1000,13 @@ function resolveDecoyReviewerLogin(selfLogin: string, authType: 'pat' | 'app'): 
 // and only `selfLogin` applies.
 export type BotMentionLogins = readonly string[]
 
-export function resolveBotMentionLogins(selfLogin: string | null, authType: 'pat' | 'app'): BotMentionLogins {
+export function resolveBotMentionLogins(
+  selfLogin: string | null,
+  authType: 'pat' | 'app',
+  configuredReviewerLogin?: string,
+): BotMentionLogins {
   if (selfLogin === null) return []
-  const decoyLogin = resolveDecoyReviewerLogin(selfLogin, authType)
+  const decoyLogin = resolveDecoyReviewerLogin(selfLogin, authType, configuredReviewerLogin)
   return decoyLogin !== null ? [selfLogin, decoyLogin] : [selfLogin]
 }
 
@@ -1022,9 +1036,9 @@ function mentionsLogin(text: string, login: string): boolean {
 }
 
 function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null {
-  const { action, payload, pr, number, base, selfLogin, authType, teamIsBotMember } = input
+  const { action, payload, pr, number, base, selfLogin, authType, reviewerLogin, teamIsBotMember } = input
   if (selfLogin === null) return null
-  const decoyLogin = resolveDecoyReviewerLogin(selfLogin, authType)
+  const decoyLogin = resolveDecoyReviewerLogin(selfLogin, authType, reviewerLogin)
   const sender = readUser(payload.sender)
   if (sender === null) return null
   // Self-loop guard: if the bot (or its decoy) requested/un-requested the
@@ -1089,17 +1103,18 @@ type OpenedReviewTriggerInput = {
   base: Pick<InboundMessage, 'adapter' | 'workspace' | 'isDm' | 'mentionsOthers' | 'replyToOtherMessageId'>
   selfLogin: string | null
   authType: 'pat' | 'app'
+  reviewerLogin?: string
 }
 
 function classifyOpenedReviewTrigger(input: OpenedReviewTriggerInput): InboundMessage | null {
-  const { payload, pr, number, base, selfLogin, authType } = input
+  const { payload, pr, number, base, selfLogin, authType, reviewerLogin } = input
   if (selfLogin === null) return null
   const sender = readUser(payload.sender) ?? readUser(pr.user)
   if (sender === null) return null
   // Defensive self-loop guard mirroring classifyReviewRequest: the handler-level
   // self-author drop already discards bot-opened PRs, but the decoy account is a
   // distinct login, so a decoy-opened PR would otherwise wake a self-review.
-  const decoyLogin = resolveDecoyReviewerLogin(selfLogin, authType)
+  const decoyLogin = resolveDecoyReviewerLogin(selfLogin, authType, reviewerLogin)
   if (sender.login === selfLogin || (decoyLogin !== null && sender.login === decoyLogin)) return null
 
   const title = readString(pr, 'title') ?? `#${number}`
@@ -1431,9 +1446,14 @@ function isBotUser(user: GithubUser): boolean {
 // auth the bot opens PRs as the decoy account (login = slug, e.g. `typeey`),
 // not the actor login `typeey[bot]`. So this matches selfLogin AND the decoy
 // slug — mirroring resolveBotMentionLogins.
-function isSelfPr(prUser: GithubUser | null, selfLogin: string | null, authType: 'pat' | 'app'): boolean {
+function isSelfPr(
+  prUser: GithubUser | null,
+  selfLogin: string | null,
+  authType: 'pat' | 'app',
+  configuredReviewerLogin?: string,
+): boolean {
   if (prUser === null || selfLogin === null) return false
-  return resolveBotMentionLogins(selfLogin, authType).includes(prUser.login)
+  return resolveBotMentionLogins(selfLogin, authType, configuredReviewerLogin).includes(prUser.login)
 }
 
 type GithubUser = { login: string; id: number; type?: string }

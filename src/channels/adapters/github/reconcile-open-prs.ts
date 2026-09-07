@@ -25,6 +25,9 @@ export type ReconcileOpenPrsOptions = {
   reviewOn: GithubReviewOn
   selfLogin: string | null
   authType: 'pat' | 'app'
+  // App-auth only: explicit decoy reviewer login. When omitted, the adapter
+  // derives the bare App slug from selfLogin; PAT auth ignores this override.
+  reviewerLogin?: string
   token: (context?: GithubAuthContext) => Promise<string>
   route: (message: InboundMessage) => void
   logger: { info: (m: string) => void; warn: (m: string) => void }
@@ -52,7 +55,7 @@ export async function reconcileOpenPrs(options: ReconcileOpenPrsOptions): Promis
   if (options.selfLogin === null) return []
   const fetchImpl = options.fetchImpl ?? fetch
   const selfLogin = options.selfLogin
-  const decoyLogin = resolveDecoyLogin(selfLogin, options.authType)
+  const decoyLogin = resolveDecoyLogin(selfLogin, options.authType, options.reviewerLogin)
 
   const outcomes: ReconcileOutcome[] = []
   for (const repo of new Set(options.repos)) {
@@ -281,15 +284,21 @@ function normalizeBotLogin(login: string): string {
   return login.endsWith(BOT_LOGIN_SUFFIX) ? login.slice(0, -BOT_LOGIN_SUFFIX.length) : login
 }
 
-// A GitHub App actor's REST login is `slug[bot]`; the decoy account an operator
-// requests for App-auth reviews is the bare slug. PAT auth has no decoy.
-function resolveDecoyLogin(selfLogin: string, authType: 'pat' | 'app'): string | null {
+// A GitHub App actor's REST login is `slug[bot]`; the App actor cannot be
+// requested directly, so App-auth reviews use a real decoy user. By default
+// that user's login is the bare App slug; `reviewerLogin` overrides it when
+// the real account uses another login. PAT auth has no decoy.
+function resolveDecoyLogin(
+  selfLogin: string,
+  authType: 'pat' | 'app',
+  configuredReviewerLogin?: string,
+): string | null {
   if (authType !== 'app') return null
+  if (configuredReviewerLogin !== undefined && configuredReviewerLogin !== '') return configuredReviewerLogin
   if (!selfLogin.endsWith(BOT_LOGIN_SUFFIX)) return null
   const slug = selfLogin.slice(0, -BOT_LOGIN_SUFFIX.length)
   return slug !== '' ? slug : null
 }
-
 function nextLink(linkHeader: string | null): string | null {
   if (linkHeader === null) return null
   for (const part of linkHeader.split(',')) {

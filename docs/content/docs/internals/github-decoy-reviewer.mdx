@@ -36,27 +36,28 @@ needs no decoy: it is already a real user you can request by its exact login.
 
 `classifyReviewRequest` (`src/channels/adapters/github/inbound.ts`) compares the
 incoming `requested_reviewer.login` against the bot's identity. Under App auth
-`selfLogin` is the bot actor `slug[bot]`, which can never match a real reviewer
-login — so the classifier also derives a **decoy login** and matches against
-it:
+`selfLogin` is the bot actor `slug[bot]`, which can never be the real reviewer
+login — so the classifier uses either the configured reviewer login or the
+derived App slug:
 
 ```ts
-function resolveDecoyReviewerLogin(selfLogin, authType) {
+function resolveDecoyReviewerLogin(selfLogin, authType, configuredReviewerLogin) {
   if (authType !== 'app') return null // PAT: the bot IS a real user
+  if (configuredReviewerLogin) return configuredReviewerLogin
   if (!selfLogin.endsWith('[bot]')) return null
   return selfLogin.slice(0, -'[bot]'.length) || null // my-app[bot] → my-app
 }
 ```
 
 A `review_requested` engages the agent when `requested_reviewer.login` equals
-**either** `selfLogin` (the exact `slug[bot]`, kept for completeness) **or** the
-derived decoy login. The same decoy login extends the self-loop guard, so a
-review the decoy account requested of itself is dropped rather than waking a
-fresh session.
+**either** `selfLogin (the exact `slug[bot]`, kept for completeness) or the
+configured/derived decoy login. The same decoy login extends the self-loop
+guard, so a review the decoy account requests of itself is dropped rather than
+waking a fresh session.
 
 Under **PAT auth** there is no decoy: the bot is a real user that can be
 requested directly by its exact login, so `resolveDecoyReviewerLogin` returns
-`null` and matching stays strict (`requested_reviewer.login === selfLogin`).
+`null` and `review.reviewerLogin` is ignored.
 
 ## The only review trigger
 
@@ -76,15 +77,15 @@ perpetual "review requested" — as if the review never happened. The adapter
 clears this deterministically rather than relying on the agent to remember a
 cleanup step.
 
-When the bot's own review lands, GitHub emits a `pull_request_review.submitted`
-webhook authored by the bot. The handler already drops this as self-authored;
-at that same point — App auth only, with a derivable decoy login — it schedules
-a background `DELETE /repos/{owner}/{repo}/pulls/{n}/requested_reviewers` for the
-decoy login (`maybeScheduleDecoyReviewerDrop` →
-`removeRequestedReviewer`, `src/channels/adapters/github/`). The DELETE runs off
-the webhook-ACK path so the 200 stays fast, and is best-effort: a `404`/`422`
-(decoy never on the list, already removed) is a benign no-op; only auth/network
-failures warn.
+When the bot's own review lands, GitHub emits a
+`pull_request_review.submitted` webhook authored by the bot. The handler already
+drops this as self-authored; at that same point — App auth only, with a
+derivable or configured decoy login — it schedules a background
+`DELETE /repos/{owner}/{repo}/pulls/{n}/requested_reviewers` for the decoy login
+(`maybeScheduleDecoyReviewerDrop` → `removeRequestedReviewer`, in
+`src/channels/adapters/github/`). The DELETE runs off the webhook-ACK path so
+the 200 stays fast, and is best-effort: a `404`/`422` (decoy never on the list,
+already removed) is a benign no-op; only auth/network failures warn.
 
 Because the `DELETE` is authenticated as the App, the `review_request_removed`
 webhook it triggers carries the bot actor (`slug[bot]`) as `sender`, which the
@@ -92,13 +93,14 @@ self-loop guard drops — the cleanup never wakes a fresh session. Under PAT aut
 or when the trigger was a plain `@`-mention or a team request (no decoy user was
 ever placed), there is nothing to remove and the path is skipped.
 
-## Why slug-derivation, not config (for now)
+## Decoy-login override
 
-The slug-strip is a **heuristic default**: it assumes the decoy account's login
-equals the App slug, which holds when the slug was still available as a username
-at account-creation time. When a decoy account's real login diverges from the
-slug (the username was taken, so the operator used `my-app-bot`, `myapp`, …),
-this derivation is the single seam to replace — `resolveDecoyReviewerLogin` is
-the only place the decoy login is computed. A future
-`channels.github.auth.reviewerLogin` (or equivalent) config field slots in there
-without touching the matcher.
+Slug derivation is the default because it requires no extra configuration and
+matches the common case where the App slug was available as a GitHub username.
+Some deployments use an existing user with a different login — for example,
+`coltrane-code-reviewer[bot]` with the real decoy user `coltrane-review`.
+
+Set `channels.github.review.reviewerLogin` to that real user's login. The field
+is used only under App auth and affects all three decoy-sensitive paths:
+review-request matching, `@login` mention matching, and automatic decoy
+cleanup after the App's formal review. Under PAT auth it has no effect.

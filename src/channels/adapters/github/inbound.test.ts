@@ -228,6 +228,15 @@ describe('classifyGithubInbound', () => {
       )
       expect(msg?.isBotMention).toBe(true)
     })
+    it('recognizes a configured decoy login mention under App auth', () => {
+      const msg = classifyGithubInbound(
+        'issue_comment',
+        issueCommentPayload({ pullRequest: true, body: '@coltrane-review review again' }),
+        'coltrane-code-reviewer[bot]',
+        { authType: 'app', reviewerLogin: 'coltrane-review' },
+      )
+      expect(msg?.isBotMention).toBe(true)
+    })
 
     it('does not flag an unrelated @mention as a self-mention under App auth', () => {
       const msg = classifyGithubInbound(
@@ -404,6 +413,27 @@ describe('classifyGithubInbound', () => {
         { authType: 'app' },
       )
       expect(msg?.isBotMention).toBe(true)
+    })
+    it('wakes the App when a configured decoy account is requested', () => {
+      const msg = classifyGithubInbound(
+        'pull_request',
+        reviewRequestedPayload({ reviewerLogin: 'coltrane-review' }),
+        'coltrane-code-reviewer[bot]',
+        { authType: 'app', reviewerLogin: 'coltrane-review' },
+      )
+      expect(msg?.chat).toBe('pr:7')
+      expect(msg?.text).toContain('requested your review on PR #7')
+      expect(msg?.isBotMention).toBe(true)
+    })
+
+    it('drops a self-request from the configured decoy account', () => {
+      const payload = reviewRequestedPayload({ reviewerLogin: 'coltrane-review' })
+      ;(payload.sender as Record<string, unknown>).login = 'coltrane-review'
+      const msg = classifyGithubInbound('pull_request', payload, 'coltrane-code-reviewer[bot]', {
+        authType: 'app',
+        reviewerLogin: 'coltrane-review',
+      })
+      expect(msg).toBe(null)
     })
 
     it('drops decoy requests targeting an unrelated user', () => {

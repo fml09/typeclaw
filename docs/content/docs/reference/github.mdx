@@ -77,14 +77,15 @@ CLI: `typeclaw channel add github` (interactive; offers to create a Cloudflare t
 
 These extend the [shared base config](/docs/reference/channel-adapters) for `channels.github`:
 
-| Field            | Type                                      | Default              | Notes                                                                                                            |
-| ---------------- | ----------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `webhookUrl`     | string                                    | —                    | Public URL for webhook delivery; tunnel used when omitted                                                        |
-| `webhookPort`    | number                                    | `8975`               | Container-side port the webhook server listens on                                                                |
-| `eventAllowlist` | string[]                                  | (12 defaults)        | Events that trigger the adapter                                                                                  |
-| `repos`          | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start                                                               |
-| `review.on`      | `'review_requested' \| 'opened' \| 'off'` | `'review_requested'` | When to fire a review                                                                                            |
-| `review.approve` | boolean                                   | `true`               | `false` downgrades APPROVE verdicts to COMMENT; a re-review that clears the bot's own block dismisses it instead |
+| Field                  | Type                                      | Default              | Notes                                                                                                            |
+| ---------------------- | ----------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `webhookUrl`           | string                                    | —                    | Public URL for webhook delivery; tunnel used when omitted                                                        |
+| `webhookPort`          | number                                    | `8975`               | Container-side port the webhook server listens on                                                                |
+| `eventAllowlist`       | string[]                                  | (12 defaults)        | Events that trigger the adapter                                                                                  |
+| `repos`                | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start                                                               |
+| `review.on`            | `'review_requested' \| 'opened' \| 'off'` | `'review_requested'` | When to fire a review                                                                                            |
+| `review.approve`       | boolean                                   | `true`               | `false` downgrades APPROVE verdicts to COMMENT; a re-review that clears the bot's own block dismisses it instead |
+| `review.reviewerLogin` | string                                    | —                    | App auth only: real decoy user login when it differs from the App slug                                           |
 
 Default `eventAllowlist`:
 
@@ -123,7 +124,7 @@ pull_request_review.submitted
 Reviews fire on the event named in `review.on` (default `review_requested`).
 
 - **PAT mode**: the bot is requested by its GitHub login.
-- **App mode**: request the [decoy user account](/docs/internals/github-decoy-reviewer); the App itself can't be a reviewer.
+- **App mode**: request the [decoy user account](/docs/internals/github-decoy-reviewer); the App itself can't be a reviewer. By default TypeClaw derives the decoy login from the App slug. Set `review.reviewerLogin` when the real decoy account uses another login.
 - Team-reviewer requests are honored when the bot is a member of the requested team.
 
 ### Draft transitions
@@ -157,7 +158,11 @@ Requires `pull_request.synchronize` in `eventAllowlist`. It is in the shipped de
       "webhookUrl": "https://hooks.example.com/github",
       "webhookPort": 8975,
       "repos": ["acme-corp/api", "acme-corp/frontend"],
-      "review": { "on": "review_requested", "approve": true },
+      "review": {
+        "on": "review_requested",
+        "approve": true,
+        "reviewerLogin": "reviewer-account"
+      },
       "engagement": {
         "trigger": ["mention", "reply", "dm"],
         "stickiness": { "perReply": { "window": 900000 } }
