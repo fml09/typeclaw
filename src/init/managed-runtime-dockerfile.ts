@@ -2,7 +2,13 @@ import { GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE } from '@/config'
 import { CONTAINER_PORT } from '@/container/port'
 
 import { GHCR_BASE_IMAGE_REPO } from './cli-version'
-import { TYPECLAW_ENTRYPOINT_PATH } from './dockerfile'
+import {
+  CLOUDFLARED_RELEASE_URL_BASE,
+  CLOUDFLARED_SHA256_AMD64,
+  CLOUDFLARED_SHA256_ARM64,
+  CLOUDFLARED_VERSION,
+  TYPECLAW_ENTRYPOINT_PATH,
+} from './dockerfile'
 
 export const MANAGED_RUNTIME_UID = 65532
 
@@ -53,6 +59,20 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\
       > /etc/apt/sources.list.d/github-cli.list \\
  && apt-get update \\
  && apt-get install -y --no-install-recommends gh tini tmux python3 python3-pip python3-venv python-is-python3 xvfb
+
+# Pinned cloudflared so the cloudflare-quick tunnel provider works inside the
+# managed Runtime Pod: unlike a host-stage agent folder there is no per-agent
+# Dockerfile build that could opt in via docker.file.cloudflared, and the
+# webhook channel needs the tunnel URL to register repository webhooks.
+RUN ARCH_BIN="$(if [ "$TARGETARCH" = "arm64" ]; then echo arm64; else echo amd64; fi)" \\
+ && ARCH_SHA="$(if [ "$TARGETARCH" = "arm64" ]; then echo ${CLOUDFLARED_SHA256_ARM64}; else echo ${CLOUDFLARED_SHA256_AMD64}; fi)" \\
+ && cd /tmp \\
+ && curl -fsSL -o cloudflared \\
+      "${CLOUDFLARED_RELEASE_URL_BASE}/${CLOUDFLARED_VERSION}/cloudflared-linux-\${ARCH_BIN}" \\
+ && echo "\${ARCH_SHA}  cloudflared" | sha256sum -c - \\
+ && chmod +x cloudflared \\
+ && mv cloudflared /usr/local/bin/cloudflared \\
+ && /usr/local/bin/cloudflared --version > /dev/null
 
 # Install the complete production graph from the source-controlled lock, then
 # extract the two exact direct packages without asking a registry resolver to

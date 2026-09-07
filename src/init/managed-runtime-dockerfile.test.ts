@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 
 import { GHCR_BASE_IMAGE_REPO } from './cli-version'
+import {
+  CLOUDFLARED_RELEASE_URL_BASE,
+  CLOUDFLARED_SHA256_AMD64,
+  CLOUDFLARED_SHA256_ARM64,
+  CLOUDFLARED_VERSION,
+} from './dockerfile'
 import { buildManagedRuntimeDockerfile, MANAGED_RUNTIME_UID } from './managed-runtime-dockerfile'
 
 describe('buildManagedRuntimeDockerfile', () => {
@@ -29,6 +35,18 @@ describe('buildManagedRuntimeDockerfile', () => {
     expect(out).toContain('HEALTHCHECK')
     expect(out).toContain('/health/live')
     expect(out).toContain('CMD ["run"]')
+  })
+
+  test('bakes the pinned cloudflared binary so cloudflare-quick tunnels work in the Pod', () => {
+    const out = buildManagedRuntimeDockerfile({ baseImageVersion: '1.2.3' })
+
+    // The managed Runtime Pod has no host-stage Dockerfile build, so the
+    // cloudflare-quick tunnel provider has no other way to get the binary.
+    expect(out).toContain('mv cloudflared /usr/local/bin/cloudflared')
+    expect(out).toContain('/usr/local/bin/cloudflared --version > /dev/null')
+    expect(out).toContain(CLOUDFLARED_SHA256_AMD64)
+    expect(out).toContain(CLOUDFLARED_SHA256_ARM64)
+    expect(out).toContain(`${CLOUDFLARED_RELEASE_URL_BASE}/${CLOUDFLARED_VERSION}/cloudflared-linux-`)
   })
 
   test('rejects a base image version that cannot be used as a release tag', () => {
