@@ -40,9 +40,9 @@ export function buildManagedRuntimeDockerfile(options: BuildManagedRuntimeDocker
 
 FROM ${baseImageRepository}:${options.baseImageVersion}
 
-# BuildKit provides TARGETARCH only when the Dockerfile declares it; the
-# cloudflared layer picks its per-arch download from this.
-ARG TARGETARCH
+# The base image's package architecture is the source of truth for the
+# downloaded executable. This remains correct on native and emulated workers;
+# uname -m can report the worker architecture during emulated builds.
 
 WORKDIR /
 COPY typeclaw.tgz /tmp/typeclaw.tgz
@@ -68,8 +68,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\
 # managed Runtime Pod: unlike a host-stage agent folder there is no per-agent
 # Dockerfile build that could opt in via docker.file.cloudflared, and the
 # webhook channel needs the tunnel URL to register repository webhooks.
-RUN ARCH_BIN="$(if [ "$TARGETARCH" = "arm64" ]; then echo arm64; else echo amd64; fi)" \\
- && ARCH_SHA="$(if [ "$TARGETARCH" = "arm64" ]; then echo ${CLOUDFLARED_SHA256_ARM64}; else echo ${CLOUDFLARED_SHA256_AMD64}; fi)" \\
+RUN ARCH_BIN="$(dpkg --print-architecture)" \\
+ && case "$ARCH_BIN" in \\
+      amd64) ARCH_SHA=${CLOUDFLARED_SHA256_AMD64} ;; \\
+      arm64) ARCH_SHA=${CLOUDFLARED_SHA256_ARM64} ;; \\
+      *) echo "unsupported target architecture: $ARCH_BIN" >&2; exit 1 ;; \\
+    esac \\
  && cd /tmp \\
  && curl -fsSL -o cloudflared \\
       "${CLOUDFLARED_RELEASE_URL_BASE}/${CLOUDFLARED_VERSION}/cloudflared-linux-\${ARCH_BIN}" \\
