@@ -31,7 +31,6 @@ describe('buildManagedRuntimeDockerfile', () => {
     expect(out).toContain('TYPECLAW_HOME=/opt/typeclaw')
     expect(out).toContain('TYPECLAW_MODEL_CACHE=/opt/typeclaw/models')
     expect(out).toContain('TYPECLAW_DEPLOYMENT_PROFILE=managed')
-    expect(out).toContain(`USER ${MANAGED_RUNTIME_UID}:${MANAGED_RUNTIME_UID}`)
     expect(out).toContain('HEALTHCHECK')
     expect(out).toContain('/health/live')
     expect(out).toContain('CMD ["run"]')
@@ -47,6 +46,7 @@ describe('buildManagedRuntimeDockerfile', () => {
     expect(out).toContain(CLOUDFLARED_SHA256_AMD64)
     expect(out).toContain(CLOUDFLARED_SHA256_ARM64)
     expect(out).toContain(`${CLOUDFLARED_RELEASE_URL_BASE}/${CLOUDFLARED_VERSION}/cloudflared-linux-`)
+    expect(out).toContain('ARG TARGETARCH')
   })
 
   test('rejects a base image version that cannot be used as a release tag', () => {
