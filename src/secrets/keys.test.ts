@@ -16,8 +16,10 @@ async function withTempKeysDir<T>(fn: (keysDir: string) => Promise<T>): Promise<
 
 describe('keys store', () => {
   test('defaultKeyStoreDir honors TYPECLAW_HOME and otherwise uses the runtime home', () => {
-    expect(defaultKeyStoreDir({ TYPECLAW_HOME: '/durable/typeclaw' }, '/home/runtime')).toBe('/durable/typeclaw/keys')
-    expect(defaultKeyStoreDir({}, '/home/runtime')).toBe('/home/runtime/.typeclaw/keys')
+    expect(defaultKeyStoreDir({ TYPECLAW_HOME: '/durable/typeclaw' }, '/home/runtime')).toBe(
+      join('/durable/typeclaw', 'keys'),
+    )
+    expect(defaultKeyStoreDir({}, '/home/runtime')).toBe(join('/home/runtime', '.typeclaw', 'keys'))
   })
 
   test('ensure creates a 32-byte key on first call and returns it on subsequent calls', async () => {
