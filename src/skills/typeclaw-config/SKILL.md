@@ -412,20 +412,21 @@ Do **not** invent plugin blocks; their existence is determined by the plugins li
 
 The model registry currently has these entries:
 
-| `model` value                                          | Display name    | Provider     | Auth                | Notes                                                                                                                              |
-| ------------------------------------------------------ | --------------- | ------------ | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `openai/gpt-5.4-nano`                                  | GPT-5.4 nano    | OpenAI       | API key             | Default. API key in `secrets.json#providers.openai.key.value` (or `OPENAI_API_KEY` env override). Reasoning model, 400K context.   |
-| `openai/gpt-5.4-mini`                                  | GPT-5.4 mini    | OpenAI       | API key             | API key in `secrets.json#providers.openai.key.value` (or `OPENAI_API_KEY` env override). Reasoning model, 400K context.            |
-| `openai/gpt-5.4`                                       | GPT-5.4         | OpenAI       | API key             | API key in `secrets.json#providers.openai.key.value` (or `OPENAI_API_KEY` env override). Reasoning model, 1.05M context.           |
-| `openai/gpt-5.5`                                       | GPT-5.5         | OpenAI       | API key             | Flagship. API key in `secrets.json#providers.openai.key.value` (or `OPENAI_API_KEY` env override). Reasoning model, 1.05M context. |
-| `openai-codex/gpt-5.4-mini`                            | GPT-5.4 mini    | OpenAI Codex | OAuth (ChatGPT P/P) | Cheaper Codex tier. Requires OAuth login at init. Persisted to `secrets.json`. 272K ctx.                                           |
-| `openai-codex/gpt-5.4`                                 | GPT-5.4         | OpenAI Codex | OAuth (ChatGPT P/P) | Codex mid-tier. Requires OAuth login at init. Persisted to `secrets.json`. 272K context.                                           |
-| `openai-codex/gpt-5.5`                                 | GPT-5.5         | OpenAI Codex | OAuth (ChatGPT P/P) | Flagship Codex. Requires OAuth login at init. Persisted to `secrets.json`. 272K context.                                           |
-| `fireworks/accounts/fireworks/routers/kimi-k2p6-turbo` | Kimi K2.6 Turbo | Fireworks    | API key             | API key in `secrets.json#providers.fireworks.key.value` (or `FIREWORKS_API_KEY` env override). Reasoning model, 256K context.      |
+| `model` value                                          | Display name    | Provider         | Auth                | Notes                                                                                                                              |
+| ------------------------------------------------------ | --------------- | ---------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `openai/gpt-5.4-nano`                                  | GPT-5.4 nano    | OpenAI           | API key             | Default. API key in `secrets.json#providers.openai.key.value` (or `OPENAI_API_KEY` env override). Reasoning model, 400K context.   |
+| `openai/gpt-5.4-mini`                                  | GPT-5.4 mini    | OpenAI           | API key             | API key in `secrets.json#providers.openai.key.value` (or `OPENAI_API_KEY` env override). Reasoning model, 400K context.            |
+| `openai/gpt-5.4`                                       | GPT-5.4         | OpenAI           | API key             | API key in `secrets.json#providers.openai.key.value` (or `OPENAI_API_KEY` env override). Reasoning model, 1.05M context.           |
+| `openai/gpt-5.5`                                       | GPT-5.5         | OpenAI           | API key             | Flagship. API key in `secrets.json#providers.openai.key.value` (or `OPENAI_API_KEY` env override). Reasoning model, 1.05M context. |
+| `openai-codex/gpt-5.4-mini`                            | GPT-5.4 mini    | OpenAI Codex     | OAuth (ChatGPT P/P) | Cheaper Codex tier. Requires OAuth login at init. Persisted to `secrets.json`. 272K ctx.                                           |
+| `openai-codex/gpt-5.4`                                 | GPT-5.4         | OpenAI Codex     | OAuth (ChatGPT P/P) | Codex mid-tier. Requires OAuth login at init. Persisted to `secrets.json`. 272K context.                                           |
+| `openai-codex/gpt-5.5`                                 | GPT-5.5         | OpenAI Codex     | OAuth (ChatGPT P/P) | Flagship Codex. Requires OAuth login at init. Persisted to `secrets.json`. 272K context.                                           |
+| `fireworks/accounts/fireworks/routers/kimi-k2p6-turbo` | Kimi K2.6 Turbo | Fireworks        | API key             | API key in `secrets.json#providers.fireworks.key.value` (or `FIREWORKS_API_KEY` env override). Reasoning model, 256K context.      |
+| `zai-coding/glm-5.3`                                   | GLM-5.3         | Z.AI Coding Plan | API key             | API key in `secrets.json#providers.zai-coding.key.value` (or `ZAI_CODING_API_KEY` env override). Reasoning model, 1M context.      |
 
 **Do not write any other value into `model`.** The schema enum will reject the file at load, and the runtime will refuse to boot the agent process. If the user names a model that isn't in this table — "use Claude", "switch to o3" — be honest:
 
-> "My registry has OpenAI's GPT-5.4 / 5.5 family (API key), the same family via ChatGPT subscription (OAuth Codex), and Fireworks' Kimi K2.6 Turbo. Other providers (Anthropic, etc.) aren't wired up yet — that needs a typeclaw release, not a config edit."
+> "My registry has OpenAI's GPT-5.4 / 5.5 family (API key), the same family via ChatGPT subscription (OAuth Codex), Fireworks' Kimi K2.6 Turbo, and Z.AI's GLM-5.3 via the GLM Coding Plan. Any other model needs a typeclaw release, not a config edit."
 
 Do **not** edit `typeclaw.json` to a model the registry doesn't know, even if the user insists. That bricks the agent on next restart.
 
@@ -448,6 +449,7 @@ Do **not** edit `typeclaw.json` to a model the registry doesn't know, even if th
   - `OPENAI_API_KEY` — for any `openai/...` model.
   - `FIREWORKS_API_KEY` — for any `fireworks/...` model.
   - `ANTHROPIC_API_KEY` — for any `anthropic/...` model when using API-key auth.
+  - `ZAI_CODING_API_KEY` — for `zai-coding/...` models (GLM Coding Plan).
 
   New TypeClaw secrets should be provisioned by the operator through host-stage TypeClaw setup. A model must not perform a "structured edit" of either secret store.
 

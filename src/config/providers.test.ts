@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
+import { stream } from '@mariozechner/pi-ai'
+
 import {
   defaultThinkingLevelForRef,
   isKnownModelRef,
@@ -80,10 +82,62 @@ describe('KNOWN_PROVIDERS', () => {
   })
 
   test('zai-coding only ships models the Coding Plan officially supports', () => {
-    const codingPlanSupported = new Set(['glm-5.1', 'glm-5', 'glm-5-turbo', 'glm-4.7', 'glm-4.5-air'])
-    for (const modelId of Object.keys(KNOWN_PROVIDERS['zai-coding'].models)) {
-      expect(codingPlanSupported.has(modelId), `${modelId} is not officially Coding-Plan-supported`).toBe(true)
+    const codingPlanSupported: Record<string, true> = {
+      'glm-5.3': true,
+      'glm-5.1': true,
+      'glm-5': true,
+      'glm-5-turbo': true,
+      'glm-4.7': true,
+      'glm-4.5-air': true,
     }
+    for (const modelId of Object.keys(KNOWN_PROVIDERS['zai-coding'].models)) {
+      expect(codingPlanSupported[modelId], `${modelId} is not officially Coding-Plan-supported`).toBe(true)
+    }
+  })
+  test('GLM-5.3 exposes the Coding Plan reasoning and transport contract', () => {
+    const model = KNOWN_PROVIDERS['zai-coding'].models['glm-5.3']
+    expect(model.reasoning).toBe(true)
+    expect(model.input).toEqual(['text'])
+    expect(model.contextWindow).toBe(1_000_000)
+    expect(model.maxTokens).toBe(131_072)
+    expect(model.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: 'low',
+      medium: null,
+      high: 'high',
+      xhigh: 'max',
+    })
+    expect(model.compat).toMatchObject({
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: true,
+      maxTokensField: 'max_tokens',
+      thinkingFormat: 'openai',
+    })
+  })
+
+  test('GLM-5.3 maps TypeClaw max effort to Z.AI reasoning_effort=max', async () => {
+    const model = KNOWN_PROVIDERS['zai-coding'].models['glm-5.3']
+    let payload: Record<string, unknown> | undefined
+    await stream(
+      model,
+      { messages: [{ role: 'user', content: 'ping', timestamp: 0 }] },
+      {
+        apiKey: 'test-key',
+        reasoningEffort: 'xhigh',
+        maxTokens: 123,
+        onPayload(value: unknown) {
+          payload = value as Record<string, unknown>
+          throw new Error('stop after payload capture')
+        },
+      },
+    ).result()
+    expect(payload).toMatchObject({
+      model: 'glm-5.3',
+      reasoning_effort: 'max',
+      max_tokens: 123,
+    })
   })
 
   test('minimax is a single api-key provider serving both paygo and Token Plan keys', () => {
@@ -565,6 +619,7 @@ describe('listKnownModelRefs', () => {
     const refs = listKnownModelRefs()
     expect(refs).toContain('zai/glm-4.6')
     expect(refs).toContain('zai-coding/glm-5.1')
+    expect(refs).toContain('zai-coding/glm-5.3')
   })
 
   test('includes minimax model refs', () => {
