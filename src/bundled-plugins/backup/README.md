@@ -42,6 +42,7 @@ The runner stages an explicit snapshot from NUL-delimited porcelain status:
 
 - **Tracked changes**, including deletions and both rename/copy endpoints, are staged even when an endpoint is no longer present on disk.
 - **Ordinary untracked paths** are staged only while still present. If one disappears between snapshot and `git add`, the runner re-reads status and retries that same snapshot once without the vanished path; paths discovered during that re-read are never added.
+- **Credential files** (`.env`, `.env.local`, `secrets.json`, and legacy `auth.json`) are never staged, even if they are already in the index. The runner removes only their index entries before committing and leaves the files on disk.
 - **`memory/`** remains excluded. Present **`sessions/` and `todo/`** paths remain force-added; tracked deletions under those prefixes stay in the ordinary snapshot. The post-message pass re-stages only `sessions/` paths that appeared while the message was selected.
 
 Commit message comes from the `backup-message` subagent, which sees a truncated `git status` and `git diff --cached --stat` and writes a single conventional-ish commit message to a tmp file. On any failure the runner falls back to `chore: backup`.

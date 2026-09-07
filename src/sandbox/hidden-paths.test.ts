@@ -39,10 +39,8 @@ const canonicalSecretDirs = (agentDir: string) => [
   join(agentDir, '.typeclaw', 'logs'),
 ]
 const secretFiles = (agentDir: string) => [
-  join(agentDir, '.env'),
-  join(agentDir, 'secrets.json'),
-  join(agentDir, 'auth.json'),
-  join(agentDir, '.typeclaw', 'incidents.json'),
+  ...CANONICAL_AGENT_SECRET_FILES.map((entry) => join(agentDir, entry)),
+  ...CANONICAL_AGENT_RUNTIME_PRIVATE_FILES.map((entry) => join(agentDir, entry)),
 ]
 
 function parseRoles(raw: unknown): RolesConfig {

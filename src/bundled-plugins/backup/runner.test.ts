@@ -155,6 +155,106 @@ describe('runBackup', () => {
     const forceAdd = calls.find((c) => c.args[0] === 'add' && c.args[1] === '-f')
     expect(forceAdd).toBeUndefined()
   })
+  test('never commits protected credential files, including files already staged', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-protected-files-'))
+    const runGit = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+      const proc = Bun.spawn({
+        cmd: ['git', ...args],
+        cwd,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'Test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'Test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      const stdout = await new Response(proc.stdout).text()
+      const stderr = await new Response(proc.stderr).text()
+      return { exitCode: await proc.exited, stdout, stderr }
+    }
+
+    try {
+      expect((await runGit(['init', '-q', '-b', 'main'])).exitCode).toBe(0)
+      await writeFile(join(cwd, 'notes.md'), 'initial\n')
+      expect((await runGit(['add', 'notes.md'])).exitCode).toBe(0)
+      expect((await runGit(['commit', '-qm', 'initial'])).exitCode).toBe(0)
+
+      await writeFile(join(cwd, '.env'), 'TEST_ENV_VALUE=not-for-commit\n')
+      await writeFile(join(cwd, '.env.local'), 'TEST_ENV_LOCAL_VALUE=not-for-commit\n')
+      await writeFile(join(cwd, 'secrets.json'), '{"version":2}\n')
+      await writeFile(join(cwd, 'notes.md'), 'changed\n')
+      expect((await runGit(['add', '.env', '.env.local', 'secrets.json'])).exitCode).toBe(0)
+
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        { gitSpawn: makeDefaultGitSpawn(), pickCommitMessage: async () => 'backup protected files' },
+      )
+
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      const committedFiles = (await runGit(['show', '--format=', '--name-only', 'HEAD'])).stdout
+      expect(committedFiles).toContain('notes.md')
+      for (const path of ['.env', '.env.local', 'secrets.json']) {
+        expect(committedFiles).not.toContain(path)
+        expect((await runGit(['ls-files', '--', path])).stdout.trim()).toBe('')
+        expect((await runGit(['status', '--porcelain'])).stdout).toContain(`?? ${path}`)
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('rechecks the index before commit when a credential file appears during message selection', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-late-protected-file-'))
+    const runGit = async (args: string[]): Promise<{ exitCode: number; stdout: string }> => {
+      const proc = Bun.spawn({
+        cmd: ['git', ...args],
+        cwd,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'Test',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'Test',
+          GIT_COMMITTER_EMAIL: 'test@example.com',
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      const stdout = await new Response(proc.stdout).text()
+      return { exitCode: await proc.exited, stdout }
+    }
+
+    try {
+      expect((await runGit(['init', '-q', '-b', 'main'])).exitCode).toBe(0)
+      await writeFile(join(cwd, 'notes.md'), 'initial\n')
+      expect((await runGit(['add', 'notes.md'])).exitCode).toBe(0)
+      expect((await runGit(['commit', '-qm', 'initial'])).exitCode).toBe(0)
+      await writeFile(join(cwd, 'notes.md'), 'changed\n')
+
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        {
+          gitSpawn: makeDefaultGitSpawn(),
+          pickCommitMessage: async () => {
+            await writeFile(join(cwd, '.env.local'), 'TEST_ENV_LOCAL_VALUE=late\n')
+            expect((await runGit(['add', '.env.local'])).exitCode).toBe(0)
+            return 'backup with late credential file'
+          },
+        },
+      )
+
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      const committedFiles = (await runGit(['show', '--format=', '--name-only', 'HEAD'])).stdout
+      expect(committedFiles).toContain('notes.md')
+      expect(committedFiles).not.toContain('.env.local')
+      expect((await runGit(['ls-files', '--', '.env.local'])).stdout.trim()).toBe('')
+      expect((await runGit(['status', '--porcelain'])).stdout).toContain('?? .env.local')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
 
   test('force-adds sessions/ paths alongside normal staging', async () => {
     const cwd = await makeRepo()
