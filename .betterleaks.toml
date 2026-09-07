@@ -1,0 +1,19 @@
+title = "TypeClaw Betterleaks"
+description = "Keep intentional credential-shaped test fixtures scoped to their exact source files."
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Intentional private-key fixtures used by tests."
+targetRules = ["private-key", "generic-api-key"]
+paths = [
+  '''(^|/)src/cli/prompt-pem\.test\.ts$''',
+  '''(^|/)src/channels/adapters/github/auth-app\.test\.ts$''',
+  '''(^|/)src/init/set-channel\.test\.ts$''',
+]
+
+[[allowlists]]
+description = "Discord SDK type names are not client secrets."
+targetRules = ["discord-client-secret"]
+paths = ['''(^|/)src/channels/adapters/discord-classify\.ts$''']
