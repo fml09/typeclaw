@@ -148,6 +148,12 @@ export type ChannelManagerOptions = {
   // plugin registry's collection; tests omit it. See
   // CreateChannelRouterOptions.pluginCommands for the collision rule.
   pluginCommands?: readonly RegisteredChannelCommand[]
+  // Forwarded to the router so an adapter-triggered work invalidation can stop
+  // independent background sessions that a parent AgentSession abort cannot reach.
+  cancelRunningSubagentsByWorkKey?: (
+    workKey: string,
+    reason: string,
+  ) => Promise<{ matched: number; cancelled: number; failures: number }>
   // Persistent messenger SDKs usually reconnect themselves, but a host sleep/offline
   // cycle can leave a socket half-dead forever. The manager watches live adapters
   // and restarts one that stays disconnected past this grace period. Test seams are
@@ -201,6 +207,8 @@ type AdapterEntry = {
   adapter: AnyAdapter
   credentialSignature: string
   disconnectedSinceMs: number | null
+  nextRecoveryRestartAtMs: number | null
+  recoveryRestartAttempts: number
   recoveryRestartQueued: boolean
 }
 
@@ -266,6 +274,9 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
       : {}),
     ...(options.pluginCommands ? { pluginCommands: options.pluginCommands } : {}),
+    ...(options.cancelRunningSubagentsByWorkKey
+      ? { cancelRunningSubagentsByWorkKey: options.cancelRunningSubagentsByWorkKey }
+      : {}),
   })
   const createDiscordBot = options.createDiscordAdapter ?? createDiscordBotAdapter
   const createDiscordUser = options.createDiscordUserAdapter ?? createDiscordAdapter
@@ -370,6 +381,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       )
       if (credentialsStore === null) return null
       return createInstagram({
+        agentDir: options.agentDir,
         router,
         configRef: () => options.channelsConfigRef()[name] ?? cfg,
         logger,
@@ -522,6 +534,8 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         adapter,
         credentialSignature: signature,
         disconnectedSinceMs: adapter.isConnected() ? null : recoveryNow(),
+        nextRecoveryRestartAtMs: null,
+        recoveryRestartAttempts: 0,
         recoveryRestartQueued: false,
       })
       return { status: 'started' }
@@ -735,6 +749,8 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     for (const [name, entry] of live) {
       if (entry.adapter.isConnected()) {
         entry.disconnectedSinceMs = null
+        entry.nextRecoveryRestartAtMs = null
+        entry.recoveryRestartAttempts = 0
         entry.recoveryRestartQueued = false
         continue
       }
@@ -744,7 +760,11 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         continue
       }
       const disconnectedForMs = now - entry.disconnectedSinceMs
-      if (disconnectedForMs < recoveryDisconnectedGraceMs || entry.recoveryRestartQueued) continue
+      const nextRestartAtMs = Math.max(
+        entry.disconnectedSinceMs + recoveryDisconnectedGraceMs,
+        entry.nextRecoveryRestartAtMs ?? Number.NEGATIVE_INFINITY,
+      )
+      if (now < nextRestartAtMs || entry.recoveryRestartQueued) continue
       entry.recoveryRestartQueued = true
       logger.warn(
         `[channels] adapter "${name}" disconnected for ${Math.round(disconnectedForMs)}ms; restarting adapter`,
@@ -769,6 +789,12 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
               return running && queuedEpoch === lifecycleEpoch && cfg !== undefined && cfg.enabled !== false
             })
             applyStartResult(name, latestCfg, result)
+            const replacement = live.get(name)
+            if (replacement !== undefined && !replacement.adapter.isConnected()) {
+              const attempts = entry.recoveryRestartAttempts + 1
+              replacement.recoveryRestartAttempts = attempts
+              replacement.nextRecoveryRestartAtMs = recoveryNow() + retryDelayMs(attempts)
+            }
           } catch (err) {
             const cfg = options.channelsConfigRef()[name]
             if (running && queuedEpoch === lifecycleEpoch && cfg !== undefined && cfg.enabled !== false) {

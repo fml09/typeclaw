@@ -1,7 +1,7 @@
 import { statSync } from 'node:fs'
 import { basename } from 'node:path'
 
-import type { AssistantMessage } from '@mariozechner/pi-ai'
+import { createAssistantMessageEventStream, type AssistantMessage, type ToolResultMessage } from '@mariozechner/pi-ai'
 import { type SessionEntry, SessionManager } from '@mariozechner/pi-coding-agent'
 
 import { createSession, renderTurnRoleAnchor, renderTurnTimeAnchor, type AgentSession } from '@/agent'
@@ -59,16 +59,19 @@ import {
   type EngagementDecision,
 } from './engagement'
 import { checkFalseReceipt } from './github-false-receipt'
+import { githubReviewerWorkKey } from './github-repo'
 import { evaluateRereviewGuard } from './github-rereview-guard'
 import { resetReviewTurn, type ReviewOutputState, type ReviewRoundOutcome } from './github-review-turn-ledger'
 import {
   canPromoteGithubReviewRoundTo,
+  abortGithubReviewStateForPr,
   completeGithubReviewRound,
   forgetGithubReviewRound,
   githubReviewRoundKey,
   githubReviewRoundPersistence,
   hasGithubReviewRoundDismissalAttempt,
   isGithubReviewRoundComplete,
+  isGithubReviewRoundPending,
   promoteGithubReviewRound,
   registerGithubReviewRound,
   restoreGithubReviewRound,
@@ -130,6 +133,7 @@ import type {
   HistoryCallback,
   InboundAttachment,
   GithubReviewFollowupRound,
+  GithubReviewThreadCloseout,
   InboundMessage,
   InboundReferenceContext,
   ListCallback,
@@ -253,12 +257,7 @@ export function disengageReactionEmojiFor(adapter: AdapterId): string {
   return DISENGAGE_REACTION_EMOJI_OVERRIDES[adapter] ?? DISENGAGE_REACTION_EMOJI
 }
 
-type SilentAckReason =
-  | 'skip_response'
-  | 'no_reply'
-  | 'skip_response_text_leak'
-  | 'github_review_output'
-  | 'awaiting_background_child'
+type SilentAckReason = 'github_review_output' | 'awaiting_background_child'
 
 // Wake nudge pushed into a resumed channel session at boot so drain() has a
 // non-empty batch and fires a turn. The substantive instruction the model acts
@@ -447,6 +446,8 @@ export const STRANDED_TOOLUSE_CONTINUATION_NUDGE = [
 // drop so the human is never left staring at dead air after a degenerate turn.
 export const EMPTY_TURN_FALLBACK_TEXT =
   "⚠️ I got stuck putting together a reply and couldn't finish. Could you rephrase or try again?"
+export const GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT =
+  "I wasn't able to complete this follow-up. Leaving this thread open for manual review."
 // Distinct from EMPTY_TURN_RETRY_NUDGE: that one diagnoses budget exhaustion
 // ("ran out of output budget"), which is FALSE for a clean `stop` with empty
 // text. This nudge names the real failure — a turn that ended sending nothing
@@ -670,6 +671,12 @@ function defaultMeasureTranscriptBytes(path: string): number {
 // instead of awaiting the same dead promise forever.
 export const ENSURE_LIVE_TIMEOUT_MS = 30_000
 
+const RELOAD_HANDOFF_RETENTION_MS = 15 * 60_000
+const MAX_PENDING_RELOAD_HANDOFF_KEYS = 100
+const MAX_PENDING_RELOAD_HANDOFF_ITEMS_PER_KEY = 1_000
+const MAX_PENDING_RELOAD_HANDOFF_BYTES_PER_KEY = 8 * 1024 * 1024
+const MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL = 64 * 1024 * 1024
+
 // Thrown by ensureLive() when a teardown (roles reload or shutdown) raced
 // ahead of an in-flight creation. route() has no special handling — it
 // propagates to the adapter's outer catch, dropping this one inbound. The
@@ -799,6 +806,7 @@ type QueuedInbound = {
   // prefix for those).
   ts: number
   githubReviewRound?: GithubReviewFollowupRound
+  githubReviewThreadCloseout?: GithubReviewThreadCloseout
 }
 
 type ObservedInbound = {
@@ -855,6 +863,15 @@ type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | unde
 // would silently misclassify, and every future enqueue site would inherit the
 // default instead of being forced to choose.
 type PendingSystemReminder = { text: string; kind: 'retry' | 'wakeup'; githubReviewRoundKey?: string }
+
+type PendingReloadHandoff = {
+  key: ChannelKey
+  inbounds: QueuedInbound[]
+  observed: ObservedInbound[]
+  reminders: PendingSystemReminder[]
+  retainedAt: number
+  estimatedBytes: number
+}
 
 const retryReminder = (text: string): PendingSystemReminder => ({ text, kind: 'retry' })
 
@@ -922,6 +939,16 @@ type LiveSession = {
   resolvedNames: ResolvedChannelNames
   originRef: { current: SessionOrigin | undefined }
   githubReviewRound: GithubReviewFollowupRound | null
+  // A real-user reply to one of this agent's own review-thread roots must end
+  // with a reply on that exact thread. This spans reminder-only retry iterations.
+  githubReviewThreadCloseout:
+    | (GithubReviewThreadCloseout & {
+        startedAt: number
+        correctionAttempts: number
+        deferred: boolean
+      })
+    | null
+  githubReviewThreadCloseoutDecisionTurn: number | null
   // Round key of a close-out that arrived while the round was still pending
   // completion. Replayed once the round completes; see replayPendingRoundCloseouts.
   pendingGithubReviewRoundCloseout: string | null
@@ -947,6 +974,12 @@ type LiveSession = {
   historyTimedAttachments: readonly TimedAttachment[]
   historyAttachments: InboundAttachment[]
   draining: boolean
+  // Every drain invocation still running, including the tail it executes after
+  // `draining` flips back to false. `drain()` deliberately no-ops while a drain
+  // owns the session, so a fire-and-forget `void drain(live)` is otherwise
+  // unobservable; this is the only handle a caller can await to know the turn
+  // actually landed. Entries remove themselves on settle.
+  activeDrains: Set<Promise<void>>
   debounceTimer: ReturnType<typeof setTimeout> | null
   // Wait (ms) computed by the most recent scheduleDebouncedDrain call.
   // Test-observable via __testing.scheduledDrainDelay; not read by logic.
@@ -995,14 +1028,13 @@ type LiveSession = {
   // `currentTurnReactionRef` points at — last item of the drained batch) was
   // EXPLICITLY addressed to the bot: a DM, an @-mention/alias (`isBotMention`
   // folds plain-name matching in at the adapter classify layer), or a reply to
-  // the bot's own message. Gates the PERSISTENT silent-ack :eyes: (see
-  // `armSilentTurnAck`): a deliberate silence on a message aimed AT us earns a
-  // courteous "seen, nothing to add" 👀, but staying quiet during ambient
-  // human-to-human chatter (sticky observation, solo-human fallback) must leave
-  // NO mark — otherwise a busy room accumulates stale 👀 on messages the bot
-  // was never part of. Computed from the SAME message the reaction targets so
-  // eligibility and target can never disagree. Reset with `currentTurnReactionRef`
-  // in the drain finally; preserved across reminder-only iterations exactly like it.
+  // the bot's own message. Gates the PERSISTENT :eyes: for deferred background
+  // work (see `armSilentTurnAck`): an addressed request may retain a progress
+  // marker while a child runs, but ambient human-to-human chatter must leave no
+  // mark. Explicit NO_REPLY and skip_response turns never use this flag to add a
+  // reaction. Computed from the SAME message the reaction targets so eligibility
+  // and target cannot disagree. Reset with `currentTurnReactionRef` in the drain
+  // finally; preserved across reminder-only iterations exactly like it.
   currentTurnExplicitlyAddressed: boolean
   // Typing-status anchor of the inbound that triggered THIS turn (last item in
   // the drained batch, mirroring `currentTurnReactionRef`). Adapter-opaque ts
@@ -1047,16 +1079,12 @@ type LiveSession = {
   // discarded on silence (skip_response / empty / errored turns) so the bot never
   // leaves a reaction on a message it merely looked at (e.g. cron lookaround).
   pendingTurnReactions: ReactionRequest[]
-  // Armed by `validateChannelTurn` on a DELIBERATE silent turn (skip_response or
-  // an explicit NO_REPLY), stamped with `turnSeq` so a stale flag from a crashed
-  // turn cannot leak into the next one. Read in drain's per-turn finally — AFTER
-  // the transient engage :eyes: is dropped — to leave a PERSISTENT :eyes: on the
-  // triggering message: "I saw this and intentionally chose not to reply." Null
-  // on every non-deliberate outcome (a real reply, a model malfunction, a
-  // plumbing leak, a retry, a synthetic turn). Firing after the engage-drop is
-  // load-bearing: adapters that collapse a same-actor same-emoji reaction into
-  // one toggle would otherwise have the engage-drop remove the only visible
-  // :eyes:. See `reactOnSilentAck`.
+  // Armed when output landed outside the channel (a GitHub review) or was
+  // deliberately deferred to a background child. Explicit NO_REPLY and
+  // skip_response turns do not arm it: opting out must leave no reaction behind.
+  // Stamped with `turnSeq` so a stale flag from a crashed turn cannot leak into
+  // the next one. Fired after the transient engage :eyes: is dropped because
+  // adapters may collapse a same-actor same-emoji reaction into one toggle.
   silentAckTurn: { turnSeq: number; reason: SilentAckReason } | null
   // One silent-ack-:eyes:-add promise per PERSISTENT ack `reactOnSilentAck` has
   // planted on a trigger message, each resolving to its removable ref (or null).
@@ -1065,16 +1093,15 @@ type LiveSession = {
   // sees every in-flight add and awaits it before removing — storing only the
   // resolved ref raced (cleanup could snapshot an empty array, then a slow add
   // append its ref afterward, stranding the :eyes:). Cross-turn state on purpose:
-  // a silent turn means "seen, not replying FOR NOW", and once the same sticky
-  // conversation gets a genuine reply those marks read as stale/contradictory —
-  // so they are retired on the next replied turn (see dropSilentAckReactions).
+  // the mark means output is external or deferred, and once the same sticky
+  // conversation gets a genuine reply it reads as stale — so it is retired on
+  // the next replied turn (see dropSilentAckReactions).
   // Conversation-scoped, NOT per-trigger-message: coalescing means the silent
   // turn's trigger (message N) and the eventual reply's trigger (message N+1)
   // routinely differ, so exact-message scoping would strand the mark. NOT reset
   // in drain's outer per-turn finally. On teardown the entries are dropped
-  // WITHOUT removing the reactions: a session that ends without ever replying
-  // legitimately keeps its "seen, not replying" ack, unlike the transient
-  // engage :eyes: which teardown must strip.
+  // WITHOUT removing the reactions, unlike the transient engage :eyes: which
+  // teardown must strip.
   activeSilentAckReactions: Array<Promise<ReactionRef | null>>
   // One add promise per willingness status posted by the agent, resolving to
   // the removable reaction-instance ref. Cross-turn state on purpose: the
@@ -1206,13 +1233,20 @@ type LiveSession = {
   // user batch starts (batch.length > 0), NOT on the reminder-only iteration the
   // nudge itself queues — same anti-reloop discipline as the empty-turn budget.
   willingnessNudges: number
-  // Stashed by `installChannelReplyTerminalHook` just before it aborts the turn
-  // after a successful `channel_reply` that omitted `more_work_this_turn: true`. Read once
+  // Stashed by `installChannelReplyTerminalHook` after a successful
+  // `channel_reply` that omitted `more_work_this_turn: true`. Read once
   // by `validateChannelTurn` to decide the continuation nudge. `turnSeq`-stamped
   // (like `skippedTurn`/`skipLockedSendTurn`) so a stale record from an earlier
   // turn can never trigger a nudge on a later one. `null` when no such reply
   // ended this turn.
-  lastTerminalReplyAbort: { turnSeq: number; text: string } | null
+  lastTerminalReplyCompletion: { turnSeq: number; text?: string; tokens: number } | null
+  // Armed after a successful terminal reply. pi-agent-core invokes streamFn
+  // again only after emitting every matching toolResult into its event queue;
+  // the wrapper consumes this marker at that awaited provider boundary and
+  // returns a local aborted response instead of calling the provider. Event
+  // queue ordering then persists every toolResult before the synthetic aborted
+  // assistant. Cleared on consumption, stop, or a fresh user turn.
+  pendingTerminalReplyStop: { turnSeq: number; tokens: number } | null
   // Stamped by `installChannelReplyTerminalHook` when a successful `channel_reply`
   // set `more_work_this_turn: true` — the machine-readable "I'll keep working this turn"
   // promise. `validateChannelTurn` reads it to recover a turn that made that promise,
@@ -1648,17 +1682,26 @@ export type ChannelRouter = {
     verdict: ReviewRoundOutcome
     sessionId: string
   }) => { kind: 'delivered'; count: number }
+  abortGithubPrTurn?: (
+    workspace: string,
+    prNumber: number,
+    reason: string,
+  ) => Promise<
+    | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+    | { kind: 'no-live-session' }
+  >
   completeGithubReviewRound?: (args: {
     workspace: string
     prNumber: number
     verdict: ReviewRoundOutcome
     sessionId: string
   }) => Promise<{ kind: 'completed' | 'no-round' }>
-  finishGithubReviewRoundCloseout?: (args: {
+  finishGithubReviewThreadCloseout?: (args: {
     sessionId: string
     workspace: string
     prNumber: number
     thread: string | null
+    decision: 'resolved' | 'left-open'
   }) => void
   noteGithubReviewOutput: (args: {
     sessionId: string
@@ -1666,6 +1709,7 @@ export type ChannelRouter = {
     prNumber: number
     state: ReviewOutputState
   }) => { kind: 'stamped' | 'no-live-session' }
+  hasOutstandingGithubReviewThreadCloseout?: (sessionId: string) => boolean
   // Record that the agent invoked `skip_response` during the current turn
   // for the channel session identified by `parentSessionId`. The reason is
   // logged at INFO level inside `validateChannelTurn` (single log line per
@@ -1737,6 +1781,7 @@ export type ChannelRouter = {
     typingHeartbeatIntervalFor: (adapter: ChannelKey['adapter']) => number
     githubReviewRoundFor: (key: ChannelKey) => GithubReviewFollowupRound | null | undefined
     pendingReminderCount: (key: ChannelKey) => number | undefined
+    creationTokenCount: () => number
     runIdleGc: () => Promise<void>
     // Returns the seeded author state on the live session matching
     // `key`, or undefined when no live session exists. Tests use this
@@ -1819,6 +1864,14 @@ export type CreateChannelRouterOptions = {
   // Test seam: override the ensureLive watchdog ceiling so the timeout path
   // is exercisable in <100ms instead of the 30s production default.
   ensureLiveTimeoutMs?: number
+  // Test seam for expiring a failed reload handoff without waiting for the
+  // production retention window.
+  handoffRetryRetentionMs?: number
+  // Test seam for exercising the per-key retry-buffer capacity without
+  // manufacturing a production-sized batch.
+  handoffRetryItemLimit?: number
+  // Test seam for the retained payload-size guard.
+  handoffRetryByteLimit?: number
   // Test seam: per-callback ceiling for channel name resolvers; mirrors the
   // ensureLive seam so timeout paths can be exercised quickly in tests.
   resolveChannelNamesTimeoutMs?: number
@@ -1900,6 +1953,10 @@ export type CreateChannelRouterOptions = {
   // the hang path without waiting 30s, because the router's `now` seam is a
   // clock reader and does not reach setTimeout.
   pluginCommandTimeoutMs?: number
+  cancelRunningSubagentsByWorkKey?: (
+    workKey: string,
+    reason: string,
+  ) => Promise<{ matched: number; cancelled: number; failures: number }>
 }
 
 export type RestartCommandContext = {
@@ -1949,6 +2006,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const now = options.now ?? Date.now
   const measureTranscriptBytes = options.measureTranscriptBytes ?? defaultMeasureTranscriptBytes
   const ensureLiveTimeoutMs = options.ensureLiveTimeoutMs ?? ENSURE_LIVE_TIMEOUT_MS
+  const handoffRetryRetentionMs = options.handoffRetryRetentionMs ?? RELOAD_HANDOFF_RETENTION_MS
+  const handoffRetryItemLimit = options.handoffRetryItemLimit ?? MAX_PENDING_RELOAD_HANDOFF_ITEMS_PER_KEY
+  const handoffRetryByteLimit = options.handoffRetryByteLimit ?? MAX_PENDING_RELOAD_HANDOFF_BYTES_PER_KEY
   const resolveChannelNamesTimeoutMs = options.resolveChannelNamesTimeoutMs ?? RESOLVE_CHANNEL_NAMES_TIMEOUT_MS
   const fetchHistoryTimeoutMs = options.fetchHistoryTimeoutMs ?? FETCH_HISTORY_TIMEOUT_MS
   const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? SESSION_IDLE_TIMEOUT_MS
@@ -1960,6 +2020,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const newestRunningChildSubagentStartedAt = options.newestRunningChildSubagentStartedAt ?? (() => null)
   const liveSessions = new Map<string, LiveSession>()
   const creating = new Map<string, Promise<LiveSession>>()
+  let nextCreationToken = 0
+  const activeCreationAttempts = new Map<string, number>()
+  // Unlike `creating`, this marker survives the watchdog cleanup. A timed-out
+  // attempt can keep running after a retry claims the key, so only the latest
+  // monotonic token may persist, install, or adopt queued handoff work.
+  const latestCreationTokens = new Map<string, number>()
+  // A deferred reload splices post-reload work off the stale session before it
+  // recreates the successor. If that recreation times out, returning from the
+  // handoff used to discard the only copy and produce the production symptom
+  // "the agent stopped responding." Keep one ordered batch per channel key so
+  // the next successful ensureLive adopts it before any newer inbound. Entries
+  // expire and the key count is capped; crossing either bound reports the loss
+  // to both logs and the channel instead of silently trimming user work.
+  const pendingReloadHandoffs = new Map<string, PendingReloadHandoff>()
   // Restart-resume reservations, keyed by channelKeyId. Installed by
   // reserveRestartHandoff BEFORE channel adapters start receiving, so an
   // inbound that races the boot resume coalesces onto the reservation (via the
@@ -2089,7 +2163,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       handler: async ({ live }) => {
         // requiresLiveSession:true guarantees the dispatch layer resolved a
         // session before running this handler, so `live` is non-null here.
-        await stopCurrentChannelTurn(live!)
+        await stopCurrentChannelTurn(live!, 'user_stop')
         return { reply: 'Stopped the current turn.' }
       },
     },
@@ -2311,7 +2385,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       void _removed
       mappings[idx] = rest
     } else {
-      const state = githubReviewRoundPersistence(round)
+      const state = githubReviewRoundPersistence(round, now)
       if (state === null) {
         const { githubReviewRound: _expired, ...rest } = record
         void _expired
@@ -2321,6 +2395,32 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
     }
     void persist()
+  }
+
+  const persistGithubReviewThreadCloseout = (live: LiveSession, closeout: GithubReviewThreadCloseout | null): void => {
+    if (mappings === null) return
+    const idx = mappings.findIndex(
+      (record) =>
+        record.adapter === live.key.adapter &&
+        record.workspace === live.key.workspace &&
+        record.chat === live.key.chat &&
+        (record.thread ?? null) === (live.key.thread ?? null),
+    )
+    if (idx < 0) return
+    const record = mappings[idx]!
+    if (closeout === null) {
+      const { githubReviewThreadCloseout: _removed, ...rest } = record
+      void _removed
+      mappings[idx] = rest
+    } else {
+      mappings[idx] = { ...record, githubReviewThreadCloseout: { ...closeout, deferred: true } }
+    }
+    void persist()
+  }
+
+  const clearGithubReviewThreadCloseout = (live: LiveSession): void => {
+    live.githubReviewThreadCloseout = null
+    persistGithubReviewThreadCloseout(live, null)
   }
 
   const createForChannel: CreateSessionForChannel =
@@ -2483,9 +2583,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // still run. Session scope would let one long-running child silence every
   // subsequent turn, and a wedged child would strand them with nothing to revisit
   // them after the backstop expires.
-  const isAwaitingBackgroundChild = (live: LiveSession, label: string): boolean => {
+  const isAwaitingBackgroundChild = (
+    live: LiveSession,
+    label: string,
+    startedAt = live.logicalTurnStartedAt,
+  ): boolean => {
     const childStartedAt = newestRunningChildSubagentStartedAt(live.sessionId)
-    if (childStartedAt === null || childStartedAt < live.logicalTurnStartedAt) return false
+    if (childStartedAt === null || childStartedAt < startedAt) return false
     return isPinnedByRunningChild(live.sessionId, live.keyId, label)
   }
 
@@ -2515,6 +2619,155 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return true
   }
 
+  const pendingReloadHandoffItemCount = (pending: PendingReloadHandoff): number =>
+    pending.inbounds.length + pending.observed.length + pending.reminders.length
+
+  const estimateReloadHandoffBytes = (
+    inbounds: QueuedInbound[],
+    observed: ObservedInbound[],
+    reminders: PendingSystemReminder[],
+  ): number => {
+    try {
+      const serializableInbounds = inbounds.map(({ engageReaction: _engageReaction, ...inbound }) => inbound)
+      return Buffer.byteLength(JSON.stringify({ inbounds: serializableInbounds, observed, reminders }), 'utf8')
+    } catch {
+      return Number.POSITIVE_INFINITY
+    }
+  }
+
+  const pendingReloadHandoffTotalBytes = (): number => {
+    let total = 0
+    for (const pending of pendingReloadHandoffs.values()) total += pending.estimatedBytes
+    return total
+  }
+
+  const reportDiscardedReloadHandoff = async (pending: PendingReloadHandoff, reason: string): Promise<void> => {
+    const count = pendingReloadHandoffItemCount(pending)
+    const recovery =
+      "Re-send the affected messages. If provider credentials changed, run reload({ scope: 'providers' }); " +
+      'otherwise check the channel logs and retry after session creation is healthy.'
+    logger.error(
+      `[channels] ${channelKeyId(pending.key)}: reload handoff retention policy discarded ${count} queued item(s): ${reason}. ${recovery}`,
+    )
+    await dropPendingReloadHandoffEngageReactions(pending)
+    const result = await send(
+      {
+        adapter: pending.key.adapter,
+        workspace: pending.key.workspace,
+        chat: pending.key.chat,
+        thread: pending.key.thread,
+        text: `⚠️ TypeClaw could not replay ${count} queued item(s) after reload: ${reason}. ${recovery}`,
+      },
+      { source: 'system', outputKind: 'meta' },
+    ).catch((err) => {
+      logger.error(`[channels] ${channelKeyId(pending.key)}: reload handoff loss notice threw: ${describeError(err)}`)
+      return null
+    })
+    if (result !== null && !result.ok) {
+      logger.error(`[channels] ${channelKeyId(pending.key)}: reload handoff loss notice failed: ${result.error}`)
+    }
+  }
+
+  const expirePendingReloadHandoffs = async (): Promise<void> => {
+    const expired: Array<{ pending: PendingReloadHandoff; ageMs: number }> = []
+    for (const [keyId, pending] of pendingReloadHandoffs) {
+      const ageMs = now() - pending.retainedAt
+      if (ageMs < handoffRetryRetentionMs) continue
+      pendingReloadHandoffs.delete(keyId)
+      expired.push({ pending, ageMs })
+    }
+    await Promise.all(
+      expired.map(({ pending, ageMs }) =>
+        reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`),
+      ),
+    )
+  }
+
+  const retainReloadHandoff = (
+    key: ChannelKey,
+    inbounds: QueuedInbound[],
+    observed: ObservedInbound[],
+    reminders: PendingSystemReminder[],
+  ): boolean => {
+    void expirePendingReloadHandoffs()
+    const keyId = channelKeyId(key)
+    const existing = pendingReloadHandoffs.get(keyId)
+    if (existing !== undefined) {
+      const incoming: PendingReloadHandoff = {
+        key,
+        inbounds,
+        observed,
+        reminders,
+        retainedAt: now(),
+        estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders),
+      }
+      if (pendingReloadHandoffItemCount(existing) + pendingReloadHandoffItemCount(incoming) > handoffRetryItemLimit) {
+        void reportDiscardedReloadHandoff(incoming, `per-key item limit ${handoffRetryItemLimit} would be exceeded`)
+        return false
+      }
+      if (existing.estimatedBytes + incoming.estimatedBytes > handoffRetryByteLimit) {
+        void reportDiscardedReloadHandoff(incoming, `per-key byte limit ${handoffRetryByteLimit} would be exceeded`)
+        return false
+      }
+      if (pendingReloadHandoffTotalBytes() + incoming.estimatedBytes > MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL) {
+        void reportDiscardedReloadHandoff(
+          incoming,
+          `global byte limit ${MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL} would be exceeded`,
+        )
+        return false
+      }
+      existing.inbounds.push(...inbounds)
+      existing.observed.push(...observed)
+      existing.reminders.push(...reminders)
+      existing.estimatedBytes += incoming.estimatedBytes
+      return true
+    }
+    const pending: PendingReloadHandoff = {
+      key,
+      inbounds,
+      observed,
+      reminders,
+      retainedAt: now(),
+      estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders),
+    }
+    if (pendingReloadHandoffItemCount(pending) > handoffRetryItemLimit) {
+      void reportDiscardedReloadHandoff(pending, `per-key item limit ${handoffRetryItemLimit} exceeded`)
+      return false
+    }
+    if (pending.estimatedBytes > handoffRetryByteLimit) {
+      void reportDiscardedReloadHandoff(pending, `per-key byte limit ${handoffRetryByteLimit} exceeded`)
+      return false
+    }
+    if (pendingReloadHandoffTotalBytes() + pending.estimatedBytes > MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL) {
+      void reportDiscardedReloadHandoff(pending, `global byte limit ${MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL} exceeded`)
+      return false
+    }
+    if (pendingReloadHandoffs.size >= MAX_PENDING_RELOAD_HANDOFF_KEYS) {
+      void reportDiscardedReloadHandoff(pending, `key limit ${MAX_PENDING_RELOAD_HANDOFF_KEYS} reached`)
+      return false
+    }
+    pendingReloadHandoffs.set(keyId, pending)
+    return true
+  }
+
+  const adoptPendingReloadHandoff = (live: LiveSession): void => {
+    const pending = pendingReloadHandoffs.get(live.keyId)
+    if (pending === undefined) return
+    const ageMs = now() - pending.retainedAt
+    if (ageMs >= handoffRetryRetentionMs) {
+      pendingReloadHandoffs.delete(live.keyId)
+      void reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`)
+      return
+    }
+    // Delete before enqueueing: once ownership moves to the live queues, a
+    // second ensureLive must not replay the same batch and double-deliver it.
+    pendingReloadHandoffs.delete(live.keyId)
+    live.promptQueue.push(...pending.inbounds)
+    live.contextBuffer.push(...pending.observed)
+    live.pendingSystemReminders.push(...pending.reminders)
+    if ((pending.inbounds.length > 0 || pending.reminders.length > 0) && !live.draining) void drain(live)
+  }
+
   const ensureLive = async (
     key: ChannelKey,
     triggeringMessageId?: string,
@@ -2536,7 +2789,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (existing && !existing.destroyed) {
       // A resume that finds the key already live is a no-op for reopening: the
       // session is up, so just hand it back and let the caller enqueue the wake.
-      if (resumeTarget !== undefined) return existing
+      if (resumeTarget !== undefined) {
+        adoptPendingReloadHandoff(existing)
+        return existing
+      }
       // Rollover decision (soft TTL → cost-aware grace → hard cap) lives in
       // shouldRolloverLive, which also skips draining sessions so a mid-prompt
       // turn is never aborted by a follow-up's idle check (PR #359 incident).
@@ -2561,11 +2817,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               thread: prev.thread,
               participants: prev.participants,
               lastInboundAt: 0,
+              ...(prev.githubReviewThreadCloseout !== undefined && prev.githubReviewRound !== undefined
+                ? { githubReviewRound: prev.githubReviewRound }
+                : {}),
+              ...(prev.githubReviewThreadCloseout !== undefined
+                ? { githubReviewThreadCloseout: prev.githubReviewThreadCloseout }
+                : {}),
             }
             await persist()
           }
         }
       } else {
+        adoptPendingReloadHandoff(existing)
         return existing
       }
     }
@@ -2574,8 +2837,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (inFlight) return inFlight
 
     const generation = liveGeneration
+    const creationToken = ++nextCreationToken
+    latestCreationTokens.set(keyId, creationToken)
+    activeCreationAttempts.set(keyId, (activeCreationAttempts.get(keyId) ?? 0) + 1)
+    const isLatestCreation = (): boolean => latestCreationTokens.get(keyId) === creationToken
 
-    const promise = (async () => {
+    let promise!: Promise<LiveSession>
+    promise = (async () => {
       await ensureLoaded()
       const record = mappings ? findRecord(mappings, key) : undefined
       let resolvedRecord = record
@@ -2601,6 +2869,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           participants: record.participants,
           lastInboundAt: 0,
           ...(record.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
+          ...(record.githubReviewThreadCloseout !== undefined
+            ? { githubReviewThreadCloseout: record.githubReviewThreadCloseout }
+            : {}),
         }
         if (mappings) {
           const idx = mappings.findIndex(
@@ -2629,13 +2900,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           sessionFile: resumeTarget.sessionFile,
           participants: (record?.participants ?? []) as ChannelParticipant[],
           lastInboundAt: now(),
+          ...(record?.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
+          ...(record?.githubReviewThreadCloseout !== undefined
+            ? { githubReviewThreadCloseout: record.githubReviewThreadCloseout }
+            : {}),
         }
       }
+      const restoredDeferredCloseout = resolvedRecord?.githubReviewThreadCloseout ?? null
       let restoredRound: GithubReviewFollowupRound | null = null
       let restoredRoundStatus: 'pending' | 'completed' | null = null
       if (resolvedRecord?.githubReviewRound !== undefined) {
         if (
-          await validateGithubReviewRound(resolvedRecord.githubReviewRound, resolvedRecord.githubReviewRound.createdAt)
+          await validateGithubReviewRound(
+            resolvedRecord.githubReviewRound,
+            resolvedRecord.githubReviewRound.createdAt,
+            now,
+          )
         ) {
           restoredRoundStatus = resolvedRecord.githubReviewRound.status
           restoredRound = restoreGithubReviewRound(
@@ -2645,6 +2925,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             resolvedRecord.githubReviewRound.dismissalAttempted === true,
             resolvedRecord.githubReviewRound.requestChangesAttempted === true,
             resolvedRecord.githubReviewRound.createdAt,
+            now,
           )
         } else {
           logger.info(
@@ -2704,6 +2985,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       })
       logger.info(`[channels] ${keyId}: ensureLive session-created sessionId=${created.sessionId}`)
 
+      // A watchdog timeout only releases callers; it cannot cancel the factory.
+      // Check the durable per-key token before this late attempt can overwrite
+      // the retry's mapping. The `creating` entry is intentionally insufficient:
+      // both attempts may have removed their transient entries by now.
+      if (!isLatestCreation()) {
+        await created.dispose()
+        throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
+      }
+
       const transcriptPath = created.getTranscriptPath?.()
       const persistedRecord: ChannelSessionRecord = {
         adapter: key.adapter,
@@ -2716,10 +3006,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         participants,
         ...(restoredRound !== null && restoredRoundStatus !== null
           ? (() => {
-              const state = githubReviewRoundPersistence(restoredRound)
+              const state = githubReviewRoundPersistence(restoredRound, now)
               return state === null ? {} : { githubReviewRound: { ...restoredRound, ...state } }
             })()
           : {}),
+        ...(restoredDeferredCloseout !== null ? { githubReviewThreadCloseout: restoredDeferredCloseout } : {}),
       }
       if (mappings) {
         const idx = mappings.findIndex(
@@ -2759,6 +3050,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         resolvedNames,
         originRef,
         githubReviewRound: restoredRound,
+        githubReviewThreadCloseout:
+          restoredDeferredCloseout === null
+            ? null
+            : {
+                ...restoredDeferredCloseout,
+                startedAt: now(),
+                correctionAttempts: 0,
+                deferred: true,
+              },
+        githubReviewThreadCloseoutDecisionTurn: null,
         pendingGithubReviewRoundCloseout: null,
         promptQueue: [],
         pendingSystemReminders: [],
@@ -2768,6 +3069,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         historyTimedAttachments: [],
         historyAttachments: [],
         draining: false,
+        activeDrains: new Set(),
         debounceTimer: null,
         debounceWaitMs: 0,
         steerBuffer: [],
@@ -2826,7 +3128,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         toolLeakRetries: 0,
         emptyStopAfterToolWorkArmed: false,
         willingnessNudges: 0,
-        lastTerminalReplyAbort: null,
+        lastTerminalReplyCompletion: null,
+        pendingTerminalReplyStop: null,
         continueReplyTurn: null,
         abortReasonThisTurn: null,
         userStoppedTurnSeq: null,
@@ -2881,7 +3184,29 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           stampedAbort.reason === 'terminal_after_channel_reply'
             ? 'terminal-after-channel-reply'
             : undefined
-        if (stampedAbort?.turnSeq === live.turnSeq) live.abortReasonThisTurn = null
+        // Keep the same-turn stamp through validateChannelTurn. Clearing it on
+        // the aborted assistant event made the later stranded-toolUse retry log
+        // `abort_reason=unknown`, even though this subscriber had just consumed
+        // the exact internal reason. A fresh user batch clears the stamp, and
+        // every reader also requires a matching turnSeq, so retaining it cannot
+        // attribute a later turn to this abort.
+        // AgentSession processes message events through one serial queue. By
+        // the time this synthetic aborted message_end reaches the subscriber,
+        // every preceding toolResult event has completed extension handling
+        // and SessionManager persistence. Preserve the original assistant
+        // usage rather than recording this local stream's zero-token envelope.
+        const terminalCompletion = live.lastTerminalReplyCompletion
+        if (termination !== undefined && terminalCompletion?.turnSeq === live.turnSeq) {
+          enqueueTodoOutcomeWrite(live, {
+            agentDir: options.agentDir,
+            origin: buildLiveOrigin(live),
+            turnId: live.sessionId,
+            stopReason: usage.stopReason,
+            termination,
+            tokens: terminalCompletion.tokens,
+          })
+          return
+        }
         const outcomeArgs = {
           agentDir: options.agentDir,
           origin: buildLiveOrigin(live),
@@ -2913,6 +3238,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (isColdStart) {
         // Install before the slow prefetch so a concurrent teardown/shutdown can
         // see and dispose this session during the network fetch.
+        if (!isLatestCreation()) {
+          await tearDownLive(live)
+          throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
+        }
         liveSessions.set(keyId, live)
         const adapterConfig = options.configForAdapter(key.adapter)
         // Overlap the disk mapping-write with the network history prefetch —
@@ -2936,6 +3265,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // before installing — a failed persist must fail ensureLive without
         // leaving a warm session behind for later inbounds to reuse.
         await persistPromise
+        if (!isLatestCreation()) {
+          await tearDownLive(live)
+          throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
+        }
         liveSessions.set(keyId, live)
       }
 
@@ -2948,29 +3281,31 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.baseContextBytes = measureTranscriptBytes(transcriptPathForBase)
       }
 
+      if (!isLatestCreation()) {
+        await unwindInstalledLive(keyId, live)
+        throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
+      }
+      adoptPendingReloadHandoff(live)
       logger.info(`[channels] ${keyId}: ensureLive done (${phase})`)
       return live
-    })()
+    })().finally(() => {
+      const remaining = (activeCreationAttempts.get(keyId) ?? 1) - 1
+      if (remaining > 0) activeCreationAttempts.set(keyId, remaining)
+      else {
+        activeCreationAttempts.delete(keyId)
+        latestCreationTokens.delete(keyId)
+      }
+    })
 
     creating.set(keyId, promise)
     try {
       return await raceWithTimeout(promise, ensureLiveTimeoutMs, `[channels] ${keyId} ensureLive`)
     } catch (err) {
-      // The orphaned `promise` may still settle eventually; that's OK because
-      // the only side effect it produces post-timeout is a `liveSessions.set`,
-      // which the next inbound's existence-check short-circuit at the top of
-      // ensureLive will treat as a usable warm session — strictly better than
-      // a permanent silent drop. The caller (route() in this file, ultimately
-      // the adapter's outer catch) sees the timeout error and logs it.
+      // A timed-out creation may still settle, but the durable creation token
+      // discards it if a later creation has claimed ownership of this key.
       logger.error(`[channels] ${keyId}: ensureLive failed: ${describeError(err)}`)
       throw err
     } finally {
-      // Owner-checked delete: only clear the in-flight marker if it still points
-      // at THIS promise. A watchdog timeout can orphan a slow creation whose
-      // `finally` runs while a later inbound has already installed its own
-      // `creating` entry for the same key; an unconditional delete would drop
-      // that newer entry and let a third inbound cold-start a duplicate session
-      // (observed: 3 concurrent sessions approving the same PR).
       if (creating.get(keyId) === promise) creating.delete(keyId)
     }
   }
@@ -3524,23 +3859,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   // After a successful `channel_reply`, the model has delivered its user-facing
-  // response and the turn is semantically done. pi-agent-core's loop, however,
-  // unconditionally makes one more LLM call after any tool result (the
-  // "post-tool follow-up") to let multi-step tool chains continue. On a turn
-  // that ended with `channel_reply` there is nothing left to say, and Fireworks'
-  // kimi-k2p6-turbo degenerates that empty follow-up into a 32000-token
-  // repetition loop (see CHANNEL_MAX_OUTPUT_TOKENS). Aborting the run's signal
-  // from `afterToolCall` — which runs during tool execution, before the loop
-  // re-enters the LLM stream — makes the follow-up stream observe an already-
-  // aborted signal and return `stopReason: 'aborted'` without generating. This
-  // is the same `agent.abort()` lever the policy-denied-send cap uses; the
-  // tool's own result is already persisted, so the reply still lands.
+  // response and the turn is semantically done. pi-agent-core otherwise makes
+  // one more LLM call after the tool result (the "post-tool follow-up") so real
+  // multi-step chains can continue. On a terminal reply there is nothing left
+  // to say, and Fireworks' kimi-k2p6-turbo can degenerate that empty follow-up
+  // into a 32000-token repetition loop (see CHANNEL_MAX_OUTPUT_TOKENS).
+  // Suppress the provider only at its next stream boundary. agent-core reaches
+  // that boundary after emitting every toolResult for the batch, and
+  // AgentSession preserves the event order even when extensions delay
+  // persistence. In the 2026-08-28 Discord incident, aborting from afterToolCall
+  // left validation looking at the preceding result as
+  // `stranded_toolUse_after_send` and opened a recovery turn after an
+  // already-complete reply.
   //
   // Scope is deliberately narrow: only `channel_reply` (the current-chat user-
   // facing response), only on success, and only for channel sessions. Read-only
   // tools and `channel_send` must keep the follow-up so genuine multi-step turns
-  // continue. A prior non-typeclaw `afterToolCall` (none today) would be
-  // composed, not clobbered.
+  // continue. A prior non-typeclaw `afterToolCall` (none today) is composed.
   //
   // `channel_reply({ more_work_this_turn: true })` is the explicit opt-out: a
   // mid-turn status reply ("working on it…") that the model follows with more
@@ -3576,12 +3911,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
         }
       }
-      if (succeeded && !keepTurnAlive && agent.signal?.aborted !== true && live.userStoppedTurnSeq !== live.turnSeq) {
-        logger.info(`[channels] ${live.keyId} terminal_after_channel_reply`)
+      if (succeeded && !keepTurnAlive && live.userStoppedTurnSeq !== live.turnSeq) {
+        logger.info(
+          `[channels] ${live.keyId} terminal_after_channel_reply site=terminal_after_channel_reply session=${live.sessionId} reason=terminal_after_channel_reply`,
+        )
         const replyText = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
-        live.lastTerminalReplyAbort = typeof replyText === 'string' ? { turnSeq: live.turnSeq, text: replyText } : null
-        live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'terminal_after_channel_reply' }
-        agent.abort()
+        live.lastTerminalReplyCompletion = {
+          turnSeq: live.turnSeq,
+          ...(typeof replyText === 'string' ? { text: replyText } : {}),
+          tokens: context.assistantMessage.usage.totalTokens,
+        }
+        live.pendingTerminalReplyStop = {
+          turnSeq: live.turnSeq,
+          tokens: context.assistantMessage.usage.totalTokens,
+        }
       }
       return result
     }
@@ -3598,13 +3941,48 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const installChannelOutputCap = (live: LiveSession): void => {
     const { agent } = live.session
     const inner = agent.streamFn
-    agent.streamFn = (model, context, options) => {
-      let maxTokens = options?.maxTokens
+    agent.streamFn = async (model, context, streamOptions) => {
+      const pendingTerminalStop = live.pendingTerminalReplyStop
+      if (pendingTerminalStop?.turnSeq === live.turnSeq && live.userStoppedTurnSeq !== pendingTerminalStop.turnSeq) {
+        live.pendingTerminalReplyStop = null
+        live.abortReasonThisTurn = {
+          turnSeq: pendingTerminalStop.turnSeq,
+          reason: 'terminal_after_channel_reply',
+        }
+        // This boundary runs only after agent-core has emitted all toolResults
+        // for the batch. Return a local aborted assistant event instead of
+        // entering the provider. Its later message_end is queued behind those
+        // result events; that persistence-ordered subscriber records the
+        // trusted outcome and original token usage.
+        const message: AssistantMessage = {
+          role: 'assistant',
+          content: [],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'aborted',
+          errorMessage: 'terminal channel reply completed',
+          timestamp: Date.now(),
+        }
+        const stream = createAssistantMessageEventStream()
+        stream.push({ type: 'start', partial: message })
+        stream.push({ type: 'error', reason: 'aborted', error: message })
+        return stream
+      }
+      let maxTokens = streamOptions?.maxTokens
       if (maxTokens === undefined && live.nextPromptMaxTokens !== undefined) {
         maxTokens = live.nextPromptMaxTokens
         live.nextPromptMaxTokens = undefined
       }
-      return inner(model, context, { ...options, maxTokens: maxTokens ?? CHANNEL_MAX_OUTPUT_TOKENS })
+      return await inner(model, context, { ...streamOptions, maxTokens: maxTokens ?? CHANNEL_MAX_OUTPUT_TOKENS })
     }
   }
 
@@ -3753,6 +4131,89 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  const postGithubReviewThreadCloseoutFallback = async (live: LiveSession): Promise<void> => {
+    const obligation = live.githubReviewThreadCloseout
+    if (obligation === null) return
+    // Consume before sending so adapter failure cannot turn this one-shot
+    // fallback into a reminder/fallback loop.
+    clearGithubReviewThreadCloseout(live)
+    logger.warn(
+      `[channels] ${live.keyId} github_thread_closeout_fallback pr=${obligation.prNumber} root=${obligation.rootCommentId}`,
+    )
+    const result = await send(
+      {
+        adapter: 'github',
+        workspace: obligation.workspace,
+        chat: `pr:${obligation.prNumber}`,
+        thread: obligation.rootCommentId,
+        text: GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT,
+      },
+      { source: 'system', outputKind: 'meta' },
+    )
+    if (!result.ok) {
+      logger.warn(`[channels] ${live.keyId}: github review-thread closeout fallback send failed: ${result.error}`)
+    }
+  }
+
+  const deferredPendingReviewRound = (live: LiveSession): GithubReviewFollowupRound | null => {
+    const round = live.githubReviewRound
+    if (round === null) return null
+    if (round.carrierThread === live.key.thread) return null
+    return isGithubReviewRoundPending(round, now) ? round : null
+  }
+
+  const isReviewStateUnknownDeferralActive = (closeout: GithubReviewThreadCloseout): boolean =>
+    closeout.deferUntil?.kind === 'review-state-unknown' && closeout.deferUntil.expiresAt > now()
+
+  const enforceGithubReviewThreadCloseout = async (live: LiveSession): Promise<void> => {
+    const closeout = live.githubReviewThreadCloseout
+    if (closeout === null || isAwaitingBackgroundChild(live, 'github-thread-closeout', closeout.startedAt)) {
+      return
+    }
+    if (isReviewStateUnknownDeferralActive(closeout)) {
+      if (!closeout.deferred) {
+        closeout.deferred = true
+        persistGithubReviewThreadCloseout(live, closeout)
+      }
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_deferred pr=${closeout.prNumber} root=${closeout.rootCommentId} reason=review_state_unknown expires_at=${closeout.deferUntil?.expiresAt}`,
+      )
+      return
+    }
+    const deferredRound = deferredPendingReviewRound(live)
+    if (deferredRound !== null) {
+      if (!closeout.deferred) {
+        closeout.deferred = true
+        persistGithubReviewThreadCloseout(live, closeout)
+      }
+      // Preserve the anti-strand obligation while the elected carrier acts, but
+      // do not convert a legitimate wait into participant-facing process noise.
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_deferred pr=${closeout.prNumber} root=${closeout.rootCommentId} round=${deferredRound.roundId}`,
+      )
+      return
+    }
+    if (live.skippedTurn?.turnSeq === live.turnSeq) live.skippedTurn = null
+    if (closeout.correctionAttempts === 0) {
+      closeout.correctionAttempts++
+      logger.warn(
+        `[channels] ${live.keyId} github_thread_closeout_retry attempt=1/1 pr=${closeout.prNumber} root=${closeout.rootCommentId}`,
+      )
+      live.pendingSystemReminders.push(
+        retryReminder(
+          `<system-reminder>\nThis session still owes a close-out on GitHub PR #${closeout.prNumber}, ` +
+            `review thread root comment ${closeout.rootCommentId}. Your previous turn sent no reply to that thread. ` +
+            `Call channel_reply now with an explicit resolve_review_thread choice: true if the concern is addressed, ` +
+            `or false to leave it open with the specific technical reason. Send exactly ONE participant-facing ` +
+            `close-out message with no narration about internal review rounds, carriers, sessions, verdict registration, ` +
+            `or sticky review state. Do not treat a PR-level verdict stand-down as satisfying this thread-level obligation.\n</system-reminder>`,
+        ),
+      )
+      return
+    }
+    await postGithubReviewThreadCloseoutFallback(live)
+  }
+
   // Resolve a fallback STAGED by a willingness-ack exhaustion path, run AFTER
   // maybeContinueTodosChannel so the idle/todo continuation has already had its
   // chance to queue a re-prompt (the mechanism that self-recovers the promised
@@ -3865,8 +4326,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const failoverGithubReviewRound = async (live: LiveSession): Promise<void> => {
     const round = live.githubReviewRound
-    if (round === null || isGithubReviewRoundComplete(round)) return
-    if (hasGithubReviewRoundDismissalAttempt(round)) {
+    if (round === null || isGithubReviewRoundComplete(round, now)) return
+    if (hasGithubReviewRoundDismissalAttempt(round, now)) {
       const key = githubReviewRoundKey(round)
       for (const sibling of Array.from(liveSessions.values())) {
         if (sibling.githubReviewRound !== null && githubReviewRoundKey(sibling.githubReviewRound) === key) {
@@ -3892,10 +4353,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         candidate.key.thread !== round.carrierThread,
     )
     const waiter = candidates
-      .filter((candidate) => canPromoteGithubReviewRoundTo(round, candidate.key.thread))
+      .filter((candidate) => canPromoteGithubReviewRoundTo(round, candidate.key.thread, now))
       .sort((a, b) => a.keyId.localeCompare(b.keyId))[0]
     if (waiter === undefined) {
-      const state = githubReviewRoundPersistence(round)
+      const state = githubReviewRoundPersistence(round, now)
       if (candidates.length === 0) {
         logger.warn(
           `[channels] github review round failover found no live waiter pr=${round.workspace}#${round.prNumber} head=${round.headSha} carrier=${round.carrierThread ?? 'root'}; retry the review after the round expires`,
@@ -3908,7 +4369,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return
     }
 
-    const promoted = promoteGithubReviewRound(round, waiter.key.thread)
+    const promoted = promoteGithubReviewRound(round, waiter.key.thread, now)
     if (promoted === null) return
     for (const sibling of Array.from(liveSessions.values())) {
       if (
@@ -3965,10 +4426,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
-  const stopCurrentChannelTurn = async (live: LiveSession): Promise<void> => {
+  const stopCurrentChannelTurn = async (live: LiveSession, reason: string): Promise<boolean> => {
     live.userStoppedTurnSeq = live.turnSeq
-    live.lastTerminalReplyAbort = null
-    live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'user_stop' }
+    live.lastTerminalReplyCompletion = null
+    live.pendingTerminalReplyStop = null
+    live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason }
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
     live.debounceTimer = null
     live.firstUnprocessedAt = 0
@@ -3988,13 +4450,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       stopReason: 'aborted',
     })
     await stopTypingHeartbeat(live)
+    let aborted = true
     try {
       await live.session.abort()
-      logger.info(`[channels] ${live.keyId}: command /stop aborted current turn`)
+      if (reason === 'user_stop') {
+        logger.info(
+          `[channels] ${live.keyId}: command /stop aborted current turn site=user_stop session=${live.sessionId} reason=user_stop`,
+        )
+      } else {
+        logger.info(
+          `[channels] ${live.keyId}: github PR turn aborted site=github_pr_abort session=${live.sessionId} reason=${JSON.stringify(reason)}`,
+        )
+      }
     } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describeError(err)}`)
+      aborted = false
+      if (reason === 'user_stop') {
+        logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describeError(err)}`)
+      } else {
+        logger.warn(
+          `[channels] ${live.keyId}: github PR turn abort failed reason=${JSON.stringify(reason)}: ${describeError(err)}`,
+        )
+      }
     }
     await awaitLatestTodoOutcomeWrite(live)
+    return aborted
   }
 
   // ensureLive() installs a session BEFORE the engage/observe decision, so a
@@ -4004,6 +4483,69 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // stopCurrentChannelTurn cancels: in-flight drain, queued prompts, reminders.
   const hasStoppableWork = (live: LiveSession): boolean =>
     live.draining || live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0
+
+  const abortGithubPrTurn = async (
+    workspace: string,
+    prNumber: number,
+    reason: string,
+  ): Promise<
+    | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+    | { kind: 'no-live-session' }
+  > => {
+    const chat = `pr:${prNumber}`
+    const matchesPr = (live: LiveSession): boolean =>
+      !live.destroyed && live.key.adapter === 'github' && live.key.workspace === workspace && live.key.chat === chat
+    const allPrSessions = Array.from(liveSessions.values()).filter(matchesPr)
+    const stoppableSessions = allPrSessions.filter(hasStoppableWork)
+
+    abortGithubReviewStateForPr(workspace, prNumber)
+    for (const live of allPrSessions) {
+      live.githubReviewRound = null
+      live.pendingGithubReviewRoundCloseout = null
+    }
+
+    const subagentAbort = (
+      options.cancelRunningSubagentsByWorkKey?.(githubReviewerWorkKey(workspace, prNumber), reason) ??
+      Promise.resolve({ matched: 0, cancelled: 0, failures: 0 })
+    ).catch((err) => {
+      logger.warn(
+        `[channels] github reviewer abort failed pr=${workspace}#${prNumber} reason=${JSON.stringify(reason)}: ${describeError(err)}`,
+      )
+      return { matched: 0, cancelled: 0, failures: 1 }
+    })
+    const sessionAborts = Promise.all(stoppableSessions.map((live) => stopCurrentChannelTurn(live, reason)))
+    const persistedRoundClear = (async (): Promise<void> => {
+      await ensureLoaded()
+      if (mappings === null) return
+      let changed = false
+      for (const [index, record] of mappings.entries()) {
+        if (record.adapter !== 'github' || record.workspace !== workspace || record.chat !== chat) continue
+        if (record.githubReviewRound === undefined) continue
+        const { githubReviewRound: _removed, ...rest } = record
+        void _removed
+        mappings[index] = rest
+        changed = true
+      }
+      if (changed) await persist()
+    })().catch((err) => {
+      logger.warn(`[channels] github review round clear failed pr=${workspace}#${prNumber}: ${describeError(err)}`)
+    })
+
+    const [sessionResults, subagentResult] = await Promise.all([sessionAborts, subagentAbort, persistedRoundClear])
+    const abortFailures = sessionResults.filter((succeeded) => !succeeded).length + subagentResult.failures
+    logger.info(
+      `[channels] github PR abort pr=${workspace}#${prNumber} sessions=${stoppableSessions.length} ` +
+        `reviewers=${subagentResult.matched} failures=${abortFailures} reason=${JSON.stringify(reason)}`,
+    )
+    return stoppableSessions.length === 0 && subagentResult.matched === 0
+      ? { kind: 'no-live-session' }
+      : {
+          kind: 'aborted',
+          matchedSessions: stoppableSessions.length,
+          matchedReviewers: subagentResult.matched,
+          abortFailures,
+        }
+  }
 
   const hasPendingContinueReply = (live: LiveSession): boolean => {
     const progressReply = live.continueReplyTurn
@@ -4129,8 +4671,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.qualifyingWorkThisLogicalTurn = false
   }
 
-  const drain = async (live: LiveSession): Promise<void> => {
-    if (live.draining || live.destroyed) return
+  const runDrain = async (live: LiveSession): Promise<void> => {
     live.draining = true
     try {
       // `!live.pendingTeardown`: once a reload marks this draining session for
@@ -4195,7 +4736,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.currentTurnReactionRef = batch[batch.length - 1]!.reactionRef ?? null
           const trigger = batch[batch.length - 1]!
           if (trigger.githubReviewRound !== undefined) {
-            live.githubReviewRound = registerGithubReviewRound(trigger.githubReviewRound)
+            live.githubReviewRound = registerGithubReviewRound(trigger.githubReviewRound, now(), now)
           }
           live.currentTurnExplicitlyAddressed =
             trigger.isDm || trigger.isBotMention || trigger.replyToBotMessageId !== null
@@ -4218,6 +4759,32 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.emptyStopAfterToolWorkArmed = false
           live.willingnessNudges = 0
           live.logicalTurnStartedAt = now()
+          const stampedCloseout = batch.findLast((item) => item.githubReviewThreadCloseout !== undefined)
+          const deferredCloseout =
+            stampedCloseout?.githubReviewThreadCloseout === undefined &&
+            live.githubReviewThreadCloseout !== null &&
+            live.githubReviewThreadCloseout.deferred
+              ? live.githubReviewThreadCloseout
+              : null
+          live.githubReviewThreadCloseout =
+            stampedCloseout?.githubReviewThreadCloseout !== undefined
+              ? {
+                  ...stampedCloseout.githubReviewThreadCloseout,
+                  startedAt: live.logicalTurnStartedAt,
+                  correctionAttempts: 0,
+                  deferred: false,
+                }
+              : deferredCloseout === null
+                ? null
+                : {
+                    ...deferredCloseout,
+                    startedAt: live.logicalTurnStartedAt,
+                    correctionAttempts: 0,
+                  }
+          if (stampedCloseout?.githubReviewThreadCloseout !== undefined) {
+            persistGithubReviewThreadCloseout(live, null)
+          }
+          live.githubReviewThreadCloseoutDecisionTurn = null
           // A fresh batch supersedes a still-pending staged fallback. That staged
           // turn produced no usable reply, so it must not leave the PRIOR turn's
           // committed lastQuestionSignal behind — otherwise the new question would
@@ -4229,6 +4796,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             live.stagedFallbackCause = null
           }
           live.abortReasonThisTurn = null
+          live.pendingTerminalReplyStop = null
           live.userStoppedTurnSeq = null
           live.nextPromptMaxTokens = undefined
           // Cleared with the retry budgets (NOT beside resetReviewTurn below) so a
@@ -4279,6 +4847,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           systemReminders: reminders.map((r) => r.text),
           role: liveRole,
         })
+
+        const repairedToolCalls = repairDanglingToolUseBranch(live.session, now())
+        if (repairedToolCalls.length > 0) {
+          logger.warn(
+            `[channels] ${live.keyId} branch_repair=missing_tool_result session=${live.sessionId} ` +
+              `count=${repairedToolCalls.length} tools=${repairedToolCalls.join(',')}`,
+          )
+        }
 
         // Bracketing logs around the LLM call so a hung prompt() is
         // diagnosable from logs alone (we see prompting without prompted).
@@ -4406,26 +4982,36 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           // pendingTeardown carry moves them to the reload successor.
           flushSteerBufferToQueue(live)
           const sentReplyThisTurn = live.successfulChannelSends > successfulSendsBeforePrompt
-          // The engage reaction is a transient "working" signal. A configured
-          // progress reaction must remain present across reminder-only retries,
-          // then be removed before the terminal reaction is added; Kakao uses
-          // ACTION as a toggle, so ordering is correctness-critical.
+          // The eager :eyes: ack is a "looking at this" signal, not a "replied"
+          // one, so it comes off at turn end no matter the outcome — a reply, but
+          // also silence, skip_response, an empty turn, or a provider error
+          // (observe-after-engage). Leaving it only on the reply path stranded the
+          // ack permanently on messages the agent looked at but never answered.
+          // One exception: a configured progress reaction is the turn's "working"
+          // signal and must remain present across reminder-only retries, then be
+          // removed before the terminal reaction is added; Kakao uses ACTION as a
+          // toggle, so ordering is correctness-critical.
+          const progressConfig = progressConfigFor(live)
+          const progressReactionConfigured =
+            progressConfig?.enabled === true && progressConfig.startReaction !== undefined
           const retryQueuedThisTurn =
             live.emptyTurnRetries > emptyTurnRetriesBeforePrompt ||
             live.toolLeakRetries > toolLeakRetriesBeforePrompt ||
             live.willingnessNudges > willingnessNudgesBeforePrompt
-          const progressConfig = progressConfigFor(live)
-          const progressReactionConfigured =
-            progressConfig?.enabled === true && progressConfig.startReaction !== undefined
-          const dropDone =
-            progressReactionConfigured && retryQueuedThisTurn
-              ? Promise.resolve()
-              : dropEngageReactions(live, engageAddPromises)
+          const keepProgressForRetry = progressReactionConfigured && retryQueuedThisTurn
+          const dropDone = keepProgressForRetry ? Promise.resolve() : dropEngageReactions(live, engageAddPromises)
+          // A turn whose output landed outside the channel or was deferred to a
+          // background child leaves a persistent :eyes:. On a typing-less adapter
+          // it reuses the transient engage reaction's message/emoji/actor, so wait
+          // for that removal to reach the adapter before adding the persistent one.
+          // A progress turn ending normally also awaits: the terminal reaction
+          // must not race the progress reaction's removal on a toggle-only adapter.
           if (live.silentAckTurn?.turnSeq === live.turnSeq || (progressReactionConfigured && !retryQueuedThisTurn)) {
             await dropDone
           } else {
             void dropDone
           }
+          if (!keepProgressForRetry) reactOnSilentAck(live)
           // Held channel_react reactions apply only when the agent posted a
           // genuine reply this turn — NOT an empty-turn fallback or provider-
           // error notice, both of which send via source:'system' and bump
@@ -4531,6 +5117,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             sentReplyThisTurn && !live.promisedWorkOutstandingThisLogicalTurn,
             retryQueuedThisTurn,
           )
+          // Provider notices own the first terminal output opportunity. A notice
+          // that lands on the owed thread clears the obligation through send();
+          // a suppressed or failed notice leaves it intact for this bounded net.
+          await enforceGithubReviewThreadCloseout(live)
           await fireSessionTurnEnd(live)
         }
         await fireSessionIdle(live)
@@ -4593,9 +5183,47 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const carriedInbounds = live.promptQueue.splice(0, live.promptQueue.length)
       const carriedObserved = live.contextBuffer.splice(0, live.contextBuffer.length)
       const carriedReminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
+      const hasCarriedWork = carriedInbounds.length > 0 || carriedObserved.length > 0 || carriedReminders.length > 0
+      const retained =
+        hasCarriedWork && retainReloadHandoff(live.key, carriedInbounds, carriedObserved, carriedReminders)
       liveSessions.delete(live.keyId)
       await tearDownLive(live)
-      await handOffToSuccessor(live.key, carriedInbounds, carriedObserved, carriedReminders)
+      if (retained) await handOffToSuccessor(live.key)
+    }
+  }
+
+  // No-op while a drain already owns the session: that loop re-checks both
+  // queues every iteration, so work landing behind it is picked up without a
+  // second concurrent drain. Registers the running invocation on `activeDrains`
+  // so `settleDrains` can await a turn started fire-and-forget.
+  const drain = (live: LiveSession): Promise<void> => {
+    if (live.draining || live.destroyed) return Promise.resolve()
+    const running = runDrain(live)
+    // Attaching this handler marks `running` handled, so a drain-tail throw can
+    // no longer reach the runtime's unhandled-rejection reporter — every
+    // production call site is `void drain(live)` and catches nothing. Log it
+    // here so the failure stays visible rather than disappearing into the
+    // tracking. The settlement copy must still RESOLVE: `settleDrains` waits on
+    // unrelated turns too, and one failed drain must not reject a waiter that
+    // has nothing to do with it. Callers keep `running`, so an awaiting caller
+    // still sees the original rejection.
+    const settled = running.then(
+      () => undefined,
+      (err: unknown) => {
+        logger.error(`[channels] ${live.keyId}: drain failed: ${describeError(err)}`)
+      },
+    )
+    live.activeDrains.add(settled)
+    void settled.then(() => live.activeDrains.delete(settled))
+    return running
+  }
+
+  // Resolves once no drain is running. Loops because a drain's post-`draining`
+  // tail can start a rival, and because work queued during one turn opens the
+  // next; a snapshot `Promise.all` would return with that successor in flight.
+  const settleDrains = async (live: LiveSession): Promise<void> => {
+    while (live.activeDrains.size > 0) {
+      await Promise.all(live.activeDrains)
     }
   }
 
@@ -4605,33 +5233,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // were enqueued while draining), so they are transplanted straight onto the
   // fresh session's queues rather than re-routed through route() — re-routing
   // would re-run the claim/command/permission gates and re-derive engagement
-  // from a lossy QueuedInbound projection. Best-effort: a recreate failure logs
-  // and drops the batch rather than throwing out of the predecessor's drain.
-  const handOffToSuccessor = async (
-    key: ChannelKey,
-    inbounds: QueuedInbound[],
-    observed: ObservedInbound[],
-    reminders: PendingSystemReminder[],
-  ): Promise<void> => {
-    // Observed context alone is carried too: observe() can buffer post-reload
-    // messages onto contextBuffer with no queued prompt, and dropping them would
-    // lose the successor's "recent context". Only skip when nothing at all was
-    // carried.
-    if (inbounds.length === 0 && reminders.length === 0 && observed.length === 0) return
-    let successor: LiveSession
+  // from a lossy QueuedInbound projection. The batch is retained BEFORE the
+  // recreate attempt so a timeout leaves it available to the next successful
+  // ensureLive rather than dropping the user's messages at the handoff seam.
+  const handOffToSuccessor = async (key: ChannelKey): Promise<void> => {
     try {
-      successor = await ensureLive(key)
+      await ensureLive(key)
     } catch (err) {
-      logger.warn(`[channels] ${channelKeyId(key)}: successor recreate after reload failed: ${describeError(err)}`)
-      return
+      logger.warn(
+        `[channels] ${channelKeyId(key)}: successor recreate after reload failed; queued work retained for the next successful session: ${describeError(err)}`,
+      )
     }
-    if (successor.destroyed) return
-    successor.promptQueue.push(...inbounds)
-    successor.contextBuffer.push(...observed)
-    successor.pendingSystemReminders.push(...reminders)
-    // Observed-only context is NOT a turn trigger — it waits on contextBuffer for
-    // a real inbound. Drain only when there is actual work (a prompt or reminder).
-    if ((inbounds.length > 0 || reminders.length > 0) && !successor.draining) void drain(successor)
   }
 
   const scheduleDebouncedDrain = (live: LiveSession): void => {
@@ -5088,7 +5700,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     clearQueuedEngageReactions(live)
     live.promptQueue.push(toQueuedInbound(event, engageReaction))
     if (event.githubReviewRound !== undefined) {
-      live.githubReviewRound = registerGithubReviewRound(event.githubReviewRound)
+      live.githubReviewRound = registerGithubReviewRound(event.githubReviewRound, now(), now)
       persistGithubReviewRound(live, live.githubReviewRound)
     }
     // Make the typing anchor live BEFORE startTypingHeartbeat fires (route()
@@ -5119,6 +5731,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     isDm: event.isDm,
     ...(event.typingThread !== undefined ? { typingThread: event.typingThread } : {}),
     ...(event.githubReviewRound !== undefined ? { githubReviewRound: event.githubReviewRound } : {}),
+    ...(event.githubReviewThreadCloseout !== undefined
+      ? { githubReviewThreadCloseout: event.githubReviewThreadCloseout }
+      : {}),
     receivedAt: now(),
     ts: event.ts,
   })
@@ -5571,7 +6186,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // its persistent :eyes: is added strictly AFTER the transient one is removed
   // (see reactOnSilentAck). Fire-and-forget callers just `void` the result.
   const dropEngageReactions = (live: LiveSession, addPromises: Array<Promise<ReactionRef | null>>): Promise<void> => {
-    return Promise.all(addPromises.map((addPromise) => dropOneEngageReaction(live, addPromise))).then(() => undefined)
+    return Promise.all(addPromises.map((addPromise) => dropOneEngageReaction(live.key, addPromise))).then(
+      () => undefined,
+    )
   }
 
   // Only the LAST engaging inbound of a coalesced batch should carry the eager
@@ -5586,29 +6203,35 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     void dropEngageReactions(live, addPromises)
   }
 
-  const dropOneEngageReaction = (live: LiveSession, addPromise: Promise<ReactionRef | null>): Promise<void> => {
+  const dropPendingReloadHandoffEngageReactions = (pending: PendingReloadHandoff): Promise<void> => {
+    const addPromises = pending.inbounds.flatMap((item) =>
+      item.engageReaction !== undefined ? [item.engageReaction] : [],
+    )
+    for (const item of pending.inbounds) delete item.engageReaction
+    return Promise.all(addPromises.map((addPromise) => dropOneEngageReaction(pending.key, addPromise))).then(
+      () => undefined,
+    )
+  }
+
+  const dropOneEngageReaction = (key: ChannelKey, addPromise: Promise<ReactionRef | null>): Promise<void> => {
     return addPromise
       .then((reactionRef) => {
         if (reactionRef === null) return undefined
         return removeReaction({
-          adapter: live.key.adapter,
-          workspace: live.key.workspace,
-          chat: live.key.chat,
-          thread: live.key.thread,
+          adapter: key.adapter,
+          workspace: key.workspace,
+          chat: key.chat,
+          thread: key.thread,
           reactionRef,
         })
       })
       .then((result) => {
         if (result && !result.ok && result.code !== 'unsupported' && result.code !== 'not-found') {
-          logger.info(
-            `[channels] engage-unreact failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
-          )
+          logger.info(`[channels] engage-unreact failed adapter=${key.adapter} chat=${key.chat}: ${result.error}`)
         }
       })
       .catch((err) => {
-        logger.info(
-          `[channels] engage-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
-        )
+        logger.info(`[channels] engage-unreact threw adapter=${key.adapter} chat=${key.chat}: ${describeError(err)}`)
       })
   }
 
@@ -6051,6 +6674,35 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       accountingTarget.thread === (msg.thread ?? null)
     const keyId = channelKeyId(accountingTarget)
     const live = liveSessions.get(keyId)
+    // Credit sticky where the reply was PUBLISHED, not where it was accounted.
+    // The two diverge when a caller answers from one sub-surface but publishes
+    // to another in the same room — `postDuplicateRequestChangesComment` sends
+    // with `thread: null` while passing the review-thread session as
+    // `accountingTarget`. An inbound is keyed from its OWN tuple, so the human's
+    // follow-up consumes the root key and finds nothing: the reply was observed
+    // and silently dropped.
+    //
+    // Delivery-only, not both. A dual grant cannot be undone atomically —
+    // `clearSticky` clears one key, so `channel_disengage` on the originating
+    // thread would strand the root credit. It also buys nothing here: GitHub
+    // review-comment inbounds set `suppressSticky`, so they never reach the
+    // sticky gate and engage via `replyToBotMessageId` instead.
+    //
+    // Same adapter/workspace/chat only. `targets` are authors of the ACCOUNTING
+    // turn and author ids are namespaced per adapter, so redirecting a genuine
+    // cross-channel send would credit ids that cannot appear in that room.
+    const stickyGrantKeyId =
+      !deliveryMatchesAccounting &&
+      accountingTarget.adapter === msg.adapter &&
+      accountingTarget.workspace === msg.workspace &&
+      accountingTarget.chat === msg.chat
+        ? channelKeyId({
+            adapter: msg.adapter,
+            workspace: msg.workspace,
+            chat: msg.chat,
+            thread: msg.thread ?? null,
+          })
+        : keyId
     const sendKey = consecutiveSendKey(accountingTarget.chat, accountingTarget.thread)
     // An explicit final-progress delivery owns the rest of this prompt's
     // progress lifecycle. Mark it before any await so late tool lifecycle
@@ -6123,7 +6775,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const count = (live.policyDeniedToolSendsThisTurn.get(sendKey) ?? 0) + 1
         live.policyDeniedToolSendsThisTurn.set(sendKey, count)
         if (count >= MAX_POLICY_DENIED_CHANNEL_SENDS_PER_TURN) {
-          logger.warn(`[channels] ${live.keyId}: aborting turn — ${count} policy-denied channel sends (last: ${code})`)
+          logger.warn(
+            `[channels] ${live.keyId}: aborting turn — ${count} policy-denied channel sends (last: ${code}) site=policy_denied_send_cap session=${live.sessionId} reason=policy_denied:${code}`,
+          )
           live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: `policy_denied:${code}` }
           if (live.session.agent.signal?.aborted !== true) live.session.agent.abort()
         }
@@ -6296,7 +6950,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
         }
         if (targets.size > 0) {
-          grantStickyForReplyTargets(stickyLedger, keyId, Array.from(targets), adapterConfig.engagement, now())
+          grantStickyForReplyTargets(
+            stickyLedger,
+            stickyGrantKeyId,
+            Array.from(targets),
+            adapterConfig.engagement,
+            now(),
+          )
         }
       }
       const turnCount = live.consecutiveSends.get(sendKey) ?? 0
@@ -6316,24 +6976,67 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
-  // The turn ended via the terminal-reply abort. If that reply promised to keep
+  // The turn ended via terminal channel_reply completion. If that reply promised to keep
   // working but omitted `more_work_this_turn: true`, queue ONE reminder-only re-prompt so
-  // the model gets a second chance to actually do it. The abort already fired
-  // (safe default preserved); this only adds an optional nudge. Bounded by
+  // the model gets a second chance to actually do it. The tool batch already
+  // terminated (safe default preserved); this only adds an optional nudge. Bounded by
   // MAX_WILLINGNESS_NUDGES and gated on `promptQueue` being empty so a real
   // inbound that coalesced into this turn is never answered with a stale nudge.
   const maybeNudgeContinuationWillingness = (live: LiveSession): void => {
-    const record = live.lastTerminalReplyAbort
-    live.lastTerminalReplyAbort = null
+    const record = live.lastTerminalReplyCompletion
+    live.lastTerminalReplyCompletion = null
     if (record === null || record.turnSeq !== live.turnSeq) return
+    if (live.githubReviewThreadCloseout !== null || live.githubReviewThreadCloseoutDecisionTurn === live.turnSeq) {
+      return
+    }
     if (live.willingnessNudges >= MAX_WILLINGNESS_NUDGES) return
     if (live.promptQueue.length > 0) return
+    if (record.text === undefined) return
     if (!detectContinuationWillingness(record.text)) return
     live.willingnessNudges++
     logger.info(
       `[channels] ${live.keyId} willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES}`,
     )
     live.pendingSystemReminders.push(retryReminder(WILLINGNESS_NUDGE))
+  }
+
+  const armRetainedOutputAckIfEligible = (
+    live: LiveSession,
+    successfulSendsBeforePrompt: number,
+    explicitlySkipped: boolean,
+  ): boolean => {
+    // A formal GitHub review is user-facing output delivered outside the channel.
+    // Preserve its acknowledgement even when the model closes the turn through
+    // skip_response after publishing the review.
+    if (
+      live.githubReviewOutputTurn === live.turnSeq &&
+      live.successfulChannelSends === successfulSendsBeforePrompt &&
+      live.currentTurnAuthorId !== null
+    ) {
+      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=github_review_output_this_turn`)
+      armSilentTurnAck(live, 'github_review_output')
+      return true
+    }
+
+    // An active child means delivery is deferred rather than dropped. Normally a
+    // completed prose leaf still goes through reply recovery, but skip_response is
+    // authoritative: its prose is intentionally discarded, while the progress
+    // acknowledgement must remain until the child reports back.
+    const awaitLeaf = recoverableAssistantText(live.session)
+    const awaitLeafIsUnfinishedToolUse = awaitLeaf?.source === 'mid-turn' || awaitLeaf?.source === 'pre-tool'
+    if (
+      live.currentTurnAuthorId !== null &&
+      (explicitlySkipped ||
+        awaitLeaf === null ||
+        awaitLeafIsUnfinishedToolUse ||
+        endsWithNoReplySignal(awaitLeaf.text)) &&
+      isAwaitingBackgroundChild(live, 'empty_turn_recovery')
+    ) {
+      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=awaiting_background_child`)
+      armSilentTurnAck(live, 'awaiting_background_child')
+      return true
+    }
+    return false
   }
 
   const validateChannelTurn = async (live: LiveSession, successfulSendsBeforePrompt: number): Promise<void> => {
@@ -6353,8 +7056,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.skippedTurn !== null && live.skippedTurn.turnSeq === live.turnSeq && !skipContested) {
       const { reason } = live.skippedTurn
       live.skippedTurn = null
+      armRetainedOutputAckIfEligible(live, successfulSendsBeforePrompt, true)
       logger.info(`[channels] ${live.keyId} skipped_by_tool reason=${JSON.stringify(reason)}`)
-      armSilentTurnAck(live, 'skip_response')
       void dropContinuationReactions(live)
       return
     }
@@ -6368,49 +7071,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.stagedFallbackCause = { cause, sendCountAtStage: live.successfulChannelSends }
     }
 
-    // A formal GitHub review already landed this logical turn (APPROVE /
-    // REQUEST_CHANGES / COMMENT, stamped via noteGithubReviewOutput). That review IS
-    // the turn's user-facing output — it just went through the GitHub review API, not
-    // channel_reply/channel_send, so `successfulChannelSends` never moved. An empty
-    // completion afterward is the agent legitimately having nothing more to say, NOT
-    // a dead turn: skip the empty-turn retries AND the "I got stuck" fallback and
-    // treat it as silent completion. Gated on no channel send this turn so a turn
-    // that ALSO replied in-channel still runs the normal reply-recovery below.
-    if (
-      live.githubReviewOutputTurn === live.turnSeq &&
-      live.successfulChannelSends === successfulSendsBeforePrompt &&
-      live.currentTurnAuthorId !== null
-    ) {
-      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=github_review_output_this_turn`)
-      armSilentTurnAck(live, 'github_review_output')
-      return
-    }
-
-    // A background child spawned by this session is still running, and the turn
-    // produced no user-facing output. That is `spawn_subagent`'s contract being
-    // honored ("you will receive a system-reminder when it completes"), not the
-    // empty-completion degeneration every branch below exists to repair — so the
-    // recovery ladder must not manufacture the status prose the model
-    // deliberately withheld. Each nudge re-enters with the child STILL running,
-    // so the budgets stack (MAX_EMPTY_TURN_RETRIES + MAX_WILLINGNESS_NUDGES) into
-    // several "still working…" messages for one request; on GitHub, where a
-    // channel reply IS a public PR comment, that shipped as duplicate review
-    // acknowledgements. The completion reminder re-wakes this session with the
-    // real result, so silence here is delivery deferred, not delivery dropped.
-    // Bounded by the same stuck-child backstop as GC/rollover: a wedged child
-    // stops pinning and the normal ladder resumes. A leaf carrying real text is
-    // deliberately NOT covered — recovering an answer the model already wrote is
-    // still correct while a child runs.
     const awaitLeaf = recoverableAssistantText(live.session)
-    if (
-      live.currentTurnAuthorId !== null &&
-      (awaitLeaf === null || endsWithNoReplySignal(awaitLeaf.text)) &&
-      isAwaitingBackgroundChild(live, 'empty_turn_recovery')
-    ) {
-      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=awaiting_background_child`)
-      armSilentTurnAck(live, 'awaiting_background_child')
-      return
-    }
+    if (armRetainedOutputAckIfEligible(live, successfulSendsBeforePrompt, false)) return
 
     // Suppress a leaked tool call (never post the plumbing) and, while budget
     // remains, push a self-correction reminder so the same logical turn
@@ -6433,6 +7095,49 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
     }
 
+    const retryStrandedToolUse = async (cause: string, exhaustedCause: string): Promise<void> => {
+      if (live.emptyTurnRetries < MAX_EMPTY_TURN_RETRIES) {
+        live.emptyTurnRetries++
+        const routerAbortReason =
+          live.abortReasonThisTurn !== null && live.abortReasonThisTurn.turnSeq === live.turnSeq
+            ? live.abortReasonThisTurn.reason
+            : undefined
+        const agentAbortReason =
+          live.session.agent.signal?.aborted === true ? live.session.getAbortReason?.() : undefined
+        const abortReason = routerAbortReason ?? agentAbortReason ?? 'unknown'
+        logger.warn(
+          `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
+            `cause=${cause} abort_reason=${abortReason}`,
+        )
+        live.pendingSystemReminders.push(retryReminder(STRANDED_TOOLUSE_CONTINUATION_NUDGE))
+        return
+      }
+      await postEmptyTurnFallback(live, exhaustedCause)
+    }
+
+    // A real asker who received nothing cannot distinguish unfinished tool-use
+    // narration from a completed answer. Posting that scratchpad can falsely
+    // claim completion in the wrong language or before the tool result is
+    // interpreted; treating it as deliberate silence strands the asker instead.
+    // Keep both textless and text-bearing unfinished shapes on the established
+    // bounded continuation ladder, while explicit NO_REPLY, queued fresh input,
+    // observation-only turns, and every earlier delivery-deferred guard retain
+    // their narrower silence contracts.
+    const unfinishedToolUse = awaitLeaf
+    const unfinishedToolUseWithoutReply =
+      unfinishedToolUse !== null &&
+      (unfinishedToolUse.source === 'mid-turn' || unfinishedToolUse.source === 'pre-tool') &&
+      (unfinishedToolUse.text.trim() === '' || !endsWithNoReplySignal(unfinishedToolUse.text))
+    if (
+      unfinishedToolUseWithoutReply &&
+      live.successfulChannelSends === successfulSendsBeforePrompt &&
+      live.currentTurnAuthorId !== null &&
+      live.promptQueue.length === 0
+    ) {
+      await retryStrandedToolUse('stranded_toolUse_without_send', 'stranded_toolUse_without_send_retries_exhausted')
+      return
+    }
+
     // A send landed this turn, but the model may have posted a `more_work_this_turn: true`
     // progress reply, kept working, then ENDED with its final answer as plain
     // prose — never calling a channel tool again. The terminal-reply abort fires
@@ -6444,6 +7149,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // the send is narration the model emitted with/before the reply that already
     // landed — suppress it, as before.
     if (live.successfulChannelSends > successfulSendsBeforePrompt) {
+      const terminalReplyCompletedThisTurn = live.lastTerminalReplyCompletion?.turnSeq === live.turnSeq
       maybeNudgeContinuationWillingness(live)
 
       // A `channel_reply({ more_work_this_turn: true })` progress ack landed this turn (the
@@ -6469,6 +7175,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (
         live.promptQueue.length === 0 &&
         live.currentTurnAuthorId !== null &&
+        live.githubReviewThreadCloseout === null &&
+        live.githubReviewThreadCloseoutDecisionTurn !== live.turnSeq &&
         live.continueReplyTurn?.turnSeq === live.turnSeq &&
         live.continueReplyTurn.sendCount === live.successfulChannelSends &&
         isFreshEmptyStopAfterSend(live) &&
@@ -6491,7 +7199,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // then an EMPTY `stop` leaf: the model computed the answer in its reasoning
       // / tool results but never sent it (the Kimi/Fireworks empty-completion
       // flake). `maybeNudgeContinuationWillingness` above can't catch this — it
-      // reads `lastTerminalReplyAbort`, which only a `channel_reply` sets;
+      // reads `lastTerminalReplyCompletion`, which only a `channel_reply` sets;
       // `channel_send` keeps the turn alive and stamps nothing. And the
       // stranded-toolUse retry below requires `source !== 'leaf'`, but an empty
       // `stop` leaf recovers as `source: 'leaf'`, so this shape would otherwise
@@ -6509,7 +7217,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // batch — so injecting a stale recovery nudge would prepend it to a live user
       // message. Skip the nudge AND the fallback in that case and let the trailing
       // recovery below run; the queued inbound supersedes this turn's silence.
-      if (live.promptQueue.length === 0 && live.currentTurnAuthorId !== null && isEmptyStopAfterWillingnessAck(live)) {
+      if (
+        live.promptQueue.length === 0 &&
+        live.currentTurnAuthorId !== null &&
+        live.githubReviewThreadCloseout === null &&
+        live.githubReviewThreadCloseoutDecisionTurn !== live.turnSeq &&
+        isEmptyStopAfterWillingnessAck(live)
+      ) {
         if (live.willingnessNudges < MAX_WILLINGNESS_NUDGES) {
           live.willingnessNudges++
           logger.warn(
@@ -6522,6 +7236,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         return
       }
+
+      // A terminal channel_reply now ends the SDK tool batch with
+      // ToolResult.terminate after its matching result is persisted. The leaf
+      // therefore has the same toolResult-under-toolUse shape as genuinely
+      // stranded post-status work, but this turn already delivered its final
+      // answer and explicitly terminated. The 2026-08-28 Discord incident
+      // crossed this distinction: validation re-prompted the completed turn as
+      // `stranded_toolUse_after_send`, then subsequent inbounds accumulated on
+      // the failed recovery branch. Keep willingness nudges queued above, but do
+      // not send terminal completion through stranded-work recovery.
+      if (terminalReplyCompletedThisTurn) return
 
       const trailing = recoverableAssistantText(live.session)
       if (trailing === null || trailing.source !== 'leaf') {
@@ -6540,27 +7265,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // that accompanied the already-landed reply); only the no-prose strand
         // gets a retry-or-fallback.
         if (leafIsStrandedToolUse(live.session) && live.currentTurnAuthorId !== null) {
-          if (live.emptyTurnRetries < MAX_EMPTY_TURN_RETRIES) {
-            live.emptyTurnRetries++
-            const routerAbortReason =
-              live.abortReasonThisTurn !== null && live.abortReasonThisTurn.turnSeq === live.turnSeq
-                ? live.abortReasonThisTurn.reason
-                : undefined
-            const agentAbortReason =
-              live.session.agent.signal?.aborted === true ? live.session.getAbortReason?.() : undefined
-            const abortReason = routerAbortReason ?? agentAbortReason ?? 'unknown'
-            logger.warn(
-              `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
-                `cause=stranded_toolUse_after_send abort_reason=${abortReason}`,
-            )
-            live.pendingSystemReminders.push(retryReminder(STRANDED_TOOLUSE_CONTINUATION_NUDGE))
-          } else {
-            await postEmptyTurnFallback(live, 'stranded_toolUse_retries_exhausted')
-          }
+          await retryStrandedToolUse('stranded_toolUse_after_send', 'stranded_toolUse_retries_exhausted')
         }
         return
       }
       if (live.session.sessionManager.getLeafEntry()?.id === live.lastSendLeafId) return
+    }
+
+    if (unfinishedToolUseWithoutReply) {
+      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=unfinished_toolUse_continuation_ineligible`)
+      return
     }
 
     let candidate = recoverableAssistantText(live.session)
@@ -6760,7 +7474,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
       const leakedReasoning = !isNoReplySignal(assistantText)
       logger.info(`[channels] ${live.keyId} no_reply${leakedReasoning ? ' (with_leaked_reasoning)' : ''}`)
-      armSilentTurnAck(live, 'no_reply')
       void dropContinuationReactions(live)
       return
     }
@@ -6806,7 +7519,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       logger.warn(
         `[channels] ${live.keyId}: suppressed plain_text_tool_call_leak (silent) text_len=${assistantText.length}`,
       )
-      armSilentTurnAck(live, 'skip_response_text_leak')
       return
     }
     if (plainTextToolCallKind === 'suppress-warn') {
@@ -6842,21 +7554,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       assistantText = extracted
     }
 
-    // `source` distinguishes the three recovery shapes for log triage:
+    // `source` distinguishes the completed recovery shapes for log triage:
     //   - 'leaf': the assistant message IS the leaf with stopReason 'stop'
     //     (existing behavior; model ended its turn with text but forgot to
     //     call channel_reply).
-    //   - 'mid-turn': the assistant message IS the leaf with stopReason
-    //     'toolUse'; the model narrated a reply, committed to a tool plan, and
-    //     the turn ended before a follow-up that would have called a channel
-    //     tool was persisted. The narration is the only user-facing text.
-    //   - 'pre-tool': the leaf is a toolResult (or other non-assistant entry)
-    //     and the assistant message lives upstream in the branch. This is the
-    //     Kimi-on-Fireworks `kimi-k2p6-turbo` failure mode where the post-tool
-    //     follow-up LLM call never produced a persisted assistant message, so
-    //     the model's pre-tool commentary is the only user-facing text we have.
-    //     Recovering it means the user gets *something* — strictly better than
-    //     the historical silent drop.
+    //   - 'length-leaf': the assistant message hit the output cap, leaked
+    //     reasoning was stripped, and a complete-looking answer survived.
+    // Unfinished 'mid-turn' / 'pre-tool' prose never reaches this egress: the
+    // terminal gate above either continues an eligible turn or preserves the
+    // silence contract that made continuation ineligible.
     // Egress-level GitHub review guards. The false-receipt and re-review
     // stranding guards live inside the channel_reply / channel_send tool
     // handlers, but recovery surfaces trailing assistant prose through a
@@ -7012,8 +7718,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.unsubTodoOutcome?.()
     live.unsubTodoOutcome = null
     await stopTypingHeartbeat(live)
+    // Captured before the abort call: `draining` flips false in drain()'s own
+    // finally once the turn it was guarding ends, so reading it here is the
+    // only reliable signal that this teardown cut off a turn actually in
+    // flight rather than an already-idle session.
+    const abortedInFlightTurn = live.draining
     try {
       await live.session.abort()
+      if (abortedInFlightTurn) {
+        logger.warn(`[channels] ${live.keyId} abort site=teardown session=${live.sessionId} reason=teardown`)
+      }
     } catch (err) {
       logger.warn(`[channels] abort failed for ${live.keyId}: ${describeError(err)}`)
     }
@@ -7033,6 +7747,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const runIdleGc = async (): Promise<void> => {
+    await expirePendingReloadHandoffs()
+    for (const live of liveSessions.values()) {
+      const closeout = live.githubReviewThreadCloseout
+      const round = live.githubReviewRound
+      if (live.destroyed || closeout === null) continue
+      const unknownStateExpired =
+        closeout.deferUntil?.kind === 'review-state-unknown' && closeout.deferUntil.expiresAt <= now()
+      if (round === null && !unknownStateExpired) continue
+      if (round?.carrierThread === live.key.thread) continue
+      if (live.draining || live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) continue
+      if (deferredPendingReviewRound(live) !== null) continue
+      if (isAwaitingBackgroundChild(live, 'github-thread-closeout-release', closeout.startedAt)) continue
+      const reason =
+        round === null
+          ? 'review_state_unknown_expired'
+          : isGithubReviewRoundComplete(round, now)
+            ? 'round_completed'
+            : 'round_expired'
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_released pr=${closeout.prNumber} root=${closeout.rootCommentId}${round === null ? '' : ` round=${round.roundId}`} reason=${reason}`,
+      )
+      await enforceGithubReviewThreadCloseout(live)
+      if (!live.draining && live.pendingSystemReminders.length > 0) void drain(live)
+    }
     const t = now()
     const victims: LiveSession[] = []
     for (const live of Array.from(liveSessions.values())) {
@@ -7067,6 +7805,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (gcTimer) clearInterval(gcTimer)
     gcTimer = null
     liveGeneration++
+    const pendingHandoffs = Array.from(pendingReloadHandoffs.values())
+    pendingReloadHandoffs.clear()
+    for (const pending of pendingHandoffs) {
+      await reportDiscardedReloadHandoff(pending, 'router stopped before replay could complete')
+    }
     const all = Array.from(liveSessions.values())
     liveSessions.clear()
     for (const live of all) {
@@ -7128,6 +7871,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
       await live.session
         .abort()
+        .then(() => {
+          logger.warn(
+            `[channels] ${live.keyId} abort site=graceful_restart session=${live.sessionId} reason=graceful_restart`,
+          )
+        })
         .catch((err) => logger.error(`[channels] graceful-restart abort failed: ${describeError(err)}`))
     }
   }
@@ -7388,9 +8136,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (resolved.kind === 'ambiguous') {
         return { kind: 'ambiguous', matchCount: resolved.count }
       }
-      // A resolved session that isn't actually running has nothing for /stop to
-      // cancel; report it as no-live-session so bystander agents stay silent.
-      if (lowered === 'stop' && !hasStoppableWork(resolved.session)) {
+      // Slack broadcasts slash commands to every installed app, so an idle
+      // fallback/observe-only session must stay silent instead of claiming it
+      // stopped work. Discord interactions are delivered only to the selected
+      // application, and its exact channel key is authoritative even between
+      // prompts. In the 2026-08-28 incident, one exact Discord session consumed
+      // 14 messages into a no-assistant-output branch; each prompt ended in
+      // ~53ms, so /stop landed while `draining`, queues, and reminders were all
+      // empty and incorrectly reported no-live-session. Always pass that exact
+      // session to stopCurrentChannelTurn so the user's escape hatch remains.
+      const exactDiscordSession = key.adapter === 'discord-bot' && resolved.session.keyId === channelKeyId(key)
+      if (lowered === 'stop' && !exactDiscordSession && !hasStoppableWork(resolved.session)) {
         return { kind: 'no-live-session' }
       }
       live = resolved.session
@@ -7542,7 +8298,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     )
     const round = publisher?.githubReviewRound ?? persistedPublisher?.githubReviewRound
     if (round === null || round === undefined) {
-      const resetRound = resetGithubReviewRoundCompletionForPr(args.workspace, args.prNumber)
+      const resetRound = resetGithubReviewRoundCompletionForPr(args.workspace, args.prNumber, now)
       if (resetRound !== null) persistMatchingGithubReviewRound(resetRound)
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: no publisher session with round state session=${args.sessionId}`,
@@ -7550,7 +8306,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return { kind: 'no-round' }
     }
 
-    const activeRound = registerGithubReviewRound(round)
+    const activeRound = registerGithubReviewRound(round, now(), now)
     if (activeRound === null) {
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: round expired`,
@@ -7559,22 +8315,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     const publisherThread = publisher?.key.thread ?? persistedPublisher?.thread ?? null
     if (activeRound.carrierThread !== publisherThread) {
-      resetGithubReviewRoundCompletion(activeRound)
+      resetGithubReviewRoundCompletion(activeRound, now)
       persistMatchingGithubReviewRound(activeRound)
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: publisher thread=${publisherThread ?? 'root'} is not carrier=${activeRound.carrierThread ?? 'root'}`,
       )
       return { kind: 'no-round' }
     }
-    if (!(await validateGithubReviewRound(activeRound))) {
-      resetGithubReviewRoundCompletion(activeRound)
+    if (!(await validateGithubReviewRound(activeRound, undefined, now))) {
+      resetGithubReviewRoundCompletion(activeRound, now)
       persistMatchingGithubReviewRound(activeRound)
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: head mismatch or unavailable expected=${activeRound.headSha}`,
       )
       return { kind: 'no-round' }
     }
-    completeGithubReviewRound(activeRound)
+    completeGithubReviewRound(activeRound, now)
     const key = githubReviewRoundKey(round)
     for (const live of Array.from(liveSessions.values())) {
       if (live.githubReviewRound === null || githubReviewRoundKey(live.githubReviewRound) !== key) continue
@@ -7596,7 +8352,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const persistMatchingGithubReviewRound = (round: GithubReviewFollowupRound): void => {
     if (mappings === null) return
     const key = githubReviewRoundKey(round)
-    const state = githubReviewRoundPersistence(round)
+    const state = githubReviewRoundPersistence(round, now)
     let changed = false
     for (const [idx, record] of Array.from(mappings.entries())) {
       if (record.githubReviewRound === undefined) continue
@@ -7614,7 +8370,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   // A close-out can land while completion is still awaiting head validation, so
-  // `finishGithubReviewRoundCloseout` sees a pending round and returns without
+  // `finishGithubReviewThreadCloseout` sees a pending round and returns without
   // clearing. Nothing else retries it, which would strand round metadata on the
   // session and reject its later verdicts — so the close-out is recorded and
   // replayed here once the round actually completes.
@@ -7623,20 +8379,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const live of Array.from(liveSessions.values())) {
       if (live.pendingGithubReviewRoundCloseout !== key) continue
       live.pendingGithubReviewRoundCloseout = null
-      finishGithubReviewRoundCloseout({
+      finishGithubReviewThreadCloseout({
         sessionId: live.sessionId,
         workspace: live.key.workspace,
         prNumber: Number(live.key.chat.slice('pr:'.length)),
         thread: live.key.thread ?? null,
+        decision: 'resolved',
       })
     }
   }
 
-  const finishGithubReviewRoundCloseout = (args: {
+  const finishGithubReviewThreadCloseout = (args: {
     sessionId: string
     workspace: string
     prNumber: number
     thread: string | null
+    decision: 'resolved' | 'left-open'
   }): void => {
     const chat = `pr:${args.prNumber}`
     const live = Array.from(liveSessions.values()).find(
@@ -7648,9 +8406,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         candidate.key.chat === chat &&
         candidate.key.thread === args.thread,
     )
+    if (live !== undefined) {
+      live.githubReviewThreadCloseoutDecisionTurn = live.turnSeq
+      clearGithubReviewThreadCloseout(live)
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_decided decision=${args.decision} turn=${live.turnSeq}`,
+      )
+    }
     if (live?.githubReviewRound === null || live?.githubReviewRound === undefined) return
     const round = live.githubReviewRound
-    if (!isGithubReviewRoundComplete(round)) {
+    if (!isGithubReviewRoundComplete(round, now)) {
       live.pendingGithubReviewRoundCloseout = githubReviewRoundKey(round)
       return
     }
@@ -7724,6 +8489,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { kind: 'no-live-session' }
   }
 
+  const hasOutstandingGithubReviewThreadCloseout = (sessionId: string): boolean => {
+    for (const live of liveSessions.values()) {
+      if (live.destroyed || live.sessionId !== sessionId) continue
+      return live.githubReviewThreadCloseout !== null
+    }
+    return false
+  }
+
   const clearSticky = (key: ChannelKey): { keyId: string; cleared: number } => {
     const keyId = channelKeyId(key)
     const cleared = stickyLedger.clear(keyId)
@@ -7764,11 +8537,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const armSilentTurnAck = (live: LiveSession, reason: SilentAckReason): void => {
-    // A GitHub review IS its own emoji-shaped output, so it always earns the
-    // 👀; every other deliberate silence earns one ONLY when the triggering
-    // message was addressed to the bot. Staying quiet in ambient chatter leaves
-    // no mark, so a busy room never accumulates stale 👀 on messages the bot
-    // was never part of.
+    // A GitHub review is user-facing output, so it always earns the 👀; deferred
+    // background work earns one only when the triggering message addressed the
+    // bot. Ambient chatter stays unmarked.
     const eligible =
       reason === 'github_review_output' ? live.key.adapter === 'github' : live.currentTurnExplicitlyAddressed
     if (!eligible) return
@@ -7808,8 +8579,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   // Retire every persistent silent-ack :eyes: outstanding in this live session
-  // once the agent posts a genuine reply — the "seen, not replying" mark is now
-  // contradicted. Snapshot-and-clear the promise array BEFORE awaiting, so a
+  // once the agent posts a genuine reply. Snapshot-and-clear the promise array
+  // BEFORE awaiting, so a
   // concurrent later silent turn appending a fresh add is never swept by this
   // in-flight cleanup. Each entry is AWAITED to its resolved ref before removal,
   // so an add still in flight when the reply lands is still retired. Failures are
@@ -7964,9 +8735,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     getSelfAliases: computeSelfAliases,
     injectSubagentCompletionReminder,
     injectPrVerdictActivity,
+    abortGithubPrTurn,
     completeGithubReviewRound: completeRoundForVerifiedVerdict,
-    finishGithubReviewRoundCloseout,
+    finishGithubReviewThreadCloseout,
     noteGithubReviewOutput,
+    hasOutstandingGithubReviewThreadCloseout,
     markTurnSkipped,
     clearSticky,
     reserveRestartHandoff,
@@ -7979,15 +8752,37 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     __testing: {
       githubReviewRoundFor: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.githubReviewRound,
       pendingReminderCount: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.pendingSystemReminders.length,
+      creationTokenCount: () => latestCreationTokens.size,
       flushDebounce: async (key: ChannelKey) => {
-        const live = liveSessions.get(channelKeyId(key))
+        const keyId = channelKeyId(key)
+        let live = liveSessions.get(keyId)
         if (!live) return
         if (live.debounceTimer) {
           clearTimeout(live.debounceTimer)
           live.debounceTimer = null
         }
         live.firstUnprocessedAt = 0
-        await drain(live)
+        // Settle a drain that is ALREADY in flight before starting our own, then
+        // again after. `drain()` no-ops while one owns the session, so a
+        // fire-and-forget `void drain(live)` raised elsewhere — the restart-resume
+        // lost-work notice, a promoted review carrier, a subagent-completion wake —
+        // would still be mid-turn when this returned, and the caller would assert
+        // on a prompt that has not landed. Same defect shape as the `persist()`
+        // race below: this seam has to mean "settled", not "started".
+        //
+        // Re-resolved by key each round because settling is not a property of one
+        // object: a deferred reload teardown drops this session mid-drain and
+        // `handOffToSuccessor` replays the carried work onto a REPLACEMENT live
+        // session with its own `activeDrains`. Watching only the session captured
+        // at entry would return with the successor's prompt still in flight.
+        for (;;) {
+          await settleDrains(live)
+          await drain(live)
+          await settleDrains(live)
+          const current = liveSessions.get(keyId)
+          if (current === undefined || current === live) break
+          live = current
+        }
         // Settle the fire-and-forget `void persist()` from scheduleDebouncedDrain
         // (the lastInboundAt write). Draining alone doesn't await that promise, so
         // a test reading sessions.json right after would race the disk write — the
@@ -8873,27 +9668,19 @@ async function raceWithTimeout<T>(work: Promise<T>, ms: number, label: string): 
 //     Observed against claude on a channel turn that fell silent (2026-06-12).
 //
 //   - source: 'mid-turn'
-//     The leaf IS an assistant message with `stopReason === 'toolUse'` that
-//     carries visible text. The model narrated a user-facing reply ("on it,
-//     bumping to 16x now") AND committed to a tool plan in the same message,
-//     but the turn ended before any follow-up assistant message that would
-//     have called `channel_reply` was persisted — the upstream pi-agent-core
-//     loop's post-tool follow-up never landed, or the run was aborted
-//     mid-loop. The model treated its visible prose as ambient narration; in
-//     a channel session that prose is dead text. Recovers it so the user gets
-//     the reply the model thought it had already given. Observed against
-//     Fireworks' `kimi-k2p6-turbo` on KakaoTalk: the agent posted speed-change
-//     status as narration, kept taking screenshots, and the user saw nothing.
-//     This is the leaf-is-assistant twin of the 'pre-tool' shape below.
+//     The leaf IS an assistant message with `stopReason === 'toolUse'`. Its
+//     visible text, if any, is unfinished narration rather than a trustworthy
+//     answer because the planned tool work never reached a follow-up assistant
+//     message. The caller uses this source to enter bounded continuation rather
+//     than publishing the narration.
 //
 //   - source: 'pre-tool'
 //     The leaf is a `toolResult` and the immediately-prior assistant message
 //     has `stopReason === 'toolUse'` (it called the tool that produced this
 //     toolResult). The upstream pi-agent-core loop SHOULD have made a
 //     follow-up LLM call after the tool returned, but that call either never
-//     happened or produced no persisted message. Recovers the assistant's
-//     pre-tool commentary so the user gets *something* — observed against
-//     Fireworks' `accounts/fireworks/routers/kimi-k2p6-turbo` on 2026-05-26.
+//     happened or produced no persisted message. The caller treats the
+//     assistant's commentary as unfinished and enters bounded continuation.
 //
 // Returns null when no recovery is appropriate:
 //   - No leaf, no messages in branch, branch is malformed
@@ -8916,9 +9703,8 @@ function recoverableAssistantText(
     if (leaf.message.stopReason === 'stop') {
       return { text: visibleAssistantText(leaf.message), source: 'leaf' }
     }
-    // The model committed to a tool plan but its visible prose never reached
-    // the channel and no follow-up message that would have called a channel
-    // tool was persisted. Recover the stranded prose.
+    // Preserve the unfinished shape for the caller's continuation ladder; its
+    // prose is not a final answer and must not be published directly.
     if (leaf.message.stopReason === 'toolUse') {
       return { text: visibleAssistantText(leaf.message), source: 'mid-turn' }
     }
@@ -8949,7 +9735,9 @@ function recoverableAssistantText(
     if (!parent) return null
     if (parent.type === 'message') {
       if (parent.message.role === 'assistant') {
-        return { text: visibleAssistantText(parent.message), source: 'pre-tool' }
+        return parent.message.stopReason === 'toolUse'
+          ? { text: visibleAssistantText(parent.message), source: 'pre-tool' }
+          : null
       }
       if (parent.message.role === 'user') return null
     }
@@ -9006,6 +9794,57 @@ function leafIsStrandedToolUse(session: AgentSession): boolean {
     cursor = parent
   }
   return false
+}
+
+// Permanently close a trailing tool batch whose assistant toolUse has one or
+// more missing results. PR #1386 could recognize this shape and re-prompt, but
+// the 2026-08-28 Discord fingerprint showed the poisoned branch rejecting each
+// retry in ~53ms before provider generation: 15 user entries accumulated with
+// no assistant entry until idle rollover. Append-only error results preserve
+// the full conversation and any completed sibling results while making both
+// the live Agent state and persisted SessionManager branch valid again.
+function repairDanglingToolUseBranch(session: AgentSession, timestamp: number): string[] {
+  const branch = session.sessionManager.getBranch?.()
+  if (!branch) return []
+  const messages = branch.filter(
+    (entry): entry is Extract<SessionEntry, { type: 'message' }> => entry.type === 'message',
+  )
+  if (messages.length === 0) return []
+
+  const completed = new Set<string>()
+  let index = messages.length - 1
+  while (index >= 0) {
+    const message = messages[index]!.message
+    if (message.role !== 'toolResult') break
+    completed.add(message.toolCallId)
+    index--
+  }
+
+  const assistantEntry = messages[index]
+  if (!assistantEntry || assistantEntry.message.role !== 'assistant') return []
+  if (assistantEntry.message.stopReason !== 'toolUse') return []
+  const missing = assistantEntry.message.content.filter(
+    (block): block is Extract<(typeof assistantEntry.message.content)[number], { type: 'toolCall' }> =>
+      block.type === 'toolCall' && !completed.has(block.id),
+  )
+  if (missing.length === 0) return []
+
+  const repairedMessages: ToolResultMessage[] = missing.map((toolCall) => ({
+    role: 'toolResult',
+    toolCallId: toolCall.id,
+    toolName: toolCall.name,
+    content: [
+      {
+        type: 'text',
+        text: 'Tool execution was interrupted before its result was recorded. Continue from the preserved conversation without assuming the tool succeeded.',
+      },
+    ],
+    isError: true,
+    timestamp,
+  }))
+  for (const message of repairedMessages) session.sessionManager.appendMessage(message)
+  session.agent.state.messages = [...session.agent.state.messages, ...repairedMessages]
+  return missing.map((toolCall) => toolCall.name)
 }
 
 // The turn-end leaf is a FRESH empty `stop` — an assistant message with no visible

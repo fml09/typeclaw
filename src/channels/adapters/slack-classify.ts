@@ -1,14 +1,16 @@
-import type { SlackRTMMessageEvent } from 'agent-messenger/slack'
+import type { SlackFile, SlackRTMMessageEvent } from 'agent-messenger/slack'
 
 import { matchesAnyAlias } from '@/channels/engagement'
 import type { ChannelAdapterConfig } from '@/channels/schema'
-import type { InboundMessage } from '@/channels/types'
+import type { InboundAttachment, InboundMessage } from '@/channels/types'
 
 import { slackTsToMillis } from './slack-bot-time'
 import { encodeSlackReactionRef } from './slack-reactions'
 
 export type SlackInboundMessageEvent = SlackRTMMessageEvent & {
   channel_type?: string
+  // Modern RTM file messages are subtype-less but retain the `files` array.
+  files?: SlackFile[]
   is_mpim?: boolean
 }
 
@@ -35,10 +37,11 @@ export function classifyInbound(
   if (context.selfUserId !== null && event.user === context.selfUserId) return { kind: 'drop', reason: 'self_author' }
   if (event.user === undefined || event.user === '') return { kind: 'drop', reason: 'no_user' }
   if (!isRouteableSlackMessageSubtype(event.subtype)) return { kind: 'drop', reason: 'slack_system_message' }
-  if ((event.text ?? '') === '') return { kind: 'drop', reason: 'empty_text' }
+  const rawText = event.text ?? ''
+  const { text, attachments } = splitSlackFiles(rawText, event.files)
+  if (text === '') return { kind: 'drop', reason: 'empty_text' }
   if (context.selfUserId === null) return { kind: 'drop', reason: 'pre_connect' }
 
-  const rawText = event.text ?? ''
   const conversationType = classifyConversation(event, context.conversationType)
   const isDm = conversationType === 'im'
   const workspace = isDm ? '@dm' : context.teamId
@@ -57,7 +60,8 @@ export function classifyInbound(
       chat: event.channel,
       thread,
       ...(thread !== null ? { room: { kind: 'thread' as const } } : {}),
-      text: rawText,
+      text,
+      ...(attachments.length > 0 ? { attachments } : {}),
       externalMessageId: event.ts,
       reactionRef: encodeSlackReactionRef({ channel: event.channel, ts: event.ts }),
       authorId: event.user,
@@ -89,6 +93,37 @@ function classifyConversation(
 
 export function isRouteableSlackMessageSubtype(subtype: string | undefined): boolean {
   return subtype === undefined || subtype === 'me_message'
+}
+
+// Live inbound and REST history share the same attachment rendering contract.
+// Registering the ref
+// without also baking a `#N` placeholder into the text is not enough: the
+// agent has no way to learn the id exists, so look_at_channel_attachment stays
+// unreachable in practice.
+export function splitSlackFiles(text: string, files: readonly SlackFile[] | undefined): SplitSlackFiles {
+  const attachments = (files ?? []).map(describeSlackFile)
+  if (attachments.length === 0) return { text, attachments: [] }
+  const summary = attachments.map(renderPlaceholder).join('\n')
+  return { text: text === '' ? summary : `${text}\n${summary}`, attachments }
+}
+
+type SplitSlackFiles = { text: string; attachments: InboundAttachment[] }
+
+function describeSlackFile(file: SlackFile, index: number): InboundAttachment {
+  return {
+    id: index + 1,
+    kind: 'file',
+    ref: file.id,
+    filename: file.name,
+    mimetype: file.mimetype,
+  }
+}
+
+function renderPlaceholder(attachment: InboundAttachment): string {
+  const parts: string[] = [`Slack attachment #${attachment.id}: ${attachment.kind}`]
+  if (attachment.mimetype !== undefined) parts.push(attachment.mimetype)
+  if (attachment.filename !== undefined) parts.push(`name=${attachment.filename}`)
+  return `[${parts.join(' ')}]`
 }
 
 const MENTION_PATTERN = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g

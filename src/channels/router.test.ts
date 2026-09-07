@@ -3,11 +3,25 @@ import { mkdir, mkdtemp, readFile, rm, writeFile as writeFileFs } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
-import type { AfterToolCallContext, AfterToolCallResult, StreamFn } from '@mariozechner/pi-agent-core'
-import type { AssistantMessage } from '@mariozechner/pi-ai'
+import {
+  Agent,
+  type AgentMessage,
+  type AfterToolCallContext,
+  type AfterToolCallResult,
+  type StreamFn,
+} from '@mariozechner/pi-agent-core'
+import {
+  fauxAssistantMessage,
+  fauxText,
+  fauxToolCall,
+  registerFauxProvider,
+  Type,
+  type AssistantMessage,
+} from '@mariozechner/pi-ai'
 import type { SessionEntry } from '@mariozechner/pi-coding-agent'
 
 import type { AgentSession, SessionOriginRef } from '@/agent'
+import { LiveSubagentRegistry } from '@/agent/live-subagents'
 import {
   consumeRestartHandoff,
   peekRestartHandoff,
@@ -20,6 +34,7 @@ import { readContinuationState } from '@/agent/todo/continuation-state'
 import { recordTurnOutcome } from '@/agent/todo/continuation-wiring'
 import { resolveTodoScope } from '@/agent/todo/scope'
 import { writeTodos } from '@/agent/todo/store'
+import { createChannelHistoryTool } from '@/agent/tools/channel-history'
 import { createChannelReplyTool } from '@/agent/tools/channel-reply'
 import { createPostGithubReviewTool } from '@/agent/tools/post-github-review'
 import {
@@ -39,12 +54,14 @@ import type {
 import { createStream, type Stream } from '@/stream'
 import { waitFor } from '@/test-helpers/wait-for'
 
+import { createDiscordHistoryCallback } from './adapters/discord'
 import { channelDeliveryModesPath } from './delivery-modes'
 import {
   __resetReviewVerdictGuardForTest,
   configureReviewVerdictCoordinator,
   guardGithubReviewRoundDismissal,
   isGithubReviewRoundComplete,
+  REPLY_REVIEW_ROUND_TTL_MS,
   releaseGithubReviewRoundDismissal,
   REVIEW_ROUND_TTL_MS,
 } from './github-review-verdict-coordinator'
@@ -61,6 +78,7 @@ import {
   EMPTY_STOP_AFTER_TOOL_WORK_NUDGE,
   EMPTY_TURN_FALLBACK_TEXT,
   EMPTY_TURN_RETRY_NUDGE,
+  GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT,
   extractPlainTextChannelToolCallText,
   getPlainTextChannelToolCallKind,
   stripTrailingLeakedToolCall,
@@ -181,6 +199,30 @@ class FakeSession {
   public sessionManager = {
     getLeafEntry: (): SessionEntry | undefined => this.leafEntry,
     getEntry: (id: string): SessionEntry | undefined => this.entriesById.get(id),
+    getBranch: (): SessionEntry[] => {
+      const reversed: SessionEntry[] = []
+      let cursor = this.leafEntry
+      while (cursor) {
+        reversed.push(cursor)
+        cursor = cursor.parentId ? this.entriesById.get(cursor.parentId) : undefined
+      }
+      return reversed.reverse()
+    },
+    appendMessage: (message: AgentMessage): string => {
+      const parentId = this.leafEntry?.id ?? null
+      if (this.leafEntry) this.entriesById.set(this.leafEntry.id, this.leafEntry)
+      const id = `appended-${this.entriesById.size + 1}`
+      const entry: SessionEntry = {
+        type: 'message',
+        id,
+        parentId,
+        timestamp: '2026-08-28T10:20:18.000Z',
+        message,
+      }
+      this.entriesById.set(id, entry)
+      this.leafEntry = entry
+      return id
+    },
   }
 
   private subscribers = new Set<(event: Record<string, unknown> & { type: string }) => void>()
@@ -253,6 +295,42 @@ async function streamOnce(session: FakeSession): Promise<void> {
   )
 }
 
+function connectCoreAgent(session: FakeSession, coreAgent: Agent): void {
+  const fallbackController = new AbortController()
+  let eventPersistence = Promise.resolve()
+  coreAgent.subscribe((event) => {
+    if (event.type !== 'message_end') return
+    eventPersistence = eventPersistence.then(async () => {
+      if (event.message.role === 'toolResult') await new Promise((resolve) => setTimeout(resolve, 5))
+      session.sessionManager.appendMessage(event.message)
+      session.emit(event)
+    })
+  })
+  session.agent = {
+    controller: fallbackController,
+    get signal(): AbortSignal {
+      return coreAgent.signal ?? fallbackController.signal
+    },
+    get state(): { messages: Array<{ role: string; stopReason?: string }> } {
+      return coreAgent.state
+    },
+    continue: async () => await coreAgent.continue(),
+    abort: () => coreAgent.abort(),
+    get afterToolCall() {
+      return coreAgent.afterToolCall
+    },
+    set afterToolCall(hook) {
+      coreAgent.afterToolCall = hook
+    },
+    get streamFn() {
+      return coreAgent.streamFn
+    },
+    set streamFn(fn) {
+      coreAgent.streamFn = fn
+    },
+  }
+}
+
 function assistantMessage(text: string): AssistantMessage {
   return {
     role: 'assistant',
@@ -315,6 +393,23 @@ function strandOnUnansweredToolUse(session: FakeSession, id: string = 'strand'):
   session.leafEntry = toolResultEntry
 }
 
+function strandOnMissingToolResult(session: FakeSession, id: string = 'missing-result'): void {
+  const assistantEntry: SessionEntry = {
+    type: 'message',
+    id: `assistant-${id}`,
+    parentId: null,
+    timestamp: '2026-08-28T10:20:18.000Z',
+    message: {
+      ...assistantMessage(''),
+      content: [{ type: 'toolCall', id: `tool-${id}`, name: 'channel_reply', arguments: { text: 'Done.' } }],
+      stopReason: 'toolUse',
+    },
+  }
+  session.entriesById.set(assistantEntry.id, assistantEntry)
+  session.leafEntry = assistantEntry
+  session.agent.state.messages = [assistantEntry.message]
+}
+
 // A bare-empty `stop` leaf whose parentId chain runs back through a web_search
 // tool call to a bounding user entry — the production shape recoverableAssistantText
 // recovers as { text: '', source: 'leaf' } while attemptMadeToolCall still finds
@@ -370,14 +465,19 @@ function emptyStopAfterToolWork(session: FakeSession, id: string = 'tw', userId:
 }
 
 function terminalReplyContext(replyText: string): AfterToolCallContext {
+  const toolCall = {
+    type: 'toolCall' as const,
+    id: 'tc-terminal-reply',
+    name: 'channel_reply',
+    arguments: { text: replyText },
+  }
   return {
-    assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
-    toolCall: {
-      type: 'toolCall',
-      id: 'tc-terminal-reply',
-      name: 'channel_reply',
-      arguments: { text: replyText },
-    } as AfterToolCallContext['toolCall'],
+    assistantMessage: {
+      ...assistantMessage(''),
+      content: [toolCall],
+      stopReason: 'toolUse',
+    } as AfterToolCallContext['assistantMessage'],
+    toolCall: toolCall as AfterToolCallContext['toolCall'],
     args: { text: replyText },
     result: {
       content: [{ type: 'text' as const, text: 'ignored' }],
@@ -436,16 +536,24 @@ function makeRouter(
     saveChannelSessions?: (agentDir: string, sessions: readonly ChannelSessionRecord[]) => Promise<void>
     newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
     listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
+    cancelRunningSubagentsByWorkKey?: CreateChannelRouterOptions['cancelRunningSubagentsByWorkKey']
     runIdleContinuation?: CreateChannelRouterOptions['runIdleContinuation']
     recordTurnOutcome?: CreateChannelRouterOptions['recordTurnOutcome']
     pluginCommands?: CreateChannelRouterOptions['pluginCommands']
     pluginCommandTimeoutMs?: number
     stream?: Stream
+    onSessionCreated?: (session: FakeSession) => void
+    beforeSessionCreation?: (attempt: number) => Promise<void> | void
+    failSessionCreationAt?: readonly number[]
+    handoffRetryRetentionMs?: number
+    handoffRetryItemLimit?: number
+    handoffRetryByteLimit?: number
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
   const origins: SessionOrigin[] = options.origins ?? []
   const nowRef = options.nowRef ?? { value: 1000 }
+  let creationAttempts = 0
   const router = createChannelRouter({
     agentDir,
     configForAdapter: () => options.config ?? baseConfig,
@@ -464,11 +572,19 @@ function makeRouter(
     ...(options.listRunningBackgroundSubagentNames !== undefined
       ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
       : {}),
+    ...(options.cancelRunningSubagentsByWorkKey !== undefined
+      ? { cancelRunningSubagentsByWorkKey: options.cancelRunningSubagentsByWorkKey }
+      : {}),
     ...(options.runIdleContinuation !== undefined ? { runIdleContinuation: options.runIdleContinuation } : {}),
     ...(options.recordTurnOutcome !== undefined ? { recordTurnOutcome: options.recordTurnOutcome } : {}),
     ...(options.pluginCommands !== undefined ? { pluginCommands: options.pluginCommands } : {}),
     ...(options.pluginCommandTimeoutMs !== undefined ? { pluginCommandTimeoutMs: options.pluginCommandTimeoutMs } : {}),
     ...(options.stream !== undefined ? { stream: options.stream } : {}),
+    ...(options.handoffRetryRetentionMs !== undefined
+      ? { handoffRetryRetentionMs: options.handoffRetryRetentionMs }
+      : {}),
+    ...(options.handoffRetryItemLimit !== undefined ? { handoffRetryItemLimit: options.handoffRetryItemLimit } : {}),
+    ...(options.handoffRetryByteLimit !== undefined ? { handoffRetryByteLimit: options.handoffRetryByteLimit } : {}),
     permissions: options.permissions ?? grantAllPermissions,
     now: () => nowRef.value,
     logger: {
@@ -477,13 +593,19 @@ function makeRouter(
       error: (m) => options.logs?.push(`error:${m}`),
     },
     createSessionForChannel: async ({ origin, originRef, existingSessionId, existingSessionFile }) => {
+      creationAttempts++
       options.factoryCalls?.push({
         ...(existingSessionId !== undefined ? { existingSessionId } : {}),
         ...(existingSessionFile !== undefined ? { existingSessionFile } : {}),
       })
       origins.push(origin)
       options.originRefs?.push(originRef)
+      await options.beforeSessionCreation?.(creationAttempts)
+      if (options.failSessionCreationAt?.includes(creationAttempts)) {
+        throw new Error(`session creation failed at attempt ${creationAttempts}`)
+      }
       const fake = new FakeSession()
+      options.onSessionCreated?.(fake)
       sessions.push(fake)
       const sessionId = existingSessionId ?? `ses_fake_${sessions.length}`
       return {
@@ -1177,13 +1299,295 @@ describe('ChannelRouter session lifecycle', () => {
     // Release the held prompt: the stale session tears down (finishing only the
     // in-flight prompt), and a fresh successor is created that processes the
     // post-reload message exactly once.
+    // Asserted synchronously off the flush promise, with no polling: the
+    // successor is created inside the predecessor's own drain tail, so
+    // flushDebounce must follow the handoff to the replacement session and
+    // settle ITS drain too before returning.
     releaseFirstPrompt()
     await drainPromise
-    await waitFor(() => sessions.length === 2)
-    await waitFor(() => sessions[1]!.prompts.length > 0)
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts.length).toBeGreaterThan(0)
     expect(sessions[0]!.prompts.length).toBe(1)
     expect(sessions[1]!.prompts.some((p) => p.includes('after reload'))).toBe(true)
     expect(router.liveCount()).toBe(1)
+  })
+
+  test('failed reload handoff retains queued inbounds for the next successful session in order', async () => {
+    const dir = await tempDir()
+    const factoryCalls: SessionFactoryArgs[] = []
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { factoryCalls, failSessionCreationAt: [2], logs })
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'queued first' }))
+    await router.route(inbound({ externalMessageId: 'm3', text: 'queued second' }))
+
+    releaseFirstPrompt()
+    await drainPromise
+    expect(factoryCalls).toHaveLength(2)
+    expect(router.liveCount()).toBe(0)
+    expect(
+      logs.some((line) => line.includes('successor recreate after reload failed') && line.includes('retained')),
+    ).toBe(true)
+
+    await router.route(inbound({ externalMessageId: 'm4', text: 'new trigger' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(factoryCalls).toHaveLength(3)
+    expect(sessions).toHaveLength(2)
+    const replayed = sessions[1]!.prompts.join('\n')
+    expect(replayed.indexOf('queued first')).toBeLessThan(replayed.indexOf('queued second'))
+    expect(replayed.indexOf('queued second')).toBeLessThan(replayed.indexOf('new trigger'))
+    expect(replayed.match(/queued first/g)).toHaveLength(1)
+    expect(replayed.match(/queued second/g)).toHaveLength(1)
+  })
+
+  test('a timed-out reload successor cannot replace the retry that replayed its retained work', async () => {
+    const dir = await tempDir()
+    const factoryCalls: SessionFactoryArgs[] = []
+    let releaseLateSuccessor: () => void = () => {}
+    const lateSuccessorBlocked = new Promise<void>((resolve) => {
+      releaseLateSuccessor = resolve
+    })
+    let markLateSuccessorEntered: () => void = () => {}
+    const lateSuccessorEntered = new Promise<void>((resolve) => {
+      markLateSuccessorEntered = resolve
+    })
+    const { router, sessions } = makeRouter(dir, {
+      ensureLiveTimeoutMs: 1_000,
+      factoryCalls,
+      beforeSessionCreation: async (attempt) => {
+        if (attempt !== 2) return
+        markLateSuccessorEntered()
+        await lateSuccessorBlocked
+      },
+    })
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'retained once' }))
+    releaseFirstPrompt()
+    await lateSuccessorEntered
+    await drainPromise
+
+    await router.route(inbound({ externalMessageId: 'm3', text: 'retry trigger' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts.join('\n').match(/retained once/g)).toHaveLength(1)
+
+    releaseLateSuccessor()
+    await waitFor(() => sessions.length === 3 && sessions[2]!.disposed === 1)
+
+    await router.route(inbound({ externalMessageId: 'm4', text: 'still on retry' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(factoryCalls).toHaveLength(3)
+    expect(router.liveCount()).toBe(1)
+    expect(sessions[1]!.prompts.join('\n')).toContain('still on retry')
+    expect(sessions[1]!.prompts.join('\n').match(/retained once/g)).toHaveLength(1)
+  })
+
+  test('successful reload handoff delivers its queued inbound exactly once', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'queued once' }))
+    releaseFirstPrompt()
+    await drainPromise
+
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts.join('\n').match(/queued once/g)).toHaveLength(1)
+  })
+
+  test('expired reload handoff reports the loss and recovery path to the channel and operator log', async () => {
+    const dir = await tempDir()
+    const factoryCalls: SessionFactoryArgs[] = []
+    const logs: string[] = []
+    const nowRef = { value: 1000 }
+    const notices: string[] = []
+    const removed: RemoveReactionRequest[] = []
+    const { router, sessions } = makeRouter(dir, {
+      factoryCalls,
+      failSessionCreationAt: [2],
+      handoffRetryRetentionMs: 100,
+      logs,
+      nowRef,
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      notices.push(message.text ?? '')
+      return { ok: true }
+    })
+    router.registerReaction('discord-bot', async () => ({
+      ok: true,
+      reactionRef: { adapter: 'discord-bot', value: 'retained-reaction' },
+    }))
+    router.registerRemoveReaction('discord-bot', async (request) => {
+      removed.push(request)
+      return { ok: true }
+    })
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+    await router.tearDownAllLive()
+    await router.route(
+      inbound({
+        externalMessageId: 'm2',
+        text: 'retained until expiry',
+        reactionRef: { adapter: 'discord-bot', value: 'queued-message' },
+      }),
+    )
+    releaseFirstPrompt()
+    await drainPromise
+
+    nowRef.value += 100
+    await router.__testing!.runIdleGc()
+
+    expect(logs.some((line) => line.includes('reload handoff retention policy discarded'))).toBe(true)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!).toContain('could not replay 1 queued item(s)')
+    expect(notices[0]!).toContain("reload({ scope: 'providers' })")
+    expect(removed).toHaveLength(1)
+    expect(removed[0]!.reactionRef).toEqual({ adapter: 'discord-bot', value: 'retained-reaction' })
+  })
+
+  test('failed reload handoff also retains observed context and system reminders', async () => {
+    const dir = await tempDir()
+    const factoryCalls: SessionFactoryArgs[] = []
+    const { router, sessions } = makeRouter(dir, { factoryCalls, failSessionCreationAt: [2] })
+    await router.route(
+      inbound({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'prime group context' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+    let releaseHeldPrompt: () => void = () => {}
+    const heldPrompt = new Promise<void>((resolve) => {
+      releaseHeldPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm-hold', text: 'hold before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await heldPrompt
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.some((prompt) => prompt.includes('hold before reload')))
+
+    await router.tearDownAllLive()
+    await router.route(
+      inbound({ isBotMention: false, externalMessageId: 'm-observed', text: 'retained ambient context' }),
+    )
+    router.__testing!.injectContinuationReminder(KEY, 'retained reminder marker')
+    releaseHeldPrompt()
+    await drainPromise
+    expect(router.liveCount()).toBe(0)
+
+    await router.route(inbound({ externalMessageId: 'm-next', text: 'new trigger after retry' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const replayed = sessions[1]!.prompts.join('\n')
+    expect(replayed.match(/retained ambient context/g)).toHaveLength(1)
+    expect(replayed.match(/retained reminder marker/g)).toHaveLength(1)
+  })
+
+  test('oversized reload handoff reports the whole rejected batch instead of silently trimming it', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const notices: string[] = []
+    const { router, sessions } = makeRouter(dir, { handoffRetryItemLimit: 1, logs })
+    router.registerOutbound('discord-bot', async (message) => {
+      notices.push(message.text ?? '')
+      return { ok: true }
+    })
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'queued first' }))
+    await router.route(inbound({ externalMessageId: 'm3', text: 'queued second' }))
+
+    releaseFirstPrompt()
+    await drainPromise
+
+    expect(sessions).toHaveLength(1)
+    expect(router.liveCount()).toBe(0)
+    expect(logs.some((line) => line.includes('per-key item limit 1 exceeded'))).toBe(true)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!).toContain('could not replay 2 queued item(s)')
+    expect(notices[0]!).toContain('per-key item limit 1 exceeded')
+  })
+
+  test('stop logs teardown abort details when a prompt is in flight', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    let releasePrompt: () => void = () => {}
+    const promptHeld = new Promise<void>((resolve) => {
+      releasePrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1' }))
+    sessions[0]!.onPrompt = async () => {
+      await promptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    await router.stop()
+    releasePrompt()
+    await drainPromise
+
+    expect(logs).toContain('warn:[channels] discord-bot:g1:c1: abort site=teardown session=ses_fake_1 reason=teardown')
+  })
+
+  test('stop does not log a teardown abort for an idle session', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { logs })
+    await router.route(inbound({ externalMessageId: 'm1' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    await router.stop()
+
+    expect(logs.filter((line) => line.includes('abort site=teardown'))).toEqual([])
   })
 
   // Reviewer follow-up (#1174): observe-only messages (buffered to contextBuffer
@@ -1351,6 +1755,16 @@ describe('ChannelRouter session lifecycle', () => {
 })
 
 describe('ChannelRouter ensureLive watchdog', () => {
+  test('releases creation tokens after ordinary successful sessions settle', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(router.__testing!.creationTokenCount()).toBe(0)
+  })
+
   test('hung session factory rejects after the timeout instead of awaiting forever', async () => {
     // given a factory that never resolves (simulates a hung Discord REST chain
     // inside createForChannel — the production failure mode that bricked the
@@ -2318,6 +2732,129 @@ describe('ChannelRouter sticky credits', () => {
     expect(sessions[0]!.prompts).toHaveLength(1)
     expect(sessions[0]!.prompts[0]).toContain('where did you send it')
     expect(sessions[0]!.prompts[0]).toContain('You are in a group chat and are woken on every message')
+  })
+
+  test('a reply published to the room root wakes the author there, not in the thread it was answered from', async () => {
+    // given a root room where BOTH humans have spoken, so the solo-human
+    // fallback is off and sticky is the only thing that can engage a plain
+    // follow-up, and alice engaged the bot inside a thread
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true, text: 'bot hi' }))
+    await router.__testing!.flushDebounce(KEY)
+    nowRef.value = 1100
+    await router.route(inbound({ authorId: 'alice', externalMessageId: 'alice-1', isBotMention: true, text: 'bot yo' }))
+    await router.__testing!.flushDebounce(KEY)
+    sessions[0]!.prompts.length = 0
+
+    const threadKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't1' }
+    nowRef.value = 1200
+    await router.route(
+      inbound({ thread: 't1', authorId: 'alice', externalMessageId: 'alice-t1', isBotMention: true, text: 'bot look' }),
+    )
+    await router.__testing!.flushDebounce(threadKey)
+
+    // when the answer is PUBLISHED to the room root while still being accounted
+    // to the thread session (the post_github_review fallback-comment shape)
+    nowRef.value = 1500
+    const result = await router.send(
+      { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null, text: 'here is the review' },
+      { accountingTarget: threadKey },
+    )
+    expect(result.ok).toBe(true)
+
+    // then alice's plain follow-up on the root — the only surface she can see
+    // that reply on — engages instead of being silently observed
+    nowRef.value = 2000
+    await router.route(
+      inbound({ authorId: 'alice', externalMessageId: 'alice-2', isBotMention: false, text: 'answered your point' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sessions[0]!.prompts[0]).toContain('answered your point')
+  })
+
+  test('a divergent-thread send credits only the delivery key, leaving no stranded thread credit', async () => {
+    // given the same divergent send as above
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    const threadKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't1' }
+    await router.route(
+      inbound({ thread: 't1', authorId: 'alice', externalMessageId: 'alice-t1', isBotMention: true, text: 'bot look' }),
+    )
+    await router.__testing!.flushDebounce(threadKey)
+    nowRef.value = 1500
+    await router.send(
+      { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null, text: 'here is the review' },
+      { accountingTarget: threadKey },
+    )
+
+    // then the credit exists on the root and nothing is left on the thread, so a
+    // later disengage on either surface cannot strand a half of a paired grant
+    expect(router.clearSticky(threadKey).cleared).toBe(0)
+    expect(router.clearSticky(KEY).cleared).toBe(1)
+  })
+
+  test('a cross-chat send still credits its accounting session, not the destination', async () => {
+    // given a turn in c1 whose reply is delivered to a different chat entirely
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound({ authorId: 'alice', externalMessageId: 'alice-1', isBotMention: true, text: 'bot hi' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    nowRef.value = 1500
+    await router.send(
+      { adapter: 'discord-bot', workspace: 'g1', chat: 'c2', thread: null, text: 'relaying this over here' },
+      { accountingTarget: KEY },
+    )
+
+    // then the delivery redirect does not apply: author ids are namespaced per
+    // room, so the credit stays where the turn actually happened
+    expect(router.clearSticky({ adapter: 'discord-bot', workspace: 'g1', chat: 'c2', thread: null }).cleared).toBe(0)
+    expect(router.clearSticky(KEY).cleared).toBe(1)
+  })
+
+  test('a root-published reply credits only its reply targets, not everyone in the room', async () => {
+    // given the divergent send answering alice, in a 2-human root room where
+    // the solo-human fallback is off
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true, text: 'bot hi' }))
+    await router.__testing!.flushDebounce(KEY)
+    nowRef.value = 1100
+    await router.route(inbound({ authorId: 'alice', externalMessageId: 'alice-1', isBotMention: true, text: 'bot yo' }))
+    await router.__testing!.flushDebounce(KEY)
+    const threadKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't1' }
+    nowRef.value = 1200
+    await router.route(
+      inbound({ thread: 't1', authorId: 'alice', externalMessageId: 'alice-t1', isBotMention: true, text: 'bot look' }),
+    )
+    await router.__testing!.flushDebounce(threadKey)
+    nowRef.value = 1500
+    await router.send(
+      { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null, text: 'here is the review' },
+      { accountingTarget: threadKey },
+    )
+    sessions[0]!.prompts.length = 0
+
+    // when uncredited bob posts a plain comment on the root
+    nowRef.value = 2000
+    await router.route(
+      inbound({ authorId: 'bob', externalMessageId: 'bob-2', isBotMention: false, text: 'unrelated chatter' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+
+    // then it stays observed — the grant followed the reply target, not the room
+    expect(sessions[0]!.prompts).toHaveLength(0)
   })
 
   test('clearSticky drops the credit so a plain follow-up is no longer auto-engaged', async () => {
@@ -3842,11 +4379,10 @@ describe('disengageReactionEmojiFor', () => {
   })
 })
 
-describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
+describe('ChannelRouter reaction cleanup on deliberate silence', () => {
   const REACTION_REF: ReactionRef = { adapter: 'discord-bot', value: 'msg-ref' }
 
-  // discord-bot is typing-capable, so route() adds no eager engage :eyes: — every
-  // captured reaction is the silent-ack, keeping these assertions unambiguous.
+  // discord-bot is typing-capable, so route() adds no eager engage :eyes:.
   const setupSilentTurn = async (
     dir: string,
   ): Promise<{
@@ -3866,32 +4402,30 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     return { router, sessions, captured }
   }
 
-  test('skip_response leaves an :eyes: on the triggering message', async () => {
+  test('skip_response leaves no :eyes: on the triggering message', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
-    sessions[0]!.onPrompt = () => {
+    sessions[0]!.onPrompt = async () => {
       router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
       sessions[0]!.setAssistantText('Nothing actionable here.')
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ adapter: 'discord-bot', chat: 'c1', emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
-  test('an explicit NO_REPLY leaves an :eyes: on the triggering message', async () => {
+  test('an explicit NO_REPLY leaves no :eyes: on the triggering message', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
-    sessions[0]!.onPrompt = () => {
+    sessions[0]!.onPrompt = async () => {
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
-  test('(NO_REPLY) with parens leaves an :eyes:', async () => {
+  test('(NO_REPLY) with parens leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
     sessions[0]!.onPrompt = () => {
@@ -3899,11 +4433,10 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
-  test('a plain-text skip_response(...) leak leaves an :eyes: (deliberate silence)', async () => {
+  test('a plain-text skip_response(...) leak leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
     sessions[0]!.onPrompt = () => {
@@ -3911,8 +4444,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
   test('does not react when the silent turn carries no triggering reactionRef', async () => {
@@ -3976,13 +4508,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     expect(called).toBe(false)
   })
 
-  test('on a typing-less adapter, the silent-ack :eyes: is added AFTER the transient engage :eyes: is removed', async () => {
-    // given a typing-less adapter (engage :eyes: IS added on route, then removed
-    // at turn end) whose engage add resolves to a removable instance ref. Both
-    // the engage add and the silent-ack add target the SAME triggering message /
-    // emoji, so the guard is the ORDER: the final event must be the silent-ack
-    // add, never a removal. Pre-fix (fire-and-forget drop) the order raced to
-    // add,add,remove — the trailing remove would strip the ack on toggle adapters.
+  test('on a typing-less adapter, NO_REPLY removes the transient engage :eyes:', async () => {
     const dir = await tempDir()
     const engageInstanceRef: ReactionRef = { adapter: 'discord-bot', value: 'engage-instance' }
     const events: string[] = []
@@ -4003,8 +4529,8 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => events.length === 3)
-    expect(events).toEqual(['add-eyes', 'remove-eyes', 'add-eyes'])
+    await waitFor(() => events.length === 2)
+    expect(events).toEqual(['add-eyes', 'remove-eyes'])
   })
 
   test('an ambient (unaddressed) NO_REPLY leaves NO :eyes:', async () => {
@@ -4051,7 +4577,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     expect(called).toBe(false)
   })
 
-  test('a DM NO_REPLY still leaves an :eyes: (explicitly addressed)', async () => {
+  test('a DM NO_REPLY leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await (async () => {
       const { router, sessions } = makeRouter(dir)
@@ -4070,11 +4596,10 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
-  test('a reply-to-bot NO_REPLY still leaves an :eyes: (explicitly addressed)', async () => {
+  test('a reply-to-bot NO_REPLY leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
@@ -4091,8 +4616,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
   const ADDRESSED_REF: ReactionRef = { adapter: 'discord-bot', value: 'addressed-msg' }
@@ -4125,9 +4649,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     expect(called).toBe(false)
   })
 
-  test('ambient then addressed coalesced: the :eyes: lands on the final addressed message', async () => {
-    // given an ambient message and a later addressed one coalescing into ONE turn.
-    // batch[last] is the addressed tail, so the ack must fire AND target its ref.
+  test('ambient then addressed coalesced: NO_REPLY leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
@@ -4146,181 +4668,193 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    // then the ack fires on the final addressed message's ref, not the ambient one
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: ADDRESSED_REF })
+    expect(captured).toHaveLength(0)
   })
 })
 
-describe('ChannelRouter retires the persistent silent-ack :eyes: on a later reply', () => {
-  const REF_A: ReactionRef = { adapter: 'discord-bot', value: 'msg-a' }
-  const REF_B: ReactionRef = { adapter: 'discord-bot', value: 'msg-b' }
-  const SILENT_ACK_INSTANCE: ReactionRef = { adapter: 'discord-bot', value: 'silent-ack-instance' }
-
-  // discord-bot is typing-capable, so route() adds no eager engage :eyes: — every
-  // add is the silent-ack, and the add resolves to a removable instance ref so a
-  // later reply can retire it. Removals are captured to assert cleanup.
-  const setup = (
-    dir: string,
-  ): {
-    router: ReturnType<typeof makeRouter>['router']
-    sessions: ReturnType<typeof makeRouter>['sessions']
-    added: ReactionRequest[]
-    removed: ReactionRef[]
-  } => {
+describe('ChannelRouter persistent output acknowledgements', () => {
+  test('keeps a GitHub review acknowledgement until a later channel reply', async () => {
+    const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.setTypingCapability('discord-bot', true)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const triggerRef: ReactionRef = { adapter: 'github', value: 'review-request' }
+    const acknowledgementRef: ReactionRef = { adapter: 'github', value: 'review-ack' }
     const added: ReactionRequest[] = []
     const removed: ReactionRef[] = []
-    router.registerReaction('discord-bot', async (req) => {
+    router.setTypingCapability('github', true)
+    router.registerReaction('github', async (req) => {
       added.push(req)
-      return { ok: true, reactionRef: SILENT_ACK_INSTANCE }
+      return { ok: true, reactionRef: acknowledgementRef }
     })
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveReaction('github', async (req) => {
       removed.push(req.reactionRef)
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
-    return { router, sessions, added, removed }
-  }
+    router.registerOutbound('github', async () => ({ ok: true }))
 
-  test('a silent turn plants an :eyes: that a later reply removes', async () => {
-    const dir = await tempDir()
-    const { router, sessions, added, removed } = setup(dir)
-
-    // given a first turn that deliberately stays silent
-    await router.route(inbound({ reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.some((r) => r.emoji === 'eyes'))
-
-    // when a later turn in the same conversation replies for real
-    sessions[0]!.onPrompt = async () => {
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'here you go' })
-      sessions[0]!.setAssistantText('here you go')
+    await router.route(inbound({ ...key, isBotMention: true, reactionRef: triggerRef }))
+    sessions[0]!.onPrompt = () => {
+      router.noteGithubReviewOutput({
+        sessionId: 'ses_fake_1',
+        workspace: 'acme/repo',
+        prNumber: 672,
+        state: 'APPROVE',
+      })
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'review already published' })
+      sessions[0]!.setAssistantText('')
     }
-    await router.route(inbound({ externalMessageId: 'm2', reactionRef: REF_B }))
-    await router.__testing!.flushDebounce(KEY)
+    await router.__testing!.flushDebounce(key)
 
-    // then the stale silent-ack :eyes: is retired
-    await waitFor(() => removed.length > 0)
-    expect(removed).toContainEqual(SILENT_ACK_INSTANCE)
-  })
+    await waitFor(() => added.length === 1)
+    expect(added[0]).toMatchObject({ emoji: 'eyes', reactionRef: triggerRef })
 
-  test('a reply retires ALL outstanding silent-ack :eyes: in the conversation', async () => {
-    const dir = await tempDir()
-    const { router, sessions, added, removed } = setup(dir)
-
-    // given two separate silent turns, each planting its own :eyes:
-    await router.route(inbound({ reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.filter((r) => r.emoji === 'eyes').length === 1)
-
-    await router.route(inbound({ externalMessageId: 'm2', reactionRef: REF_B }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.filter((r) => r.emoji === 'eyes').length === 2)
-
-    // when a third turn finally replies
     sessions[0]!.onPrompt = async () => {
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'done' })
-      sessions[0]!.setAssistantText('done')
+      await router.send({ ...key, text: 'Review complete.' })
+      sessions[0]!.setAssistantText('Review complete.')
     }
-    await router.route(inbound({ externalMessageId: 'm3', reactionRef: REF_A }))
-    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ ...key, externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(key)
 
-    // then both silent-ack markers are removed, not just the latest
-    await waitFor(() => removed.length === 2)
-    expect(removed).toEqual([SILENT_ACK_INSTANCE, SILENT_ACK_INSTANCE])
+    await waitFor(() => removed.length === 1)
+    expect(removed).toEqual([acknowledgementRef])
   })
 
-  test('a later silent turn does NOT remove the earlier silent-ack :eyes:', async () => {
-    const dir = await tempDir()
-    const { router, sessions, added, removed } = setup(dir)
-
-    await router.route(inbound({ reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.filter((r) => r.emoji === 'eyes').length === 1)
-
-    // when a second turn is ALSO silent
-    await router.route(inbound({ externalMessageId: 'm2', reactionRef: REF_B }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.filter((r) => r.emoji === 'eyes').length === 2)
-
-    // then nothing is removed — silence never contradicts a prior "seen" ack
-    expect(removed).toHaveLength(0)
-  })
-
-  test('a Korean silent turn then a reply retires the :eyes: (language-agnostic)', async () => {
-    const dir = await tempDir()
-    const { router, sessions, added, removed } = setup(dir)
-
-    // given a Korean inbound the agent silently acks
-    await router.route(inbound({ text: '확인만 해주세요', reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.some((r) => r.emoji === 'eyes'))
-
-    // when a later Korean turn replies
-    sessions[0]!.onPrompt = async () => {
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '네, 처리했어요' })
-      sessions[0]!.setAssistantText('네, 처리했어요')
-    }
-    await router.route(inbound({ externalMessageId: 'm2', text: '고마워요', reactionRef: REF_B }))
-    await router.__testing!.flushDebounce(KEY)
-
-    // then the marker is retired regardless of message language
-    await waitFor(() => removed.length > 0)
-    expect(removed).toContainEqual(SILENT_ACK_INSTANCE)
-  })
-
-  test('a reply removes the :eyes: even when the silent-ack add resolves AFTER cleanup starts', async () => {
-    // Regression for the race: reactOnSilentAck stores the add PROMISE (not its
-    // resolved ref), so a reply that runs cleanup before a slow add resolves
-    // still awaits it and removes the mark. Here the add is held open until the
-    // reply turn has already drained, forcing cleanup to see an unresolved entry.
+  test('adds a persistent acknowledgement after removing a typing-less engage reaction', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.setTypingCapability('discord-bot', true)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const triggerRef: ReactionRef = { adapter: 'github', value: 'review-request' }
+    const acknowledgementRef: ReactionRef = { adapter: 'github', value: 'review-ack' }
+    const events: string[] = []
+    router.registerReaction('github', async (req) => {
+      events.push(`add-${req.emoji}`)
+      return { ok: true, reactionRef: acknowledgementRef }
+    })
+    router.registerRemoveReaction('github', async () => {
+      events.push('remove-eyes')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ ...key, isBotMention: true, reactionRef: triggerRef }))
+    sessions[0]!.onPrompt = () => {
+      router.noteGithubReviewOutput({
+        sessionId: 'ses_fake_1',
+        workspace: 'acme/repo',
+        prNumber: 672,
+        state: 'APPROVE',
+      })
+      sessions[0]!.setAssistantText('')
+    }
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => events.length === 3)
+    expect(events).toEqual(['add-eyes', 'remove-eyes', 'add-eyes'])
+  })
+
+  test('removes a slow persistent acknowledgement when a later reply races its add', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const acknowledgementRef: ReactionRef = { adapter: 'github', value: 'review-ack' }
     const removed: ReactionRef[] = []
-    let releaseSilentAckAdd: (() => void) | null = null
-    const silentAckAddGate = new Promise<void>((resolve) => {
-      releaseSilentAckAdd = resolve
+    let releaseAdd: (() => void) | null = null
+    const addGate = new Promise<void>((resolve) => {
+      releaseAdd = resolve
     })
     let addCount = 0
-    router.registerReaction('discord-bot', async () => {
+    router.setTypingCapability('github', true)
+    router.registerReaction('github', async () => {
       addCount++
-      await silentAckAddGate
-      return { ok: true, reactionRef: SILENT_ACK_INSTANCE }
+      await addGate
+      return { ok: true, reactionRef: acknowledgementRef }
     })
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveReaction('github', async (req) => {
       removed.push(req.reactionRef)
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('github', async () => ({ ok: true }))
 
-    // given a silent turn whose :eyes: add is still in flight (gated)
-    await router.route(inbound({ reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
+    await router.route(
+      inbound({ ...key, isBotMention: true, reactionRef: { adapter: 'github', value: 'review-request' } }),
+    )
+    sessions[0]!.onPrompt = () => {
+      router.noteGithubReviewOutput({
+        sessionId: 'ses_fake_1',
+        workspace: 'acme/repo',
+        prNumber: 672,
+        state: 'APPROVE',
+      })
+      sessions[0]!.setAssistantText('')
+    }
+    await router.__testing!.flushDebounce(key)
     await waitFor(() => addCount === 1)
 
-    // when a later turn replies while the add is STILL unresolved
     sessions[0]!.onPrompt = async () => {
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'done' })
-      sessions[0]!.setAssistantText('done')
+      await router.send({ ...key, text: 'Review complete.' })
+      sessions[0]!.setAssistantText('Review complete.')
     }
-    await router.route(inbound({ externalMessageId: 'm2', reactionRef: REF_B }))
-    await router.__testing!.flushDebounce(KEY)
-    // let the gated add resolve only now — after cleanup has already begun
-    releaseSilentAckAdd!()
+    await router.route(inbound({ ...key, externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(key)
+    releaseAdd!()
 
-    // then cleanup still awaits the add and retires the mark (no strand)
-    await waitFor(() => removed.length > 0)
-    expect(removed).toContainEqual(SILENT_ACK_INSTANCE)
+    await waitFor(() => removed.length === 1)
+    expect(removed).toEqual([acknowledgementRef])
+  })
+
+  test('a later reply removes all outstanding persistent acknowledgements', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const acknowledgementRefs: ReactionRef[] = [
+      { adapter: 'github', value: 'review-ack-1' },
+      { adapter: 'github', value: 'review-ack-2' },
+    ]
+    const removed: ReactionRef[] = []
+    let addCount = 0
+    router.setTypingCapability('github', true)
+    router.registerReaction('github', async () => {
+      const reactionRef = acknowledgementRefs[addCount]
+      if (!reactionRef) throw new Error('unexpected persistent acknowledgement')
+      addCount++
+      return { ok: true, reactionRef }
+    })
+    router.registerRemoveReaction('github', async (req) => {
+      removed.push(req.reactionRef)
+      return { ok: true }
+    })
+    router.registerOutbound('github', async () => ({ ok: true }))
+
+    for (let index = 0; index < 2; index++) {
+      await router.route(
+        inbound({
+          ...key,
+          externalMessageId: `m${index + 1}`,
+          isBotMention: true,
+          reactionRef: { adapter: 'github', value: `review-request-${index + 1}` },
+        }),
+      )
+      sessions[0]!.onPrompt = () => {
+        router.noteGithubReviewOutput({
+          sessionId: 'ses_fake_1',
+          workspace: 'acme/repo',
+          prNumber: 672,
+          state: 'APPROVE',
+        })
+        sessions[0]!.setAssistantText('')
+      }
+      await router.__testing!.flushDebounce(key)
+      await waitFor(() => addCount === index + 1)
+    }
+
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ ...key, text: 'Review complete.' })
+      sessions[0]!.setAssistantText('Review complete.')
+    }
+    await router.route(inbound({ ...key, externalMessageId: 'm3' }))
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => removed.length === 2)
+    expect(removed).toEqual(acknowledgementRefs)
   })
 })
 
@@ -4391,8 +4925,7 @@ describe('ChannelRouter model react only when replying', () => {
 
   test('drops a queued channel_react reaction when the turn stays silent', async () => {
     // given a typing-capable adapter (no eager engage :eyes:) whose model queues
-    // a reaction but sends no reply. The queued reaction uses a DISTINCT emoji so
-    // it is separable from the silent-ack :eyes: a NO_REPLY turn now leaves.
+    // a reaction but sends no reply.
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
@@ -5093,7 +5626,7 @@ describe('ChannelRouter channel-turn protocol', () => {
           state: 'APPROVE',
         })
       }
-      emptyStopAfterToolWork(sessions[0]!)
+      strandOnUnansweredToolUse(sessions[0]!, 'github-review-output')
     }
     await router.__testing!.flushDebounce(githubKey)
 
@@ -5441,7 +5974,7 @@ describe('ChannelRouter channel-turn protocol', () => {
       router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'duplicate' })
       // given: model leaked meta-narration before / instead of NO_REPLY.
       // The skip guard must win — recovery would otherwise post this.
-      sessions[0]!.setAssistantText("Same story as before; I'll stay quiet here.")
+      sessions[0]!.setAssistantMidTurn("Same story as before; I'll stay quiet here.")
     }
     await router.__testing!.flushDebounce(KEY)
 
@@ -5818,6 +6351,34 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(dupResults.every((r) => r.ok === false && r.code === 'duplicate')).toBe(true)
     expect(sent).toEqual([{ text: 'same text' }])
     expect(logs.some((m) => m.includes('aborting turn') && m.includes('policy-denied'))).toBe(true)
+  })
+
+  test('policy-denial abort log identifies the session id, reason, and firing site for operator diagnosis', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'just FYI' }))
+    sessions[0]!.onPrompt = async () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
+      let i = 0
+      while (!sessions[0]!.agent.signal.aborted && i < 100) {
+        await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: `attempt ${i}` })
+        i++
+      }
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.agent.signal.aborted).toBe(true)
+    const abortLog = logs.find((m) => m.includes('site=policy_denied_send_cap'))
+    expect(abortLog).toBeDefined()
+    expect(abortLog).toContain('session=ses_fake_1')
+    expect(abortLog).toContain('reason=policy_denied:skip-locked')
   })
 
   test('policy-denial loop: counter resets per turn (denials below the ceiling do not throw, next turn replies)', async () => {
@@ -6872,14 +7433,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('blocked assistant_text_without_channel_tool'))).toBe(false)
   })
 
-  // Regression for the Kimi-on-Fireworks `kimi-k2p6-turbo` KakaoTalk silence
-  // bug: the model narrated a user-facing reply ("16x now") AND committed to a
-  // tool plan in the same message (stopReason='toolUse'), then the turn ended
-  // before any follow-up message that would have called channel_reply was
-  // persisted. The leaf is the assistant message itself, not a toolResult, so
-  // 'pre-tool' recovery does not apply. Without 'mid-turn' recovery the prose
-  // is silently dropped and the user sees nothing.
-  test('mid-turn recovery: recovers prose when leaf is a toolUse assistant with no follow-up', async () => {
+  test('mid-turn recovery: retries unfinished toolUse prose instead of publishing it as the reply', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -6889,17 +7443,24 @@ describe('ChannelRouter channel-turn protocol', () => {
       return { ok: true }
     })
 
-    await router.route(inbound({ text: 'go 16x speed' }))
+    await router.route(inbound({ text: '설정 적용됐어?' }))
+    let attempt = 0
     sessions[0]!.onPrompt = () => {
-      sessions[0]!.setAssistantMidTurn('Running at 16x speed! Hold on a sec and I will grab a screenshot!')
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('Configuration parsed. Next I will run the remaining step.')
+        return
+      }
+      sessions[0]!.setAssistantText('설정이 적용됐어요.')
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(
-      logs.some((m) => m.includes('recovering assistant_text_without_channel_tool') && m.includes('source=mid-turn')),
-    ).toBe(true)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
     expect(sent).toHaveLength(1)
-    expect(sent[0]!.text).toBe('Running at 16x speed! Hold on a sec and I will grab a screenshot!')
+    expect(sent[0]!.text).toBe('설정이 적용됐어요.')
+    expect(sent.some((message) => message.text.includes('Configuration parsed'))).toBe(false)
+    expect(logs.some((message) => message.includes('source=mid-turn'))).toBe(false)
   })
 
   test('mid-turn recovery: applies the NO_REPLY guard to recovered prose', async () => {
@@ -6923,7 +7484,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
   })
 
-  test('mid-turn recovery: applies the Kimi tool-call leak guard to recovered prose', async () => {
+  test('mid-turn recovery: never publishes tool-call-like unfinished prose while exhausting retries', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -6941,8 +7502,9 @@ describe('ChannelRouter channel-turn protocol', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(sent).toHaveLength(0)
-    expect(logs.some((m) => m.includes('suppressed kimi_tool_call_leak'))).toBe(true)
+    expect(sessions[0]!.prompts).toHaveLength(1 + MAX_EMPTY_TURN_RETRIES)
+    expect(sent.map((message) => message.text)).toEqual([EMPTY_TURN_FALLBACK_TEXT])
+    expect(sent.some((message) => message.text.includes('tool_call_argument_begin'))).toBe(false)
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
   })
 
@@ -6962,7 +7524,12 @@ describe('ChannelRouter channel-turn protocol', () => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
-    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: true, approve: true }))
+    router.registerReviewStateResolver('github', async () => ({
+      ok: true,
+      selfBlocking: true,
+      selfBlockingReviewId: null,
+      approve: true,
+    }))
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672' }))
     sessions[0]!.onPrompt = () => {
@@ -6988,7 +7555,12 @@ describe('ChannelRouter channel-turn protocol', () => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
-    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: false, approve: true }))
+    router.registerReviewStateResolver('github', async () => ({
+      ok: true,
+      selfBlocking: false,
+      selfBlockingReviewId: null,
+      approve: true,
+    }))
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672' }))
     sessions[0]!.onPrompt = () => {
@@ -7025,7 +7597,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(true)
   })
 
-  test('mid-turn recovery: applies the upstream empty-response sentinel guard to recovered prose', async () => {
+  test('mid-turn recovery: never publishes an unfinished upstream empty-response sentinel', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -7044,17 +7616,16 @@ describe('ChannelRouter channel-turn protocol', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(sent).toHaveLength(0)
-    expect(logs.some((m) => m.includes('suppressed upstream_empty_response_sentinel'))).toBe(true)
+    expect(sessions[0]!.prompts).toHaveLength(1 + MAX_EMPTY_TURN_RETRIES)
+    expect(sent.map((message) => message.text)).toEqual([EMPTY_TURN_FALLBACK_TEXT])
+    expect(sent.some((message) => message.text.includes('Empty response'))).toBe(false)
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
   })
 
-  // The leaf-assistant branch recovers ONLY 'stop' and 'toolUse'. length /
-  // error / aborted carry visible text too, but it's a truncation or an
-  // errored partial, not a deliberate reply — recovering it would post broken
-  // output. This is the load-bearing scoping of the mid-turn fix. The truncated
-  // prose is NEVER posted; instead the empty-turn guard retries the turn and,
-  // on exhaustion, posts the fallback (asserted in the empty-turn suite below).
+  // The leaf-assistant branch classifies unfinished `toolUse` separately from
+  // length / error / aborted truncations. None is a deliberate reply, but their
+  // recovery owners differ: toolUse continues from existing results, while the
+  // other stop reasons retain their provider/budget-specific paths.
   for (const stopReason of ['length', 'error', 'aborted'] as const) {
     test(`mid-turn recovery: does NOT recover a leaf assistant with stopReason='${stopReason}'`, async () => {
       const dir = await tempDir()
@@ -7801,14 +8372,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('blocked assistant_text_without_channel_tool'))).toBe(false)
   })
 
-  // Regression for the Kimi-on-Fireworks `kimi-k2p6-turbo` channel-silence
-  // bug observed on 2026-05-26: the model emitted text + a tool call
-  // (stopReason='toolUse'), the tool ran successfully, but the upstream
-  // pi-agent-core loop never produced a follow-up assistant message after
-  // the toolResult. The session JSONL ended with the toolResult as the leaf,
-  // `prompt()` resolved cleanly, and the channel router silently dropped the
-  // pre-tool commentary. User saw nothing in Discord.
-  test('pre-tool recovery: recovers assistant text when leaf is toolResult with no follow-up', async () => {
+  test('pre-tool recovery: retries unfinished prose instead of publishing it when the toolResult has no follow-up', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -7819,7 +8383,13 @@ describe('ChannelRouter channel-turn protocol', () => {
     })
 
     await router.route(inbound({ text: 'why is cron not working' }))
+    let attempt = 0
     sessions[0]!.onPrompt = () => {
+      attempt++
+      if (attempt > 1) {
+        sessions[0]!.setAssistantText('Cron is configured and running.')
+        return
+      }
       // given: an assistant message with text + a tool call. The model never
       // produced a follow-up assistant message after the tool result, so the
       // leaf is the toolResult, NOT the assistant message.
@@ -7870,11 +8440,12 @@ describe('ChannelRouter channel-turn protocol', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(
-      logs.some((m) => m.includes('recovering assistant_text_without_channel_tool') && m.includes('source=pre-tool')),
-    ).toBe(true)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
     expect(sent).toHaveLength(1)
-    expect(sent[0]!.text).toBe('Sorry about that. I will look into the cron issue right now.')
+    expect(sent[0]!.text).toBe('Cron is configured and running.')
+    expect(sent.some((message) => message.text.includes('look into'))).toBe(false)
+    expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool source=pre-tool'))).toBe(false)
   })
 
   test('pre-tool recovery: still applies NO_REPLY / Kimi-leak / empty-sentinel guards', async () => {
@@ -7968,6 +8539,125 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sent).toHaveLength(1)
     expect(sent[0]!.text).toBe('real reply')
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
+  })
+
+  test('stranded toolUse without a send: retries the same turn and delivers the Korean conclusion', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '설정 된 건가요' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = () => {
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('')
+        return
+      }
+      sessions[0]!.setAssistantText('네, 설정이 적용됐어요.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
+    expect(sent.map((message) => message.text)).toEqual(['네, 설정이 적용됐어요.'])
+    expect(logs.some((message) => message.includes('cause=stranded_toolUse_without_send'))).toBe(true)
+    expect(logs.some((message) => message.includes('no_reply'))).toBe(false)
+  })
+
+  test('stranded toolUse without a send: posts exactly one fallback after exhausting the shared retry budget', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'is it configured?' }))
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantMidTurn('')
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1 + MAX_EMPTY_TURN_RETRIES)
+    expect(
+      logs.filter(
+        (message) => message.includes('empty_turn_retry') && message.includes('stranded_toolUse_without_send'),
+      ),
+    ).toHaveLength(MAX_EMPTY_TURN_RETRIES)
+    expect(sent.map((message) => message.text)).toEqual([EMPTY_TURN_FALLBACK_TEXT])
+    expect(
+      logs.filter((message) =>
+        message.includes('empty_turn_fallback cause=stranded_toolUse_without_send_retries_exhausted'),
+      ),
+    ).toHaveLength(1)
+  })
+
+  test('stranded toolUse without a send: a queued fresh inbound supersedes recovery and is answered next', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'first question' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('')
+        await router.route(inbound({ text: 'new context', externalMessageId: 'm2' }))
+        return
+      }
+      sessions[0]!.setAssistantText('Answer using the new context.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('new context')
+    expect(sessions[0]!.prompts[1]).not.toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
+    expect(sent.map((message) => message.text)).toEqual(['Answer using the new context.'])
+    expect(logs.some((message) => message.includes('cause=stranded_toolUse_without_send'))).toBe(false)
+    expect(logs.some((message) => message.includes('empty_turn_fallback'))).toBe(false)
+  })
+
+  test('stranded toolUse without a send: text-bearing narration stays private when fresh inbound is queued', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'first question' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('도구 결과를 확인한 다음 답변하겠습니다.')
+        await router.route(inbound({ text: 'new context', externalMessageId: 'm2' }))
+        return
+      }
+      sessions[0]!.setAssistantText('새 컨텍스트를 반영한 답변입니다.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('new context')
+    expect(sessions[0]!.prompts[1]).not.toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
+    expect(sent.map((message) => message.text)).toEqual(['새 컨텍스트를 반영한 답변입니다.'])
+    expect(sent.some((message) => message.text.includes('도구 결과'))).toBe(false)
+    expect(logs.some((message) => message.includes('cause=unfinished_toolUse_continuation_ineligible'))).toBe(true)
   })
 
   // Regression for the "I'll check right now" → silence bug (Discord channel,
@@ -8077,6 +8767,87 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('empty_turn_retry attempt=1'))).toBe(true)
   })
 
+  // Regression for the 2026-08-28 Discord fingerprint. A terminal
+  // channel_reply deliberately ends on its matching toolResult with no
+  // follow-up assistant message. That is a completed turn, not the
+  // `more_work_this_turn: true` stranded-work shape above.
+  test('terminal channel_reply does not enter stranded-toolUse recovery after its result is persisted', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'is it done?' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Done.' })
+      const terminal = await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Done.'))
+      expect(terminal).toBeUndefined()
+      strandOnUnansweredToolUse(sessions[0]!, 'terminal-reply')
+      await streamOnce(sessions[0]!)
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toEqual(['Done.'])
+    expect(logs.some((message) => message.includes('cause=stranded_toolUse_after_send'))).toBe(false)
+  })
+
+  test('repairs an already-poisoned unmatched toolUse before later user messages run', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      onSessionCreated: (session) => strandOnMissingToolResult(session, 'persisted-terminal-reply'),
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'are you still there?' }))
+    sessions[0]!.onPrompt = async () => {
+      const leaf = sessions[0]!.sessionManager.getLeafEntry()
+      if (leaf?.type !== 'message' || leaf.message.role !== 'toolResult') return
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Yes — continuing normally.' })
+      sessions[0]!.setAssistantText('Yes — continuing normally.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toEqual(['Yes — continuing normally.'])
+    expect(logs.some((message) => message.includes('branch_repair=missing_tool_result'))).toBe(true)
+
+    await router.route(inbound({ text: 'and this one?', externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent).toEqual(['Yes — continuing normally.', 'Yes — continuing normally.'])
+  })
+
+  test('textless terminal channel_reply still records completion and avoids stranded recovery', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'send the file' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1' })
+      const context = terminalReplyContext('unused')
+      context.toolCall.arguments = {}
+      await sessions[0]!.agent.afterToolCall!(context)
+      strandOnUnansweredToolUse(sessions[0]!, 'terminal-attachment')
+      await streamOnce(sessions[0]!)
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(logs.some((message) => message.includes('cause=stranded_toolUse_after_send'))).toBe(false)
+  })
+
   test('continue-reply guard: logs policy-denied abort provenance when retrying stranded toolUse', async () => {
     const dir = await tempDir()
     const logs: string[] = []
@@ -8097,6 +8868,7 @@ describe('ChannelRouter channel-turn protocol', () => {
           await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'checking now' })
         }
         strandOnUnansweredToolUse(sessions[0]!, 'policy-denied')
+        sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
         return
       }
       expect(text).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
@@ -8884,6 +9656,166 @@ describe('ChannelRouter stop', () => {
   })
 })
 
+describe('ChannelRouter GitHub PR abort', () => {
+  test('stops every active thread session for exactly one PR and clears its live and persisted round state', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const subagents = new LiveSubagentRegistry()
+    let reviewerAborts = 0
+    subagents.register({
+      taskId: 'bg_reviewer',
+      sessionId: 'ses_reviewer',
+      subagentName: 'reviewer',
+      parentSessionId: 'ses_fake_1',
+      workKey: 'reviewer:github:acme/widgets#42',
+      startedAt: 1_000,
+      status: 'running',
+      abort: async () => {
+        reviewerAborts++
+      },
+    })
+    const { router, sessions } = makeRouter(dir, {
+      cancelRunningSubagentsByWorkKey: (workKey, reason) => subagents.cancelRunningByWorkKey(workKey, reason),
+    })
+    const targetRound = {
+      kind: 'push',
+      roundId: 'target-round',
+      workspace: 'acme/widgets',
+      prNumber: 42,
+      headSha: 'target-head',
+      carrierThread: null,
+    } as const
+    const otherRound = {
+      ...targetRound,
+      roundId: 'other-round',
+      prNumber: 43,
+      headSha: 'other-head',
+    } as const
+    const keys: ChannelKey[] = [
+      { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null },
+      { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: 'review:101' },
+      { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:43', thread: null },
+      { adapter: 'github', workspace: 'acme/gadgets', chat: 'pr:42', thread: null },
+      { adapter: 'slack-bot', workspace: 'acme/widgets', chat: 'pr:42', thread: null },
+    ]
+    for (const [index, key] of keys.entries()) {
+      await router.route(
+        inbound({
+          ...key,
+          externalMessageId: `abort-${index}`,
+          ...(key.adapter === 'github' && key.workspace === 'acme/widgets' && key.chat === 'pr:42'
+            ? { githubReviewRound: targetRound }
+            : {}),
+          ...(key.adapter === 'github' && key.workspace === 'acme/widgets' && key.chat === 'pr:43'
+            ? { githubReviewRound: otherRound }
+            : {}),
+        }),
+      )
+    }
+
+    const result = await router.abortGithubPrTurn!('acme/widgets', 42, 'pull request converted to draft')
+
+    expect(result).toEqual({ kind: 'aborted', matchedSessions: 2, matchedReviewers: 1, abortFailures: 0 })
+    expect(sessions.map((session) => session.aborted)).toEqual([1, 1, 0, 0, 0])
+    expect(reviewerAborts).toBe(1)
+    expect(subagents.get('bg_reviewer')?.status).toBe('failed')
+    expect(router.__testing!.githubReviewRoundFor(keys[0]!)).toBeNull()
+    expect(router.__testing!.githubReviewRoundFor(keys[1]!)).toBeNull()
+    expect(router.__testing!.githubReviewRoundFor(keys[2]!)).toEqual(otherRound)
+    const persisted = await loadChannelSessions(dir)
+    expect(
+      persisted
+        .filter(
+          (record) => record.adapter === 'github' && record.workspace === 'acme/widgets' && record.chat === 'pr:42',
+        )
+        .every((record) => record.githubReviewRound === undefined),
+    ).toBe(true)
+    expect(
+      persisted.find(
+        (record) => record.adapter === 'github' && record.workspace === 'acme/widgets' && record.chat === 'pr:43',
+      )?.githubReviewRound,
+    ).toMatchObject(otherRound)
+
+    await router.stop()
+    __resetReviewVerdictGuardForTest()
+  })
+
+  test('counts a failed session abort without preventing sibling sessions from stopping', async () => {
+    const dir = await tempDir()
+    let created = 0
+    const { router, sessions } = makeRouter(dir, {
+      onSessionCreated: (session) => {
+        created++
+        if (created !== 1) return
+        session.abort = async () => {
+          session.aborted++
+          throw new Error('session abort failed')
+        }
+      },
+    })
+    await router.route(
+      inbound({ adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null, externalMessageId: 'a' }),
+    )
+    await router.route(
+      inbound({
+        adapter: 'github',
+        workspace: 'acme/widgets',
+        chat: 'pr:42',
+        thread: 'review:101',
+        externalMessageId: 'b',
+      }),
+    )
+
+    const result = await router.abortGithubPrTurn!('acme/widgets', 42, 'pull request converted to draft')
+
+    expect(result).toEqual({ kind: 'aborted', matchedSessions: 2, matchedReviewers: 0, abortFailures: 1 })
+    expect(sessions.map((session) => session.aborted)).toEqual([1, 1])
+    await router.stop()
+  })
+
+  test('returns no-live-session when no active work matches the PR', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+
+    expect(await router.abortGithubPrTurn!('acme/widgets', 42, 'pull request converted to draft')).toEqual({
+      kind: 'no-live-session',
+    })
+
+    await router.stop()
+  })
+
+  test('reports an abort when only a background reviewer remains after its parent turn ends', async () => {
+    const dir = await tempDir()
+    const subagents = new LiveSubagentRegistry()
+    let reviewerAborts = 0
+    subagents.register({
+      taskId: 'bg_idle_parent_reviewer',
+      sessionId: 'ses_idle_parent_reviewer',
+      subagentName: 'reviewer',
+      parentSessionId: 'ses_fake_1',
+      workKey: 'reviewer:github:acme/widgets#42',
+      startedAt: 1_000,
+      status: 'running',
+      abort: async () => {
+        reviewerAborts++
+      },
+    })
+    const { router, sessions } = makeRouter(dir, {
+      cancelRunningSubagentsByWorkKey: (workKey, reason) => subagents.cancelRunningByWorkKey(workKey, reason),
+    })
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null }
+    await router.route(inbound({ ...key, externalMessageId: 'review-start' }))
+    await router.__testing!.flushDebounce(key)
+
+    const result = await router.abortGithubPrTurn!('acme/widgets', 42, 'pull request converted to draft')
+
+    expect(result).toEqual({ kind: 'aborted', matchedSessions: 0, matchedReviewers: 1, abortFailures: 0 })
+    expect(reviewerAborts).toBe(1)
+    expect(sessions[0]!.aborted).toBe(0)
+    await router.stop()
+  })
+})
+
 describe('ChannelRouter typing heartbeat interval', () => {
   test('adapters default to TYPING_HEARTBEAT_MS when no override is registered', async () => {
     const dir = await tempDir()
@@ -8942,6 +9874,31 @@ describe('ChannelRouter commands', () => {
     expect(sessions[0]!.prompts[0]).toContain('long task')
   })
 
+  test('/stop logs a diagnostic abort line identifying the session, reason, and site', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    let releasePrompt: (() => void) | undefined
+
+    await router.route(inbound({ text: 'long task' }))
+    sessions[0]!.onPrompt = async () => {
+      await new Promise<void>((resolve) => {
+        releasePrompt = resolve
+      })
+    }
+    const draining = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length === 1)
+
+    await router.route(inbound({ text: '/stop', externalMessageId: 'm-stop' }))
+    releasePrompt!()
+    await draining
+
+    const abortLog = logs.find((m) => m.includes('site=user_stop'))
+    expect(abortLog).toBe(
+      'info:[channels] discord-bot:g1:c1:: command /stop aborted current turn site=user_stop session=ses_fake_1 reason=user_stop',
+    )
+  })
+
   test('/stop supersedes terminal-reply provenance before the aborted outcome is captured', async () => {
     const dir = await tempDir()
     const scope = resolveTodoScope({
@@ -8967,8 +9924,6 @@ describe('ChannelRouter commands', () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping as requested.' })
       await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Stopping as requested.'))
       await router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
-      sessions[0]!.setAssistantMidTurn('Stopping as requested.', 'aborted')
-      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
     }
     await router.__testing!.flushDebounce(KEY)
 
@@ -9014,7 +9969,7 @@ describe('ChannelRouter commands', () => {
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping as requested.' })
       await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Stopping as requested.'))
-      sessions[0]!.setAssistantMidTurn('Stopping as requested.', 'aborted')
+      await streamOnce(sessions[0]!)
       sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
       await waitFor(() => terminalWriteStarted)
       const stopping = router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
@@ -9200,6 +10155,28 @@ describe('ChannelRouter.executeCommand (native slash-command surface)', () => {
     const result = await router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
     releasePrompt!()
     await draining
+
+    expect(result).toEqual({ kind: 'handled', name: 'stop', reply: 'Stopped the current turn.' })
+    expect(sessions[0]!.aborted).toBe(1)
+  })
+
+  // Production fingerprint, Discord 2026-08-28: one registered session
+  // consumed repeated user messages while every prompt completed without an
+  // assistant entry. Native /stop resolved the exact channel key but rejected
+  // the idle-between-prompts session as "no-live-session", removing the only
+  // user-controlled escape hatch until stale rollover.
+  test('Discord /stop aborts an exact live session that repeatedly produced no assistant output', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+
+    await router.route(inbound({ text: 'first attempt', externalMessageId: 'm-first' }))
+    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ text: 'second attempt', externalMessageId: 'm-second' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    const result = await router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
 
     expect(result).toEqual({ kind: 'handled', name: 'stop', reply: 'Stopped the current turn.' })
     expect(sessions[0]!.aborted).toBe(1)
@@ -9437,20 +10414,30 @@ describe('ChannelRouter.executeCommand (native slash-command surface)', () => {
     expect(sessions[0]!.aborted).toBe(0)
   })
 
-  test('stop on an observe-only exact-thread session reports no-live-session and aborts nothing', async () => {
+  test('Slack stop on an observe-only exact-thread session reports no-live-session and aborts nothing', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
+    const slackThreadKey: ChannelKey = { adapter: 'slack-bot', workspace: 'g1', chat: 'c1', thread: 'thr-1' }
     // Prime a second human so the strict multi-human gate applies and an
     // unaddressed thread message observes (creating a live session) rather than
     // engaging — the bystander state the fix must treat as "nothing to stop".
-    await router.route(inbound({ thread: 'thr-1', isBotMention: true, authorId: 'carol', authorName: 'carol' }))
-    await router.__testing!.flushDebounce({ ...KEY, thread: 'thr-1' })
+    await router.route(
+      inbound({ adapter: 'slack-bot', thread: 'thr-1', isBotMention: true, authorId: 'carol', authorName: 'carol' }),
+    )
+    await router.__testing!.flushDebounce(slackThreadKey)
     const engagedSessions = sessions.length
     await router.route(
-      inbound({ thread: 'thr-1', isBotMention: false, authorId: 'bob', authorName: 'bob', externalMessageId: 'm-obs' }),
+      inbound({
+        adapter: 'slack-bot',
+        thread: 'thr-1',
+        isBotMention: false,
+        authorId: 'bob',
+        authorName: 'bob',
+        externalMessageId: 'm-obs',
+      }),
     )
 
-    const result = await router.executeCommand({ ...KEY, thread: 'thr-1' }, 'stop', { invokerId: 'alice' })
+    const result = await router.executeCommand(slackThreadKey, 'stop', { invokerId: 'alice' })
 
     expect(result).toEqual({ kind: 'no-live-session' })
     // The observe-only inbound created no new session that got aborted, and the
@@ -11363,6 +12350,24 @@ describe('ChannelRouter peer-bot loop guard', () => {
     expect(lastPrompt).toContain('[SYSTEM MESSAGE — not from a human]')
     expect(lastPrompt).toContain('Do not acknowledge or reply to this notice')
     expect(lastPrompt).toContain('NO_REPLY')
+  })
+
+  test('a peer-bot loop-guard turn that emits NO_REPLY stays silent', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    for (let i = 0; i < 5; i++) {
+      await router.route(botInbound({ externalMessageId: `peer-${i}`, authorId: `peer-${i}` }))
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    expect(sent).toEqual([])
   })
 
   test('slow peer-bot ring (>60s gaps) still trips via since-human counter', async () => {
@@ -13861,6 +14866,53 @@ describe('ChannelRouter role-claim bypass', () => {
 })
 
 describe('ChannelRouter injectSubagentCompletionReminder', () => {
+  test('a rejected fire-and-forget drain is reported, and does not wedge or reject the settle seam', async () => {
+    // given: a live session, plus a permission service that can be armed to
+    //   throw from the per-turn role resolution `drain()` performs OUTSIDE the
+    //   prompt-level catch — so the whole drain rejects rather than being
+    //   absorbed as a prompt error
+    const dir = await tempDir()
+    const logs: string[] = []
+    let failRoleDescribe = false
+    const permissions: PermissionService = {
+      ...grantAllPermissions,
+      describe: () => {
+        if (failRoleDescribe) throw new Error('role describe boom')
+        return { role: 'owner', permissions: ['channel.respond'] }
+      },
+    }
+    const { router, sessions } = makeRouter(dir, { logs, permissions })
+    await router.route(inbound())
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+    await router.__testing!.flushDebounce(KEY)
+
+    // when: a completion wake starts a fire-and-forget `void drain(live)` that
+    // rejects. Nothing awaits that promise, so this is the only path on which
+    // the failure can still be seen.
+    failRoleDescribe = true
+    expect(
+      router.injectSubagentCompletionReminder({
+        parentSessionId: 'ses_fake_1',
+        subagent: 'explorer',
+        taskId: 'bg_drain_boom',
+        ok: true,
+        durationMs: 100,
+      }).kind,
+    ).toBe('delivered')
+
+    // then: the failure is reported rather than swallowed by the tracking, and
+    // settling resolves — one failed drain must not reject an unrelated waiter
+    await expect(router.__testing!.flushDebounce(KEY)).resolves.toBeUndefined()
+    expect(
+      logs.some((l) => l.startsWith('error:') && l.includes('drain failed') && l.includes('role describe boom')),
+    ).toBe(true)
+
+    // and: the settled entry did not leak into the tracking set, so a later
+    // flush still returns instead of waiting forever on a dead promise
+    failRoleDescribe = false
+    await expect(router.__testing!.flushDebounce(KEY)).resolves.toBeUndefined()
+  })
+
   test('matching parentSessionId wakes the channel session with a <system-reminder> turn even when no user inbound is queued', async () => {
     // given a live channel session whose sessionId is the factory-stamped `ses_fake_1`
     const dir = await tempDir()
@@ -14880,9 +15932,14 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
       details: result,
     }
     const args = replyText !== undefined ? { text: replyText } : {}
+    const toolCall = { type: 'toolCall' as const, id: 'tc1', name: toolName, arguments: args }
     return {
-      assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
-      toolCall: { type: 'toolCall', id: 'tc1', name: toolName, arguments: args } as AfterToolCallContext['toolCall'],
+      assistantMessage: {
+        ...assistantMessage(''),
+        content: [toolCall],
+        stopReason: 'toolUse',
+      } as AfterToolCallContext['assistantMessage'],
+      toolCall: toolCall as AfterToolCallContext['toolCall'],
       args,
       result: toolResult as AfterToolCallContext['result'],
       isError,
@@ -14890,29 +15947,227 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     }
   }
 
-  async function liveAgentAfterRoute(dir: string): Promise<FakeSession['agent']> {
+  async function liveSessionAfterRoute(dir: string): Promise<FakeSession> {
     const { router, sessions } = makeRouter(dir)
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
-    return sessions[0]!.agent
+    return sessions[0]!
   }
 
-  test('aborts the run after a successful channel_reply so no post-tool follow-up LLM call runs', async () => {
+  async function liveAgentAfterRoute(dir: string): Promise<FakeSession['agent']> {
+    return (await liveSessionAfterRoute(dir)).agent
+  }
+
+  test('suppresses the provider at the post-tool stream boundary', async () => {
     // given a live channel session with the terminal hook installed
-    const agent = await liveAgentAfterRoute(await tempDir())
+    const session = await liveSessionAfterRoute(await tempDir())
+    const agent = session.agent
     expect(agent.afterToolCall).toBeDefined()
 
     // when channel_reply succeeds (details.ok === true, not an error)
-    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
+    const result = await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
 
-    // then the run's abort signal is fired — the follow-up stream sees it aborted
-    expect(agent.signal.aborted).toBe(true)
+    // The hook itself does not abort before pi-agent-core emits the result.
+    expect(result).toBeUndefined()
+    expect(agent.signal.aborted).toBe(false)
+
+    await streamOnce(session)
+
+    expect(agent.signal.aborted).toBe(false)
+    expect(session.lastStreamMaxTokens).toBeUndefined()
+  })
+
+  test('preserves a prior afterToolCall result when adding terminal completion', async () => {
+    const { router, sessions } = makeRouter(await tempDir(), {
+      onSessionCreated: (session) => {
+        session.agent.afterToolCall = async () => ({
+          content: [{ type: 'text', text: 'prior content' }],
+          details: { prior: true },
+          isError: false,
+        })
+      },
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+
+    const result = await sessions[0]!.agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
+
+    expect(result).toMatchObject({
+      content: [{ type: 'text', text: 'prior content' }],
+      details: { prior: true },
+      isError: false,
+    })
+  })
+
+  test('preserves assistant token usage in the explicit terminal outcome', async () => {
+    const writes: Array<{ termination?: string; tokens?: number }> = []
+    const { router, sessions } = makeRouter(await tempDir(), {
+      recordTurnOutcome: async (args) => {
+        writes.push({
+          ...(args.termination !== undefined ? { termination: args.termination } : {}),
+          ...(args.tokens !== undefined ? { tokens: args.tokens } : {}),
+        })
+      },
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const context = afterToolContext('channel_reply', { ok: true }, false)
+    context.assistantMessage = {
+      ...context.assistantMessage,
+      usage: { ...context.assistantMessage.usage, totalTokens: 73 },
+    }
+
+    await sessions[0]!.agent.afterToolCall!(context)
+    await streamOnce(sessions[0]!)
+    sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+    await waitFor(() => writes.some((write) => write.termination === 'terminal-after-channel-reply'))
+
+    expect(writes.filter((write) => write.termination === 'terminal-after-channel-reply')).toEqual([
+      { termination: 'terminal-after-channel-reply', tokens: 73 },
+    ])
+  })
+
+  test('the pinned parallel agent loop finalizes a mixed batch and makes exactly one provider call', async () => {
+    const registration = registerFauxProvider({
+      provider: 'router-terminal-reply-test',
+      api: 'router-terminal-reply-test',
+      tokenSize: { min: 1, max: 1 },
+    })
+    try {
+      const model = registration.getModel()
+      const executed: string[] = []
+      const tool = (name: string, delayMs: number) => ({
+        name,
+        label: name,
+        description: name,
+        parameters: Type.Object({ text: Type.String() }),
+        execute: async (_toolCallId: string, params: unknown) => {
+          await new Promise((resolve) => setTimeout(resolve, delayMs))
+          executed.push(name)
+          const text =
+            typeof params === 'object' && params !== null && 'text' in params && typeof params.text === 'string'
+              ? params.text
+              : ''
+          return {
+            content: [{ type: 'text' as const, text: `${name}:${text}` }],
+            details: { ok: true },
+          }
+        },
+      })
+      registration.setResponses([
+        fauxAssistantMessage(
+          [
+            fauxToolCall('channel_reply', { text: 'Done.' }, { id: 'reply-call' }),
+            fauxToolCall('sibling', { text: 'Result.' }, { id: 'sibling-call' }),
+          ],
+          { stopReason: 'toolUse' },
+        ),
+        fauxAssistantMessage(fauxText('duplicate follow-up')),
+      ])
+      const coreAgent = new Agent({
+        initialState: {
+          model,
+          tools: [tool('channel_reply', 20), tool('sibling', 1)],
+        },
+        toolExecution: 'parallel',
+      })
+      let sessionRef: FakeSession | undefined
+      let persistedResultsAtOutcome = 0
+      const { router } = makeRouter(await tempDir(), {
+        recordTurnOutcome: async (args) => {
+          if (args.termination !== 'terminal-after-channel-reply') return
+          persistedResultsAtOutcome =
+            sessionRef?.sessionManager
+              .getBranch()
+              .filter((entry) => entry.type === 'message' && entry.message.role === 'toolResult').length ?? 0
+        },
+        onSessionCreated: (session) => {
+          sessionRef = session
+          connectCoreAgent(session, coreAgent)
+        },
+      })
+      await router.route(inbound())
+      await router.__testing!.flushDebounce(KEY)
+
+      await coreAgent.prompt('run both tools')
+      await waitFor(() => persistedResultsAtOutcome > 0)
+
+      expect(executed).toEqual(['sibling', 'channel_reply'])
+      expect(
+        coreAgent.state.messages
+          .filter((message) => message.role === 'toolResult')
+          .map((message) => message.toolCallId),
+      ).toEqual(['reply-call', 'sibling-call'])
+      expect(persistedResultsAtOutcome).toBe(2)
+      expect(
+        sessionRef?.sessionManager
+          .getBranch()
+          .filter((entry) => entry.type === 'message' && entry.message.role === 'toolResult')
+          .map((entry) =>
+            entry.type === 'message' && entry.message.role === 'toolResult' ? entry.message.toolCallId : '',
+          ),
+      ).toEqual(['reply-call', 'sibling-call'])
+      expect(registration.state.callCount).toBe(1)
+    } finally {
+      registration.unregister()
+    }
+  })
+
+  test('keeps a mixed batch alive when its sole channel_reply fails', async () => {
+    const session = await liveSessionAfterRoute(await tempDir())
+    const agent = session.agent
+    const replyCall = {
+      type: 'toolCall' as const,
+      id: 'reply-call',
+      name: 'channel_reply',
+      arguments: { text: 'Done.' },
+    }
+    const readCall = { type: 'toolCall' as const, id: 'read-call', name: 'read', arguments: { path: 'README.md' } }
+    const assistant = {
+      ...assistantMessage(''),
+      content: [replyCall, readCall],
+      stopReason: 'toolUse' as const,
+    }
+
+    const replyResult = await agent.afterToolCall!({
+      ...afterToolContext('channel_reply', { ok: false }, false, 'Done.'),
+      assistantMessage: assistant,
+      toolCall: replyCall,
+    } as AfterToolCallContext)
+
+    expect(replyResult).toBeUndefined()
+    await streamOnce(session)
+    expect(agent.signal.aborted).toBe(false)
+    expect(session.lastStreamMaxTokens).toBeDefined()
   })
 
   test('does NOT abort when channel_reply opts out with more_work_this_turn: true', async () => {
-    const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true, more_work_this_turn: true }, false))
+    const session = await liveSessionAfterRoute(await tempDir())
+    const result = await session.agent.afterToolCall!(
+      afterToolContext('channel_reply', { ok: true, more_work_this_turn: true }, false),
+    )
+    expect(result).toBeUndefined()
+    await streamOnce(session)
+    expect(session.agent.signal.aborted).toBe(false)
+    expect(session.lastStreamMaxTokens).toBeDefined()
+  })
+
+  test('logs a diagnostic line identifying the session, reason, and site when channel_reply ends the turn', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const agent = sessions[0]!.agent
+
+    const result = await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
+
+    expect(result).toBeUndefined()
     expect(agent.signal.aborted).toBe(false)
+    const abortLog = logs.find((m) => m.includes('site=terminal_after_channel_reply'))
+    expect(abortLog).toBeDefined()
+    expect(abortLog).toContain('session=ses_fake_1')
+    expect(abortLog).toContain('reason=terminal_after_channel_reply')
   })
 
   test('does NOT abort when channel_reply was rejected (details.ok === false)', async () => {
@@ -14929,13 +16184,15 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
 
   test('does NOT abort after a read-only tool so genuine multi-step turns continue', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('read', { ok: true }, false))
+    const result = await agent.afterToolCall!(afterToolContext('read', { ok: true }, false))
+    expect(result?.terminate).not.toBe(true)
     expect(agent.signal.aborted).toBe(false)
   })
 
   test('does NOT abort after a successful channel_send (only channel_reply is terminal)', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('channel_send', { ok: true }, false))
+    const result = await agent.afterToolCall!(afterToolContext('channel_send', { ok: true }, false))
+    expect(result?.terminate).not.toBe(true)
     expect(agent.signal.aborted).toBe(false)
   })
 
@@ -15017,8 +16274,11 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
 
   test('stashes the reply text on a terminal channel_reply so the willingness nudge can read it', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false, '바로 계속 확인하겠습니다'))
-    expect(agent.signal.aborted).toBe(true)
+    const result = await agent.afterToolCall!(
+      afterToolContext('channel_reply', { ok: true }, false, '바로 계속 확인하겠습니다'),
+    )
+    expect(result).toBeUndefined()
+    expect(agent.signal.aborted).toBe(false)
   })
 
   test('does NOT stash when more_work_this_turn:true (the turn stays alive, no nudge needed)', async () => {
@@ -15048,15 +16308,21 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     sessions[0]!.onPrompt = async (text) => {
       attempt++
       if (attempt === 1) {
+        // Match pi 0.73.1 ordering: the assistant toolUse message ends before
+        // channel_reply executes; the matching toolResult persists before the
+        // deferred abort prevents a later provider call.
+        sessions[0]!.setAssistantMidTurn('')
+        sessions[0]!.emit({
+          type: 'message_end',
+          message: { ...assistantMessage(''), stopReason: 'toolUse' },
+        })
         await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'First step is done.' })
         await sessions[0]!.agent.afterToolCall!(
           afterToolContext('channel_reply', { ok: true }, false, 'First step is done.'),
         )
-        sessions[0]!.setAssistantMidTurn('First step is done.', 'aborted')
-        sessions[0]!.emit({
-          type: 'message_end',
-          message: { ...assistantMessage(''), stopReason: 'aborted' },
-        })
+        strandOnUnansweredToolUse(sessions[0]!, 'terminal-todo')
+        await streamOnce(sessions[0]!)
+        sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
         return
       }
 
@@ -16881,6 +18147,62 @@ describe('ChannelRouter history attachment registry', () => {
     expect(router.listInboundAttachmentIds(KEY)).toEqual([1])
   })
 
+  // End-to-end guard for the production failure this registry exists to
+  // prevent: the agent was told by look_at_channel_attachment's own error text
+  // to "call channel_history first", did exactly that, and still could not
+  // resolve the image because the Discord user adapter's history mapper never
+  // carried the attachment. Wiring the REAL adapter callback and the REAL tool
+  // is the point — a fake history callback would have passed the whole time.
+  test('an id the agent reads in rendered channel_history output resolves to that ref', async () => {
+    const DISCORD_KEY: ChannelKey = { adapter: 'discord', workspace: 'g1', chat: 'c1', thread: null }
+    const { router } = makeRouter(await tempDir())
+    await router.route(inbound({ adapter: 'discord', text: 'open session' }))
+    await router.__testing!.flushDebounce(DISCORD_KEY)
+
+    router.registerHistory(
+      'discord',
+      createDiscordHistoryCallback({
+        client: {
+          getMessages: async () => [
+            {
+              id: 'm-image',
+              channel_id: 'c1',
+              author: { id: 'alice', username: 'alice' },
+              content: '',
+              timestamp: '2026-01-01T00:00:00.000Z',
+              attachments: [
+                {
+                  id: '1',
+                  filename: 'image.png',
+                  size: 10,
+                  url: 'https://cdn.discordapp.com/attachments/1/2/image.png',
+                  content_type: 'image/webp',
+                },
+              ],
+            },
+          ],
+        } as unknown as Parameters<typeof createDiscordHistoryCallback>[0]['client'],
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+      }),
+    )
+
+    const tool = createChannelHistoryTool({ router, origin: DISCORD_KEY })
+    const result = await tool.execute(
+      'call-1',
+      { scope: 'channel' },
+      undefined,
+      undefined,
+      {} as Parameters<typeof tool.execute>[4],
+    )
+
+    const rendered = result.content.map((part) => ('text' in part ? part.text : '')).join('\n')
+    const renderedId = /attachment #(\d+):/.exec(rendered)?.[1]
+    expect(renderedId).toBe('1')
+
+    const resolved = router.lookupInboundAttachment({ ...DISCORD_KEY, id: Number(renderedId) })
+    expect(resolved?.ref).toBe('https://cdn.discordapp.com/attachments/1/2/image.png')
+  })
+
   test('a live current-turn #1 still wins over a registered history #1', async () => {
     const { router, sessions } = makeRouter(await tempDir())
     router.registerHistory('discord-bot', async () => ({
@@ -17087,6 +18409,54 @@ describe('resumeRestartHandoff', () => {
     expect(factoryCalls[0]?.existingSessionId).toBe('ses_origin')
     expect(factoryCalls[0]?.existingSessionFile).toBe('2026-05-02T16-56-52-380Z_ses_origin.jsonl')
     expect(sessions[0]?.prompts.length).toBe(1)
+  })
+
+  test('a restart reminder with no author keeps a stranded toolUse silent', async () => {
+    const dir = await tempDir()
+    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      onSessionCreated: (session) => {
+        session.onPrompt = () => session.setAssistantMidTurn('')
+      },
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message.text ?? '')
+      return { ok: true }
+    })
+
+    await router.resumeRestartHandoff(channelHandoff())
+    await waitFor(() => sessions[0]?.prompts.length === 1)
+
+    expect(sent).toEqual([])
+    expect(logs.some((message) => message.includes('stranded_toolUse_without_send'))).toBe(false)
+    expect(logs.some((message) => message.includes('empty_turn_fallback'))).toBe(false)
+  })
+
+  test('a restart reminder with no author keeps text-bearing unfinished toolUse narration silent', async () => {
+    const dir = await tempDir()
+    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      onSessionCreated: (session) => {
+        session.onPrompt = () => session.setAssistantMidTurn('I will inspect the tool result before answering.')
+      },
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message.text ?? '')
+      return { ok: true }
+    })
+
+    await router.resumeRestartHandoff(channelHandoff())
+    await waitFor(() => sessions[0]?.prompts.length === 1)
+
+    expect(sent).toEqual([])
+    expect(logs.some((message) => message.includes('cause=unfinished_toolUse_continuation_ineligible'))).toBe(true)
+    expect(logs.some((message) => message.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
   })
 
   test('skips when the persisted mapping no longer names the handoff session', async () => {
@@ -17310,6 +18680,41 @@ describe('resumeRestartHandoff', () => {
     expect(prompts.some((p) => p.includes('researcher') && p.includes('lost when the container'))).toBe(true)
   })
 
+  test('flushDebounce settles a drain already in flight, not merely one it starts', async () => {
+    // given: the same coalesced-restart shape as above, but the fire-and-forget
+    //   drain's FIRST turn parks on a macrotask. The racing inbound is queued
+    //   behind it, so its prompt can only land on a later iteration of that same
+    //   drain — which flushDebounce's own `drain()` call cannot reach, because
+    //   drain() no-ops while `live.draining` is set. The park makes that window
+    //   deterministic instead of contention-dependent: it is the oversubscribed-
+    //   CI flake reproduced on purpose.
+    const dir = await tempDir()
+    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
+    const { router, sessions } = makeRouter(dir, {
+      transcriptPathFor: (sessionId) => `/tmp/fake/2026-05-02T16-56-52-380Z_${sessionId}.jsonl`,
+      onSessionCreated: (fake) => {
+        fake.onPrompt = async () => {
+          if (fake.prompts.length > 1) return
+          await new Promise<void>((resolve) => setTimeout(resolve, 25))
+        }
+      },
+    })
+    const reservation = router.reserveRestartHandoff(channelHandoff({ interruptedSubagents: ['researcher'] }))!
+    const inboundDone = router.route(inbound({ authorId: 'alice', authorName: 'alice', text: 'hi there' }))
+    await waitFor(() => reservation.sawInbound)
+
+    // when
+    await reservation.resume()
+    await inboundDone
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: both turns the in-flight drain owed had landed before the flush
+    // returned — no polling, because the seam settles rather than merely starts
+    const prompts = sessions[0]!.prompts
+    expect(prompts.some((p) => p.includes('researcher') && p.includes('lost when the container'))).toBe(true)
+    expect(prompts.some((p) => p.includes('hi there'))).toBe(true)
+  })
+
   test('delivers the notice even when the racing inbound is observe-only (never engages)', async () => {
     // given: a handoff with interrupted names and a racing inbound that will NOT
     //   engage (not a mention, not a reply, mentions no one). sawInbound flips
@@ -17368,7 +18773,8 @@ describe('markRestartAbortForAllLive (graceful host restart)', () => {
   test('aborts every live session and marks its scope so resume auto-continues', async () => {
     // given a live channel session with an in-flight-capable turn
     const dir = await tempDir()
-    const { router, sessions } = makeRouter(dir)
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
     await router.route(inbound({ externalMessageId: 'm1' }))
     await router.__testing!.flushDebounce(KEY)
     expect(sessions).toHaveLength(1)
@@ -17388,6 +18794,9 @@ describe('markRestartAbortForAllLive (graceful host restart)', () => {
       participants: [],
     })!
     expect((await readContinuationState(dir, scope)).restartAbortPending).toBe(true)
+    expect(logs).toContain(
+      'warn:[channels] discord-bot:g1:c1: abort site=graceful_restart session=ses_fake_1 reason=graceful_restart',
+    )
   })
 
   test('is a no-op with no live sessions', async () => {
@@ -17408,6 +18817,8 @@ describe('GitHub review follow-up round composition', () => {
         sessionId: 'ses_persisted',
         participants: [],
         githubReviewRound: {
+          kind: 'push',
+          roundId: 'persisted-round',
           workspace: 'acme/widgets',
           prNumber: 7,
           headSha: 'sha-old',
@@ -17422,7 +18833,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
       resolveHeadSha: async () => 'sha-new',
     })
-    const { router } = makeRouter(dir)
+    const { router } = makeRouter(dir, { nowRef: { value: Date.now() } })
 
     await router.route(inbound({ ...key, externalMessageId: 'reopen', text: 'new inbound after restart' }))
 
@@ -17444,12 +18855,14 @@ describe('GitHub review follow-up round composition', () => {
         sessionId: 'ses_expired',
         participants: [],
         githubReviewRound: {
+          kind: 'push',
+          roundId: 'expired-round',
           workspace: 'acme/widgets',
           prNumber: 7,
           headSha: 'sha-round',
           carrierThread: '101',
           status: 'pending',
-          createdAt: Date.now() - REVIEW_ROUND_TTL_MS - 1,
+          createdAt: Date.now() - REVIEW_ROUND_TTL_MS * 2,
           attemptedCarriers: ['101'],
         },
       },
@@ -17458,7 +18871,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
       resolveHeadSha: async () => 'sha-round',
     })
-    const { router } = makeRouter(dir)
+    const { router } = makeRouter(dir, { nowRef: { value: Date.now() } })
 
     await router.route(inbound({ ...key, externalMessageId: 'reopen-expired', text: 'new inbound after restart' }))
 
@@ -17479,8 +18892,15 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
       resolveHeadSha: async () => 'sha-round',
     })
-    const { router } = makeRouter(dir)
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const { router } = makeRouter(dir, { nowRef: { value: Date.now() } })
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
     await router.route(inbound({ ...firstKey, externalMessageId: 'round-101', githubReviewRound: round }))
@@ -17513,7 +18933,12 @@ describe('GitHub review follow-up round composition', () => {
     expect(await completed.promise).toEqual({ kind: 'completed' })
 
     const order: string[] = []
-    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: true, approve: true }))
+    router.registerReviewStateResolver('github', async () => ({
+      ok: true,
+      selfBlocking: true,
+      selfBlockingReviewId: null,
+      approve: true,
+    }))
     router.registerReviewThreadResolver('github', async ({ rootCommentId }) => {
       order.push(`resolve:${rootCommentId}`)
       return { ok: true }
@@ -17551,8 +18976,15 @@ describe('GitHub review follow-up round composition', () => {
       resolveHeadSha: async () => currentHead,
     })
     const logs: string[] = []
-    const { router } = makeRouter(dir, { logs })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const { router } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
     expect(
@@ -17602,8 +19034,15 @@ describe('GitHub review follow-up round composition', () => {
         return 'sha-round'
       },
     })
-    const { router } = makeRouter(dir)
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const { router } = makeRouter(dir, { nowRef: { value: Date.now() } })
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
 
@@ -17616,11 +19055,12 @@ describe('GitHub review follow-up round composition', () => {
     })
 
     // when: the model closes the thread out before that validation returns
-    router.finishGithubReviewRoundCloseout?.({
+    router.finishGithubReviewThreadCloseout?.({
       sessionId: 'ses_fake_1',
       workspace: 'acme/widgets',
       prNumber: 7,
       thread: '101',
+      decision: 'resolved',
     })
     expect(router.__testing!.githubReviewRoundFor(key)).not.toBeNull()
 
@@ -17645,8 +19085,15 @@ describe('GitHub review follow-up round composition', () => {
       resolveHeadSha: async () => 'sha-round',
     })
     const logs: string[] = []
-    const { router } = makeRouter(dir, { logs })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const { router } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
     expect(
@@ -17696,11 +19143,19 @@ describe('GitHub review follow-up round composition', () => {
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, {
       logs,
+      nowRef: { value: Date.now() },
       saveChannelSessions: async (_agentDir, records) => {
         saved.push(structuredClone(records))
       },
     })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
     const firstInbound = inbound({
@@ -17784,11 +19239,12 @@ describe('GitHub review follow-up round composition', () => {
           })
           if (result.ok) {
             acknowledgements += 1
-            router.finishGithubReviewRoundCloseout?.({
+            router.finishGithubReviewThreadCloseout?.({
               sessionId: 'ses_fake_2',
               workspace: 'acme/widgets',
               prNumber: 7,
               thread: '202',
+              decision: 'resolved',
             })
           }
           router.injectPrVerdictActivity({
@@ -17808,11 +19264,12 @@ describe('GitHub review follow-up round composition', () => {
           })
           if (result.ok) {
             acknowledgements += 1
-            router.finishGithubReviewRoundCloseout?.({
+            router.finishGithubReviewThreadCloseout?.({
               sessionId: 'ses_fake_1',
               workspace: 'acme/widgets',
               prNumber: 7,
               thread: '101',
+              decision: 'resolved',
             })
           }
         }
@@ -17850,8 +19307,15 @@ describe('GitHub review follow-up round composition', () => {
     __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
     const logs: string[] = []
-    const { router, sessions } = makeRouter(dir, { logs })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'no-waiter', githubReviewRound: round }))
     sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
@@ -17869,8 +19333,15 @@ describe('GitHub review follow-up round composition', () => {
     __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
     const logs: string[] = []
-    const { router, sessions } = makeRouter(dir, { logs })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
     await router.route(inbound({ ...firstKey, externalMessageId: 'exhaust-101', githubReviewRound: round }))
@@ -17894,8 +19365,10 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'DISMISSED' }),
       resolveHeadSha: async () => 'sha-dismissed',
     })
-    const { router, sessions } = makeRouter(dir)
+    const { router, sessions } = makeRouter(dir, { nowRef: { value: Date.now() } })
     const round = {
+      kind: 'push',
+      roundId: 'test-round',
       workspace: 'acme/widgets',
       prNumber: 7,
       headSha: 'sha-dismissed',
@@ -17947,11 +19420,12 @@ describe('GitHub review follow-up round composition', () => {
           rootCommentId: key.thread,
         }),
       ).toMatchObject({ ok: true })
-      router.finishGithubReviewRoundCloseout?.({
+      router.finishGithubReviewThreadCloseout?.({
         sessionId,
         workspace: key.workspace,
         prNumber: 7,
         thread: key.thread,
+        decision: 'resolved',
       })
     }
     await router.stop()
@@ -17968,8 +19442,10 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
       resolveHeadSha: async () => 'sha-pending',
     })
-    const { router, sessions } = makeRouter(dir)
+    const { router, sessions } = makeRouter(dir, { nowRef: { value: Date.now() } })
     const round = {
+      kind: 'push',
+      roundId: 'test-round',
       workspace: 'acme/widgets',
       prNumber: 7,
       headSha: 'sha-pending',
@@ -18133,19 +19609,29 @@ describe('ChannelRouter background-child await suppression', () => {
     }
   }
 
-  test('a bare-empty stop while a background child runs stays silent instead of retrying', async () => {
+  test('a stranded toolUse while a background child runs stays silent instead of retrying', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
+    const reactions: ReactionRequest[] = []
     const { router, sessions } = makeRouter(dir, { logs, newestRunningChildSubagentStartedAt: runningChild })
+    router.setTypingCapability('discord-bot', true)
+    router.registerReaction('discord-bot', async (req) => {
+      reactions.push(req)
+      return { ok: true }
+    })
     router.registerOutbound('discord-bot', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
 
     // given: the model does tool work (spawning a background child), then ends the turn empty
-    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
-    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    const reactionRef: ReactionRef = { adapter: 'discord-bot', value: 'review-request' }
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘', reactionRef }))
+    sessions[0]!.onPrompt = () => {
+      strandOnUnansweredToolUse(sessions[0]!, 'background-child')
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for background child' })
+    }
     await router.__testing!.flushDebounce(KEY)
 
     // then: the recovery ladder does not manufacture a status message
@@ -18154,6 +19640,8 @@ describe('ChannelRouter background-child await suppression', () => {
     expect(logs.some((m) => m.includes('empty_turn_retry'))).toBe(false)
     expect(logs.some((m) => m.includes('empty_turn_fallback'))).toBe(false)
     expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(true)
+    await waitFor(() => reactions.length === 1)
+    expect(reactions[0]).toMatchObject({ emoji: 'eyes', reactionRef })
   })
 
   test('a more_work_this_turn ack is not re-nudged into a second status post while the child runs', async () => {
@@ -19431,5 +20919,902 @@ describe('/steer and /queue (per-channel delivery mode)', () => {
       reply:
         'Mid-turn steer is on for this channel: messages sent while I am working are folded into the running turn.',
     })
+  })
+})
+describe('ChannelRouter GitHub review-thread closeout obligation', () => {
+  const GITHUB_KEY: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:123', thread: '456' }
+  const closeoutInbound = (over: Partial<InboundMessage> = {}): InboundMessage =>
+    inbound({
+      ...GITHUB_KEY,
+      externalMessageId: '789',
+      text: 'I pushed the requested fix.',
+      replyToBotMessageId: '456',
+      githubReviewThreadCloseout: { workspace: 'acme/repo', prNumber: 123, rootCommentId: '456' },
+      ...over,
+    })
+
+  const replyRound = {
+    kind: 'reply',
+    roundId: 'reply-round',
+    workspace: 'acme/repo',
+    prNumber: 123,
+    headSha: 'sha-round',
+    carrierThread: 'carrier-thread',
+  } as const
+
+  const carrierKey: ChannelKey = { ...GITHUB_KEY, thread: 'carrier-thread' }
+
+  async function routePendingRoundSiblings(
+    router: ChannelRouter,
+    sessions: FakeSession[],
+  ): Promise<{ carrier: FakeSession; sibling: FakeSession }> {
+    await router.route(
+      closeoutInbound({
+        ...carrierKey,
+        externalMessageId: 'carrier-inbound',
+        githubReviewRound: replyRound,
+        githubReviewThreadCloseout: undefined,
+      }),
+    )
+    await router.route(closeoutInbound({ externalMessageId: 'sibling-inbound', githubReviewRound: replyRound }))
+    return { carrier: sessions[0]!, sibling: sessions[1]! }
+  }
+
+  test('silently defers a pending reply-round non-carrier without consuming its correction', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+      sibling.setAssistantText('NO_REPLY')
+    }
+
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(1)
+    expect(sent).toEqual([])
+    expect(router.__testing!.pendingReminderCount(GITHUB_KEY)).toBe(0)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_deferred'))).toHaveLength(1)
+    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+    expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+    expect(logs.some((line) => line.includes('willingness_nudge'))).toBe(false)
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_2')).toBe(true)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('does not defer the designated carrier close-out', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    await router.route(closeoutInbound({ ...carrierKey, githubReviewRound: replyRound }))
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+
+    await router.__testing!.flushDebounce(carrierKey)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('wakes a deferred sibling once on round completion for one exact-thread close-out', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+      resolveHeadSha: async () => replyRound.headSha,
+    })
+    const sent: OutboundMessage[] = []
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = async (text) => {
+      if (text.includes('formal APPROVE review')) {
+        router.finishGithubReviewThreadCloseout?.({
+          sessionId: 'ses_fake_2',
+          workspace: GITHUB_KEY.workspace,
+          prNumber: 123,
+          thread: GITHUB_KEY.thread,
+          decision: 'resolved',
+        })
+        await router.send({ ...GITHUB_KEY, text: 'Verified — this concern is addressed.' })
+      } else {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+      }
+      sibling.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+    expect(sent).toEqual([])
+
+    expect(
+      await router.completeGithubReviewRound?.({
+        workspace: replyRound.workspace,
+        prNumber: replyRound.prNumber,
+        verdict: 'APPROVE',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'completed' })
+    expect(
+      router.injectPrVerdictActivity({
+        workspace: replyRound.workspace,
+        prNumber: replyRound.prNumber,
+        verdict: 'APPROVE',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'delivered', count: 1 })
+    await router.__testing!.runIdleGc()
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(2)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]).toMatchObject({ thread: '456', text: 'Verified — this concern is addressed.' })
+    expect(logs.some((line) => line.includes('github_thread_closeout_released'))).toBe(false)
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_2')).toBe(false)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('releases a completed round through the periodic sweep when verdict activity never arrives', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+      resolveHeadSha: async () => replyRound.headSha,
+    })
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+      sibling.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+    expect(sent).toEqual([])
+
+    expect(
+      await router.completeGithubReviewRound?.({
+        workspace: replyRound.workspace,
+        prNumber: replyRound.prNumber,
+        verdict: 'APPROVE',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'completed' })
+    await router.__testing!.runIdleGc()
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(2)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(logs.filter((line) => line.includes('reason=round_completed'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('releases an abandoned pending round through the periodic sweep and preserves the fallback net', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const nowRef = { value: Date.now() }
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+      sibling.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+    expect(sent).toEqual([])
+
+    nowRef.value += REPLY_REVIEW_ROUND_TTL_MS * 2
+    await router.__testing!.runIdleGc()
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(2)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('preserves a deferred close-out across an unrelated unstamped batch only', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+      sibling.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    await router.route(
+      closeoutInbound({
+        externalMessageId: 'unrelated-inbound',
+        text: 'One more unrelated note.',
+        githubReviewRound: undefined,
+        githubReviewThreadCloseout: undefined,
+      }),
+    )
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(2)
+    expect(sent).toEqual([])
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_2')).toBe(true)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_deferred'))).toHaveLength(2)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  for (const release of ['completed', 'expired'] as const) {
+    test(`preserves a deferred close-out across an unstamped batch after its round ${release}`, async () => {
+      __resetReviewVerdictGuardForTest()
+      const dir = await tempDir()
+      const nowRef = { value: Date.now() }
+      configureReviewVerdictCoordinator({
+        resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+        resolveHeadSha: async () => replyRound.headSha,
+      })
+      const logs: string[] = []
+      const sent: OutboundMessage[] = []
+      const { router, sessions } = makeRouter(dir, { logs, nowRef })
+      router.registerOutbound('github', async (message) => {
+        sent.push(message)
+        return { ok: true }
+      })
+      const { sibling } = await routePendingRoundSiblings(router, sessions)
+      sibling.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+        sibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      if (release === 'completed') {
+        expect(
+          await router.completeGithubReviewRound?.({
+            workspace: replyRound.workspace,
+            prNumber: replyRound.prNumber,
+            verdict: 'APPROVE',
+            sessionId: 'ses_fake_1',
+          }),
+        ).toEqual({ kind: 'completed' })
+      } else {
+        nowRef.value += REPLY_REVIEW_ROUND_TTL_MS * 2
+      }
+      await router.route(
+        closeoutInbound({
+          externalMessageId: `unstamped-after-${release}`,
+          text: 'An unrelated follow-up.',
+          githubReviewRound: undefined,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      const activeSibling = release === 'expired' ? sessions.at(-1)! : sibling
+      activeSibling.onPrompt = () => {
+        router.markTurnSkipped({
+          parentSessionId: release === 'expired' ? 'ses_fake_3' : 'ses_fake_2',
+          reason: 'no close-out',
+        })
+        activeSibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+      expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+      expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+      expect(
+        router.hasOutstandingGithubReviewThreadCloseout?.(release === 'expired' ? 'ses_fake_3' : 'ses_fake_2'),
+      ).toBe(false)
+      __resetReviewVerdictGuardForTest()
+      await router.stop()
+    })
+  }
+
+  for (const release of ['completed', 'expired'] as const) {
+    test(`restores a deferred close-out after teardown and releases it when the round ${release}`, async () => {
+      __resetReviewVerdictGuardForTest()
+      const dir = await tempDir()
+      const nowRef = { value: Date.now() }
+      configureReviewVerdictCoordinator({
+        resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+        resolveHeadSha: async () => replyRound.headSha,
+      })
+      const logs: string[] = []
+      const sent: OutboundMessage[] = []
+      const { router, sessions } = makeRouter(dir, { logs, nowRef })
+      router.registerOutbound('github', async (message) => {
+        sent.push(message)
+        return { ok: true }
+      })
+      const initial = await routePendingRoundSiblings(router, sessions)
+      initial.sibling.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+        initial.sibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+      await router.tearDownAllLive()
+
+      await router.route(
+        closeoutInbound({
+          ...carrierKey,
+          externalMessageId: 'rehydrate-carrier',
+          githubReviewRound: undefined,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      await router.route(
+        closeoutInbound({
+          externalMessageId: 'rehydrate-sibling',
+          githubReviewRound: undefined,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      const rehydratedSibling = sessions[3]!
+      rehydratedSibling.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+        rehydratedSibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+      expect(sent).toEqual([])
+
+      if (release === 'completed') {
+        expect(
+          await router.completeGithubReviewRound?.({
+            workspace: replyRound.workspace,
+            prNumber: replyRound.prNumber,
+            verdict: 'APPROVE',
+            sessionId: 'ses_fake_1',
+          }),
+        ).toEqual({ kind: 'completed' })
+      } else {
+        nowRef.value += REPLY_REVIEW_ROUND_TTL_MS * 2
+      }
+      await router.__testing!.runIdleGc()
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+      expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+      expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+      expect(
+        (await loadChannelSessions(dir)).find((record) => record.thread === GITHUB_KEY.thread)
+          ?.githubReviewThreadCloseout,
+      ).toBeUndefined()
+      __resetReviewVerdictGuardForTest()
+      await router.stop()
+    })
+  }
+
+  for (const release of ['completed', 'expired'] as const) {
+    test(`keeps a deferred close-out silent through live stale rollover until the round ${release}`, async () => {
+      __resetReviewVerdictGuardForTest()
+      const dir = await tempDir()
+      const nowRef = { value: Date.now() }
+      configureReviewVerdictCoordinator({
+        resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+        resolveHeadSha: async () => replyRound.headSha,
+      })
+      const logs: string[] = []
+      const sent: OutboundMessage[] = []
+      const { router, sessions } = makeRouter(dir, { logs, nowRef })
+      router.registerOutbound('github', async (message) => {
+        sent.push(message)
+        return { ok: true }
+      })
+      const initial = await routePendingRoundSiblings(router, sessions)
+      initial.sibling.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+        initial.sibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      nowRef.value += SESSION_GRACE_HARD_TTL_MS + 1
+      await router.route(
+        closeoutInbound({
+          externalMessageId: `live-rollover-${release}`,
+          text: 'An unrelated follow-up before the review finishes.',
+          githubReviewRound: undefined,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      const successor = sessions[2]!
+      successor.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_3', reason: 'waiting for carrier' })
+        successor.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent).toEqual([])
+      expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+      expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+      expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_3')).toBe(true)
+
+      if (release === 'completed') {
+        expect(
+          await router.completeGithubReviewRound?.({
+            workspace: replyRound.workspace,
+            prNumber: replyRound.prNumber,
+            verdict: 'APPROVE',
+            sessionId: 'ses_fake_1',
+          }),
+        ).toEqual({ kind: 'completed' })
+      } else {
+        nowRef.value += REPLY_REVIEW_ROUND_TTL_MS
+      }
+      await router.__testing!.runIdleGc()
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+      expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+      expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+      expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_3')).toBe(false)
+      __resetReviewVerdictGuardForTest()
+      await router.stop()
+    })
+  }
+
+  test('queues one correction for a skip with no running child, then posts one open-thread fallback', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'stand down' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('PR #123')
+    expect(sessions[0]!.prompts[1]).toContain('root comment 456')
+    expect(sessions[0]!.prompts[1]).toContain('resolve_review_thread')
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    expect(sent[0]?.thread).toBe('456')
+    expect(sessions[0]!.prompts).toHaveLength(2)
+  })
+
+  test('honors a skip while a child started after the obligation is still running', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      newestRunningChildSubagentStartedAt: () => 1000,
+    })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for reviewer' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toHaveLength(0)
+    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+    expect(logs.some((line) => line.includes('skipped_by_tool'))).toBe(true)
+  })
+
+  test('a completed or cancelled child does not defer the closeout correction', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { newestRunningChildSubagentStartedAt: () => null })
+    router.registerOutbound('github', async () => ({ ok: true }))
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = async () => {
+      if (sessions[0]!.prompts.length === 1) {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'child cancelled' })
+      } else {
+        await router.send({ ...GITHUB_KEY, text: 'This still needs manual review.' })
+      }
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('resolve_review_thread')
+  })
+
+  test('a running child from before the obligation does not defer it', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { newestRunningChildSubagentStartedAt: () => 999 })
+    router.registerOutbound('github', async () => ({ ok: true }))
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = async () => {
+      if (sessions[0]!.prompts.length === 1) {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'old child still running' })
+      } else {
+        await router.send({ ...GITHUB_KEY, text: 'This remains open pending manual review.' })
+      }
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+  })
+
+  test('intercepts NO_REPLY without a skip tool and preserves the obligation across the reminder-only retry', async () => {
+    const dir = await tempDir()
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('root comment 456')
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+  })
+
+  for (const resolveReviewThread of [true, false]) {
+    test(`an exact-thread channel_reply with resolve_review_thread:${resolveReviewThread} clears the obligation`, async () => {
+      const dir = await tempDir()
+      const logs: string[] = []
+      const sent: OutboundMessage[] = []
+      const { router, sessions } = makeRouter(dir, { logs })
+      router.registerOutbound('github', async (message) => {
+        sent.push(message)
+        return { ok: true }
+      })
+      router.registerReviewStateResolver('github', async () => ({
+        ok: true,
+        selfBlocking: false,
+        selfBlockingReviewId: null,
+        approve: true,
+      }))
+      router.registerReviewThreadResolver('github', async () => ({ ok: true }))
+      const reply = createChannelReplyTool({ router, origin: GITHUB_KEY, sessionId: 'ses_fake_1' })
+
+      await router.route(closeoutInbound())
+      sessions[0]!.onPrompt = async () => {
+        const result = await reply.execute(
+          'reply-call',
+          {
+            text: resolveReviewThread
+              ? 'Verified the change; this concern is addressed.'
+              : 'This concern remains open.',
+            more_work_this_turn: false,
+            resolve_review_thread: resolveReviewThread,
+          },
+          undefined,
+          undefined,
+          {} as Parameters<typeof reply.execute>[4],
+        )
+        expect(result.details).toMatchObject({ ok: true })
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' })
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent).toHaveLength(1)
+      expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+      expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_1') ?? false).toBe(false)
+    })
+  }
+
+  test('leaves non-GitHub, top-level GitHub, and human-rooted review traffic unchanged', async () => {
+    const dir = await tempDir()
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    const cases = [
+      { key: KEY, message: inbound({ text: 'ordinary skip' }) },
+      {
+        key: { ...GITHUB_KEY, thread: null },
+        message: closeoutInbound({
+          thread: null,
+          githubReviewThreadCloseout: undefined,
+          externalMessageId: 'top-level',
+        }),
+      },
+      {
+        key: GITHUB_KEY,
+        message: closeoutInbound({ githubReviewThreadCloseout: undefined, externalMessageId: 'human-root' }),
+      },
+    ] as const
+
+    for (const [index, item] of cases.entries()) {
+      await router.route(item.message)
+      const session = sessions[index]!
+      session.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: `ses_fake_${index + 1}`, reason: 'ordinary skip' })
+        session.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(item.key)
+    }
+
+    expect(sent).toHaveLength(0)
+    expect(sessions.map((session) => session.prompts.length)).toEqual([1, 1, 1])
+  })
+
+  test('a generic post-send skip retains the obligation and queues one decision correction', async () => {
+    const dir = await tempDir()
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    let skipKind = ''
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = async () => {
+      if (sessions[0]!.prompts.length === 1) {
+        await router.send({ ...GITHUB_KEY, text: 'I am checking this now.' })
+      } else {
+        router.finishGithubReviewThreadCloseout?.({
+          sessionId: 'ses_fake_1',
+          workspace: GITHUB_KEY.workspace,
+          prNumber: 123,
+          thread: GITHUB_KEY.thread,
+          decision: 'left-open',
+        })
+        await router.send({ ...GITHUB_KEY, text: 'This remains open pending another change.' })
+      }
+      skipKind = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' }).kind
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(skipKind).toBe('recorded-after-send')
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent.map((message) => message.text)).toEqual([
+      'I am checking this now.',
+      'This remains open pending another change.',
+    ])
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_1')).toBe(false)
+  })
+
+  test('suppresses Korean willingness nudges while the exact-thread close-out remains outstanding', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async () => ({ ok: true }))
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = async () => {
+      if (sessions[0]!.prompts.length === 1) {
+        await router.send({ ...GITHUB_KEY, text: '확인해볼게요.' })
+        emptyStopAfterToolWork(sessions[0]!)
+      } else {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'test correction' })
+        sessions[0]!.setAssistantText('NO_REPLY')
+      }
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts[1]).toContain('resolve_review_thread')
+    expect(sessions[0]!.prompts[1]).not.toContain(WILLINGNESS_NUDGE)
+    expect(sessions[0]!.prompts[1]).not.toContain(SEND_WILLINGNESS_NUDGE)
+    expect(logs.some((line) => line.includes('willingness_nudge'))).toBe(false)
+  })
+
+  test('defers unknown reply review state until its persisted deadline expires', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 10_000 }
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    await router.route(
+      closeoutInbound({
+        githubReviewThreadCloseout: {
+          workspace: 'acme/repo',
+          prNumber: 123,
+          rootCommentId: '456',
+          deferUntil: { kind: 'review-state-unknown', expiresAt: 130_000 },
+        },
+      }),
+    )
+    sessions[0]!.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'unknown review state' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toEqual([])
+    expect((await loadChannelSessions(dir))[0]?.githubReviewThreadCloseout?.deferUntil).toEqual({
+      kind: 'review-state-unknown',
+      expiresAt: 130_000,
+    })
+
+    nowRef.value = 129_999
+    await router.__testing!.runIdleGc()
+    expect(router.__testing!.pendingReminderCount(GITHUB_KEY)).toBe(0)
+
+    nowRef.value = 130_000
+    await router.__testing!.runIdleGc()
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+  })
+
+  test('lets a later authoritative inbound replace an unknown-state deferral', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 10_000 }
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    await router.route(
+      closeoutInbound({
+        externalMessageId: 'unknown-state',
+        githubReviewThreadCloseout: {
+          workspace: 'acme/repo',
+          prNumber: 123,
+          rootCommentId: '456',
+          deferUntil: { kind: 'review-state-unknown', expiresAt: 130_000 },
+        },
+      }),
+    )
+    sessions[0]!.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'unknown review state' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    await router.route(closeoutInbound({ externalMessageId: 'authoritative-clear' }))
+    sessions[0]!.onPrompt = async () => {
+      router.finishGithubReviewThreadCloseout?.({
+        sessionId: 'ses_fake_1',
+        workspace: GITHUB_KEY.workspace,
+        prNumber: 123,
+        thread: GITHUB_KEY.thread,
+        decision: 'left-open',
+      })
+      await router.send({ ...GITHUB_KEY, text: 'This remains open for a concrete reason.' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent.map((message) => message.text)).toEqual(['This remains open for a concrete reason.'])
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_1')).toBe(false)
+  })
+
+  test('a peer-bot review-thread reply can stay silent when loop protection applies', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    for (let index = 0; index < 5; index++) {
+      await router.route(
+        closeoutInbound({
+          externalMessageId: `peer-${index}`,
+          authorId: `peer-bot-${index}`,
+          authorName: `peer-bot-${index}`,
+          authorIsBot: true,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+    }
+
+    expect(sessions[0]!.prompts.at(-1)).toContain('Peer bots have engaged you')
+    expect(sent).toHaveLength(0)
+    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+    expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+  })
+
+  test('a hard prompt throw after tool execution still runs the bounded closeout ladder', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.prompt = async (text) => {
+      sessions[0]!.prompts.push(text)
+      sessions[0]!.emit({ type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'read', args: {} })
+      throw new Error('internal prompt failure')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('resolve_review_thread')
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    expect(sent[0]?.thread).toBe('456')
+  })
+
+  test('provider notices do not discharge the exact-thread close-out decision', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.prompt = async (text) => {
+      sessions[0]!.prompts.push(text)
+      throw new Error('429 rate limit exceeded')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent.length).toBeGreaterThanOrEqual(2)
+    expect(sent[0]?.thread).toBe('456')
+    expect(sent[0]?.text).toContain('rate-limited')
+    expect(sent[0]?.text).not.toBe(GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT)
+    expect(sent.map((message) => message.text)).toContain(GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
   })
 })

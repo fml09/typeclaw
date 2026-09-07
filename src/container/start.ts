@@ -119,19 +119,24 @@ export type HostDaemonRegisterPayload = {
 }
 
 // Injected only on the daemon-owned restart path (reuseCurrentHostDaemon).
-// The daemon registers the container in-process and reports its own HTTP port,
-// so the restart skips the `http-info`/`register` self-RPCs — those round-trips
-// can time out under IPC congestion and silently drop the TYPECLAW_HOSTD_* env
-// triple, booting a container whose hostd-bridged adapters can't construct.
+// The daemon updates the container registration in-process and reports its own
+// HTTP port, so restart lifecycle changes skip socket self-RPCs — those
+// round-trips can time out under IPC congestion and silently drop the
+// TYPECLAW_HOSTD_* env triple or leave stale broker state behind.
 export type CurrentHostDaemon = {
   httpPort: number
   register: (payload: HostDaemonRegisterPayload) => Promise<{ ok: true } | { ok: false; reason: string }>
+  deregister: (containerName: string) => Promise<void>
 }
 
 export type StartOptions = {
   cwd: string
   preferredHostPort: number
   forceBuild?: boolean
+  // A parent live renderer must be the terminal's only cursor owner. Compose
+  // disables process output so child progress and warnings cannot corrupt it.
+  streamOutput?: boolean
+  onWarning?: (warning: string) => void
   exec?: DockerExec
   // Test seam: allows tests to inject a deterministic port allocator. In
   // production we go through the real kernel via `findFreePort`.
@@ -140,9 +145,10 @@ export type StartOptions = {
   // Hostd's supervisor restart callback already runs inside the daemon process.
   // Reusing that daemon avoids a self-shutdown when disk source has drifted.
   reuseCurrentHostDaemon?: boolean
-  // Set by hostd's supervisor restart wrapper. When present, registration goes
-  // through the daemon in-process (no socket round-trips), so the env triple is
-  // injected from known-good values even under IPC congestion. See type docs.
+  // Set by hostd's supervisor restart wrapper. When present, registration
+  // lifecycle changes go through the daemon in-process (no socket round-trips),
+  // so known-good control values and rollback survive IPC congestion.
+  // See type docs.
   currentHostDaemon?: CurrentHostDaemon
   ensureDeps?: (cwd: string, opts?: { force?: boolean }) => Promise<EnsureDepsResult>
   // Test seam for host embedding model provisioning. Production callers use
@@ -242,6 +248,8 @@ async function runStart({
   cwd,
   preferredHostPort,
   forceBuild = false,
+  streamOutput = true,
+  onWarning,
   exec = defaultDockerExec,
   allocatePort = findFreePort,
   cliEntry,
@@ -327,7 +335,11 @@ async function runStart({
     }
 
     const githubCliDeniedRoots = resolveGithubCliDeniedRoots(cwd, await loadTypeclawConfig(cwd))
-    await refreshGithubCliStore(cwd, githubCliDeniedRoots, provisionGithubCliStoreForAgent)
+    const githubCliWarning = await refreshGithubCliStore(cwd, githubCliDeniedRoots, provisionGithubCliStoreForAgent)
+    if (githubCliWarning !== null) {
+      if (streamOutput) process.stderr.write(githubCliWarning)
+      else onWarning?.(githubCliWarning.trim())
+    }
 
     if (agentMessengerPolicy.migrate) {
       const agentMessengerMigration = await migrateAgentMessengerConfigDir(cwd)
@@ -551,16 +563,23 @@ async function runStart({
 
     let built = false
     if (plan.needsBuild) {
-      const buildOk = await runImageBuild({
+      const buildResult = await runImageBuild({
         exec,
         cwd,
         imageTag: plan.imageTag,
         buildContext: plan.buildContext,
         hasBuildx,
+        streamOutput,
       })
-      if (!buildOk) {
+      if (!buildResult.ok) {
         await cleanupHostDaemonRegistration(containerName, hostd)
-        return { ok: false, reason: 'docker build failed' }
+        const retryDetail = buildResult.credentialHelperRetried
+          ? ' The build was also retried without the configured Docker credential helper.'
+          : ''
+        const detail = streamOutput
+          ? ''
+          : ` (exit code ${buildResult.exitCode}). Run \`typeclaw start --build\` from this agent directory to view the full build output.${retryDetail}`
+        return { ok: false, reason: `docker build failed${detail}` }
       }
       built = true
     }
@@ -573,6 +592,44 @@ async function runStart({
         ok: false,
         reason: `embedding model unavailable; ensure network access on first start or a populated model cache: ${error instanceof Error ? error.message : String(error)}`,
       }
+    }
+
+    // The build and model provisioning above can outlive a hostd registration.
+    // Refresh both the registry entry and the launch plan at the run boundary:
+    // a broker restart may have invalidated the initial control tokens while
+    // those pre-run steps were in flight. Keep that early registration because
+    // it remains the cleanup target for build/model failures.
+    const initialHostd = hostd
+    try {
+      if (cliEntry) {
+        const refreshedHostd = await registerWithDaemon({
+          cwd,
+          containerName,
+          cliEntry,
+          hostPort,
+          reuseCurrentHostDaemon,
+          currentHostDaemon,
+        })
+        if (refreshedHostd.state !== 'registered') {
+          await cleanupHostDaemonRegistration(containerName, initialHostd)
+        }
+        hostd = refreshedHostd
+        hostdControl = refreshedHostd.state === 'registered' ? refreshedHostd.control : undefined
+        plan = await planStart({
+          cwd,
+          hostPort,
+          imageExists: true,
+          forceBuild: false,
+          hostdControl,
+          publishHost,
+          tuiToken,
+          platform,
+          hostIdentity,
+        })
+      }
+    } catch (error) {
+      await cleanupHostDaemonRegistration(containerName, hostd.state === 'registered' ? hostd : initialHostd)
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
     }
 
     let run = await execRunWithConflictRetry(exec, plan.runArgs, cwd, containerName, archiveBeforeRemove)
@@ -616,7 +673,8 @@ async function runStart({
       }
       hostPort = await allocatePort(0)
       if (cliEntry) {
-        hostd = await registerWithDaemon({
+        const previousHostd = hostd
+        const retriedHostd = await registerWithDaemon({
           cwd,
           containerName,
           cliEntry,
@@ -624,7 +682,11 @@ async function runStart({
           reuseCurrentHostDaemon,
           currentHostDaemon,
         })
-        hostdControl = hostd.state === 'registered' ? hostd.control : undefined
+        if (retriedHostd.state !== 'registered') {
+          await cleanupHostDaemonRegistration(containerName, previousHostd)
+        }
+        hostd = retriedHostd
+        hostdControl = retriedHostd.state === 'registered' ? retriedHostd.control : undefined
       }
       plan = await planStart({
         cwd,
@@ -674,19 +736,19 @@ async function refreshGithubCliStore(
   agentDir: string,
   deniedRoots: readonly string[],
   provision: (options: ProvisionGithubCliStoreOptions) => GithubCliProvisionResult | Promise<GithubCliProvisionResult>,
-): Promise<void> {
+): Promise<string | null> {
   let refreshed = false
   try {
     refreshed = (await provision({ agentDir, deniedRoots })).ok
   } catch {
     refreshed = false
   }
-  if (refreshed) return
+  if (refreshed) return null
 
-  process.stderr.write(
+  return (
     'typeclaw: warning: Could not refresh GitHub CLI credentials from the host. ' +
-      'Keeping the previously persisted credential store. Run `gh auth login --hostname github.com` on the host, ' +
-      'then restart TypeClaw.\n',
+    'Keeping the previously persisted credential store. Run `gh auth login --hostname github.com` on the host, ' +
+    'then restart TypeClaw.\n'
   )
 }
 
@@ -1042,8 +1104,9 @@ async function runImageBuild(args: {
   imageTag: string
   buildContext: string
   hasBuildx: boolean
-}): Promise<boolean> {
-  const { exec, cwd, imageTag, buildContext, hasBuildx } = args
+  streamOutput: boolean
+}): Promise<{ ok: true } | { ok: false; exitCode: number; credentialHelperRetried: boolean }> {
+  const { exec, cwd, imageTag, buildContext, hasBuildx, streamOutput } = args
   const buildArgv = (frontend: 'buildx' | 'legacy'): string[] =>
     frontend === 'buildx'
       ? ['buildx', 'build', '--load', '-t', imageTag, buildContext]
@@ -1051,12 +1114,17 @@ async function runImageBuild(args: {
 
   let sanitizedConfig: SanitizedDockerConfig | null = null
   const attempt = async (frontend: 'buildx' | 'legacy'): Promise<DockerExecResult> =>
-    exec(buildArgv(frontend), { cwd, inheritStdio: true, captureStderr: true, env: sanitizedConfig?.env })
+    exec(buildArgv(frontend), {
+      cwd,
+      ...(streamOutput ? { inheritStdio: true, captureStderr: true } : {}),
+      ...(streamOutput ? {} : { captureStdout: false, maxCapturedStderrBytes: 32 * 1024 }),
+      env: sanitizedConfig?.env,
+    })
 
   try {
     let frontend: 'buildx' | 'legacy' = hasBuildx ? 'buildx' : 'legacy'
     let result = await attempt(frontend)
-    if (result.exitCode === 0) return true
+    if (result.exitCode === 0) return { ok: true }
 
     // Same-frontend retry: a broken credential helper aborts the pull before
     // the builder ever matters, so strip it and retry the identical build.
@@ -1064,7 +1132,7 @@ async function runImageBuild(args: {
       sanitizedConfig = await createSanitizedDockerConfig()
       if (sanitizedConfig) {
         result = await attempt(frontend)
-        if (result.exitCode === 0) return true
+        if (result.exitCode === 0) return { ok: true }
       }
     }
 
@@ -1075,23 +1143,23 @@ async function runImageBuild(args: {
       await refreshDockerfile(cwd, { buildKit: false })
       frontend = 'legacy'
       result = await attempt(frontend)
-      if (result.exitCode === 0) return true
+      if (result.exitCode === 0) return { ok: true }
       if (sanitizedConfig === null && isMissingDockerCredentialHelper(result.stderr)) {
         sanitizedConfig = await createSanitizedDockerConfig()
         if (sanitizedConfig) {
           result = await attempt(frontend)
-          if (result.exitCode === 0) return true
+          if (result.exitCode === 0) return { ok: true }
         }
       }
     }
 
-    if (sanitizedConfig !== null) {
-      process.stderr.write(
+    if (sanitizedConfig !== null && streamOutput) {
+      const guidance =
         'typeclaw: docker build still failed after retrying public image pulls without the configured ' +
-          'credential helper. Your ~/.docker/config.json credsStore/credHelpers may be broken.\n',
-      )
+        'credential helper. Your ~/.docker/config.json credsStore/credHelpers may be broken.'
+      process.stderr.write(`${guidance}\n`)
     }
-    return false
+    return { ok: false, exitCode: result.exitCode, credentialHelperRetried: sanitizedConfig !== null }
   } finally {
     await sanitizedConfig?.cleanup()
   }
@@ -1448,6 +1516,7 @@ async function registerWithDaemon({
     return {
       state: 'registered',
       control: { url: `http://${CONTAINER_HOSTD_HOST}:${currentHostDaemon.httpPort}`, token, brokerToken },
+      deregister: (registeredContainerName) => currentHostDaemon.deregister(registeredContainerName),
     }
   }
 
@@ -1458,6 +1527,9 @@ async function registerWithDaemon({
   return {
     state: 'registered',
     control: { url: `http://${CONTAINER_HOSTD_HOST}:${prepared.httpPort}`, token, brokerToken },
+    deregister: async (registeredContainerName) => {
+      await sendToDaemon({ kind: 'deregister', containerName: registeredContainerName })
+    },
   }
 }
 
@@ -1492,7 +1564,7 @@ async function useCurrentHostDaemon(): Promise<{ ok: true; httpPort: number } | 
 }
 
 type PreparedHostDaemonStatus =
-  | { state: 'registered'; control: HostDaemonControl }
+  | { state: 'registered'; control: HostDaemonControl; deregister: (containerName: string) => Promise<void> }
   | { state: 'unavailable'; reason: string }
   | { state: 'disabled' }
 
@@ -1503,7 +1575,7 @@ function stripHostDaemonControl(status: PreparedHostDaemonStatus): HostDaemonSta
 
 async function cleanupHostDaemonRegistration(containerName: string, status: PreparedHostDaemonStatus): Promise<void> {
   if (status.state !== 'registered') return
-  await sendToDaemon({ kind: 'deregister', containerName }).catch(() => {})
+  await status.deregister(containerName).catch(() => {})
 }
 
 // process.env.TZ is honored first because users who explicitly set it (e.g.

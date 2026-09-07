@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { Type } from '@mariozechner/pi-ai'
 import { defineTool } from '@mariozechner/pi-coding-agent'
 
+import { githubReviewerWorkKey } from '@/channels/github-repo'
 import type { PermissionService } from '@/permissions'
 import type { Stream } from '@/stream'
 
@@ -146,6 +147,21 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       if (!hasPermissionForSubagent(permissions, origin, params.subagent_type, subagent)) {
         return errorResult('subagent.spawn denied: insufficient permissions')
       }
+      // Ordered AFTER the permission check on purpose: this message reports which
+      // sibling session holds the round, so an unauthorized caller must be turned
+      // away as unauthorized rather than told anything about the PR's round state.
+      if (
+        params.subagent_type === 'reviewer' &&
+        origin?.kind === 'channel' &&
+        origin.adapter === 'github' &&
+        /^pr:\d+$/.test(origin.chat) &&
+        origin.githubReviewRound !== undefined &&
+        origin.thread !== origin.githubReviewRound.carrierThread
+      ) {
+        return errorResult(
+          "reviewer spawn denied: another session of this PR is the designated carrier for this review round and will post the review; close out only this session's thread.",
+        )
+      }
       // Fail closed past the chain-length ceiling. The tool is present on
       // subagent sessions (operator/reviewer can delegate), but a session
       // already at MAX_SUBAGENT_DEPTH cannot spawn a deeper one — this is the
@@ -184,6 +200,10 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           reviewKind: params.review_identity.review_kind,
         }
       }
+      const workKey =
+        params.review_identity === undefined
+          ? undefined
+          : githubReviewerWorkKey(params.review_identity.repo, params.review_identity.pull_request)
 
       const coalesceKey = subagentCoalesceKey({
         parentSessionId,
@@ -201,6 +221,8 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         coalesceKeyHeld = false
         coalescer.release(coalesceKey)
       }
+      const pendingWorkKeyRegistration =
+        workKey === undefined ? undefined : liveRegistry.beginWorkKeyRegistration(workKey)
 
       const startedAt = now()
       const spawnedByRole = permissions?.resolveRole(origin)
@@ -225,6 +247,9 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       try {
         resolvedHandle = await handle
       } catch (err) {
+        if (pendingWorkKeyRegistration !== undefined) {
+          liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
+        }
         releaseCoalesceKey()
         const message = err instanceof Error ? err.message : String(err)
         return errorResult(`failed to spawn ${subagentName}: ${message}`)
@@ -237,12 +262,36 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         parentSessionId,
         ...(spawnedByRole !== undefined ? { spawnedByRole } : {}),
         background,
+        // Drafting a PR invalidates every reviewer job for it, regardless of
+        // commit or review kind. This is intentionally broader than the
+        // reviewer's head/base/kind-aware coalescing key.
+        ...(workKey !== undefined ? { workKey } : {}),
         startedAt,
         status: 'running' as const,
         abort: resolvedHandle.abort,
         releaseCoalesceKey,
       }
-      liveRegistry.register(live)
+      const registered =
+        pendingWorkKeyRegistration === undefined
+          ? (liveRegistry.register(live), true)
+          : liveRegistry.registerIfWorkKeyActive(live, pendingWorkKeyRegistration)
+      let delayedCancellationError: string | undefined
+      if (!registered) {
+        void completion.then(releaseCoalesceKey)
+        try {
+          await resolvedHandle.abort()
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          // The child is still live. Register it so later cancellation, status
+          // inspection, and completion settlement can still reach it.
+          liveRegistry.register(live)
+          delayedCancellationError = `reviewer cancellation failed before registration: ${message}`
+        }
+        if (delayedCancellationError === undefined) {
+          releaseCoalesceKey()
+          return errorResult('reviewer cancelled before registration: pull request converted to draft')
+        }
+      }
       if (capturedFinalMessage !== undefined) {
         liveRegistry.recordCapturedFinalMessageIfRunning(taskId, capturedFinalMessage)
       }
@@ -277,6 +326,8 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           },
         })
       })
+
+      if (delayedCancellationError !== undefined) return errorResult(delayedCancellationError)
 
       if (background) {
         const details: SpawnSubagentToolDetails = {

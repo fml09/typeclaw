@@ -9,7 +9,7 @@ import path from 'node:path'
 // not exist.
 //
 // Which errnos may be walked past is the security-sensitive part, so it is the
-// CALLER's decision, not a default. See the two exported sets below.
+// CALLER's decision, not a default. See the three exported sets below.
 
 // The historical, strictest set: only a missing component is walked past.
 // Correct for allowlist/authorization policies, where an unresolvable component must
@@ -24,14 +24,16 @@ export const RECOVER_MISSING: ReadonlySet<string> = new Set(['ENOENT'])
 // the denied surface after rejoining: a masked directory still matches lexically and
 // still blocks. It is NOT sound for an allowlist — see RECOVER_MISSING.
 export const RECOVER_MISSING_OR_UNSEARCHABLE: ReadonlySet<string> = new Set(['ENOENT', 'EACCES'])
-// Deny-list canonicalization may also recover from ENAMETOOLONG. An overlong
-// component cannot name a reachable filesystem entry as written, so retreating
-// to the nearest resolvable ancestor and reattaching the tail is sound. This
-// still resolves every existing prefix (including planted symlinks). Keep this
-// separate from RECOVER_MISSING_OR_UNSEARCHABLE: allow-list callers must remain
-// strict and fail on ENAMETOOLONG.
-export const RECOVER_MISSING_OR_UNSEARCHABLE_OR_TOO_LONG: ReadonlySet<string> = new Set([
-  ...RECOVER_MISSING_OR_UNSEARCHABLE,
+// Adds ENAMETOOLONG for denylist matching of values that may be prose rather
+// than filesystem paths. Walking past an oversized component is sound for a
+// DENYLIST because lexical matching has already caught direct and
+// traversal-normalized denied paths, while the ancestor walk still resolves a
+// symlinked prefix before rejoining and matching the oversized tail. The
+// oversized component cannot itself name a real file on the affected
+// filesystem. It is NOT sound for an allowlist — see RECOVER_MISSING.
+export const RECOVER_MISSING_OR_UNSEARCHABLE_OR_NAME_TOO_LONG: ReadonlySet<string> = new Set([
+  'ENOENT',
+  'EACCES',
   'ENAMETOOLONG',
 ])
 

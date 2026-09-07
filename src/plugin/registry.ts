@@ -1,9 +1,10 @@
 import { existsSync } from 'node:fs'
 
+import { z } from 'zod'
+
 import { BUILTIN_COMMAND_NAMES } from '@/cli/builtins'
 import type { CronJob, PromptJob } from '@/cron'
 
-import { FIRST_PARTY_GUARD_ACKNOWLEDGEMENT_DECLARATIONS } from './guard-acknowledgements'
 import type { HookBus } from './hooks'
 import type {
   PluginChannelCommand,
@@ -11,7 +12,6 @@ import type {
   PluginCronJob,
   PluginDoctorCheck,
   PluginExports,
-  GuardAcknowledgementDeclaration,
   PluginLogger,
   PluginSkill,
   Subagent,
@@ -49,8 +49,6 @@ export type RegisteredPluginDisposer = {
   dispose: () => void | Promise<void>
 }
 
-export type GuardAcknowledgementRegistry = ReadonlyMap<string, ReadonlySet<string>>
-
 export type PluginRegistry = {
   tools: RegisteredTool[]
   subagents: RegisteredSubagent[]
@@ -61,8 +59,6 @@ export type PluginRegistry = {
   commands: RegisteredCommand[]
   channelCommands: RegisteredChannelCommand[]
   disposers: RegisteredPluginDisposer[]
-  guardAcknowledgements: Map<string, Set<string>>
-  guardAcknowledgementOwners: Map<string, string>
 }
 
 export type RegisterContributionsOptions = {
@@ -72,7 +68,6 @@ export type RegisterContributionsOptions = {
   // Static commands declared on `DefinedPlugin.commands`. Passed alongside
   // `exports` because they live outside the factory's return value.
   commands?: Record<string, PluginCommand>
-  guardAcknowledgements?: readonly GuardAcknowledgementDeclaration[]
   registry: PluginRegistry
   hooks: HookBus
   agentDir: string
@@ -80,6 +75,7 @@ export type RegisterContributionsOptions = {
 }
 
 const COMMAND_NAME_REGEX = /^[a-z][a-z0-9-]*$/
+const ACKNOWLEDGE_GUARDS = 'acknowledgeGuards'
 
 // Channel slash commands are tokenized by `parseCommand` in src/commands, which
 // accepts underscores too. Kept separate from COMMAND_NAME_REGEX so the CLI
@@ -98,11 +94,12 @@ export function buildPluginCronGlobalId(pluginName: string, localId: string): st
 export function registerContributions(opts: RegisterContributionsOptions): void {
   const { pluginName, logger, exports: ex, registry, hooks, agentDir, pluginConfig } = opts
 
-  registerGuardAcknowledgements(pluginName, opts.guardAcknowledgements ?? [], registry)
-
   if (ex.tools) {
     for (const [toolName, tool] of Object.entries(ex.tools)) {
       assertNotEmpty('tool name', toolName, pluginName)
+      if (tool.parameters instanceof z.ZodObject && ACKNOWLEDGE_GUARDS in tool.parameters.shape) {
+        throw new Error(`plugin ${pluginName}: tool "${toolName}" declares reserved parameter "${ACKNOWLEDGE_GUARDS}"`)
+      }
       const conflict = registry.tools.find((t) => t.toolName === toolName)
       if (conflict) {
         throw new Error(`plugin ${pluginName}: tool "${toolName}" already registered by plugin ${conflict.pluginName}`)
@@ -161,9 +158,7 @@ export function registerContributions(opts: RegisterContributionsOptions): void 
     }
   }
 
-  if (ex.hooks) {
-    hooks.registerAll(pluginName, agentDir, logger, ex.hooks)
-  }
+  hooks.registerAll(pluginName, agentDir, logger, ex.hooks ?? {})
 
   if (ex.doctorChecks) {
     for (const [checkName, check] of Object.entries(ex.doctorChecks)) {
@@ -216,19 +211,11 @@ export function discardRegistrationsBy(pluginName: string, registry: PluginRegis
   registry.commands = registry.commands.filter((c) => c.pluginName !== pluginName)
   registry.channelCommands = registry.channelCommands.filter((c) => c.pluginName !== pluginName)
   registry.disposers = registry.disposers.filter((d) => d.pluginName !== pluginName)
-  for (const [key, owner] of registry.guardAcknowledgementOwners) {
-    if (owner !== pluginName) continue
-    registry.guardAcknowledgementOwners.delete(key)
-    for (const [tool, keys] of registry.guardAcknowledgements) {
-      keys.delete(key)
-      if (keys.size === 0) registry.guardAcknowledgements.delete(tool)
-    }
-  }
   hooks.unregisterAll(pluginName)
 }
 
 export function emptyRegistry(): PluginRegistry {
-  const registry: PluginRegistry = {
+  return {
     tools: [],
     subagents: [],
     cronJobs: [],
@@ -238,56 +225,6 @@ export function emptyRegistry(): PluginRegistry {
     commands: [],
     channelCommands: [],
     disposers: [],
-    guardAcknowledgements: new Map(),
-    guardAcknowledgementOwners: new Map(),
-  }
-  registerGuardAcknowledgements('<first-party>', FIRST_PARTY_GUARD_ACKNOWLEDGEMENT_DECLARATIONS, registry)
-  return registry
-}
-
-function registerGuardAcknowledgements(
-  pluginName: string,
-  declarations: readonly GuardAcknowledgementDeclaration[],
-  registry: PluginRegistry,
-): void {
-  const additions: Array<{ key: string; tools: readonly string[] }> = []
-  const declaredHere = new Set<string>()
-
-  for (const declaration of declarations) {
-    assertNotEmpty('guard acknowledgement key', declaration.key, pluginName)
-    if (declaredHere.has(declaration.key)) {
-      throw new Error(`plugin ${pluginName}: duplicate guard acknowledgement key "${declaration.key}"`)
-    }
-    const owner = registry.guardAcknowledgementOwners.get(declaration.key)
-    if (owner !== undefined) {
-      throw new Error(
-        `plugin ${pluginName}: guard acknowledgement key "${declaration.key}" already declared by plugin ${owner}`,
-      )
-    }
-    if (declaration.tools.length === 0) {
-      throw new Error(`plugin ${pluginName}: guard acknowledgement "${declaration.key}" declares no tools`)
-    }
-    const tools = new Set<string>()
-    for (const tool of declaration.tools) {
-      assertNotEmpty('guard acknowledgement tool name', tool, pluginName)
-      if (tools.has(tool)) {
-        throw new Error(
-          `plugin ${pluginName}: guard acknowledgement "${declaration.key}" declares duplicate tool "${tool}"`,
-        )
-      }
-      tools.add(tool)
-    }
-    declaredHere.add(declaration.key)
-    additions.push({ key: declaration.key, tools: [...tools] })
-  }
-
-  for (const declaration of additions) {
-    registry.guardAcknowledgementOwners.set(declaration.key, pluginName)
-    for (const tool of declaration.tools) {
-      const keys = registry.guardAcknowledgements.get(tool) ?? new Set<string>()
-      keys.add(declaration.key)
-      registry.guardAcknowledgements.set(tool, keys)
-    }
   }
 }
 

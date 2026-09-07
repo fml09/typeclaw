@@ -52,10 +52,21 @@ test.skipIf(unsupportedHost)(
   () => {
     const root = mkdtempSync(join(tmpdir(), 'typeclaw-git-http-config-'))
     const repo = join(root, 'repo')
+    // The host running the test may have a credential.helper of its own. Keep
+    // that ambient configuration out of both the control and brokered runs so
+    // this test exercises only the repository config and the returned overlay.
+    const isolatedGitEnv = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_PARAMETERS: '',
+      GIT_CONFIG_COUNT: '0',
+    }
     const run = (args: string[], env: Record<string, string> = {}) =>
       Bun.spawnSync([gitExecutable, ...args], {
         cwd: repo,
-        env: { ...process.env, ...env },
+        env: { ...isolatedGitEnv, ...env },
         stderr: 'pipe',
         stdout: 'pipe',
       })
@@ -76,7 +87,7 @@ test.skipIf(unsupportedHost)(
       const credentialInput = Buffer.from('protocol=https\nhost=github.com\npath=acme/widgets.git\n\n')
       Bun.spawnSync([gitExecutable, 'credential', 'fill'], {
         cwd: repo,
-        env: { ...process.env, TYPECLAW_GIT_TOKEN: 'control-token', GIT_TERMINAL_PROMPT: '0' },
+        env: { ...isolatedGitEnv, TYPECLAW_GIT_TOKEN: 'control-token', GIT_TERMINAL_PROMPT: '0' },
         stdin: credentialInput,
         stderr: 'pipe',
         stdout: 'pipe',
@@ -88,6 +99,9 @@ test.skipIf(unsupportedHost)(
         trustedEnv: {},
         expectedRemote: 'origin',
       })
+      expect(env.GIT_CONFIG_GLOBAL).toBe('/dev/null')
+      expect(env.GIT_CONFIG_SYSTEM).toBe('/dev/null')
+      expect(env.GIT_CONFIG_NOSYSTEM).toBe('1')
       expect(text(run(['config', '--get-urlmatch', 'credential.helper', url], env))).toBe('')
       expect(text(run(['config', '--get-urlmatch', 'http.proxy', url], env))).toBe('')
       expect(text(run(['config', '--get-urlmatch', 'http.sslVerify', url], env))).toBe('true')

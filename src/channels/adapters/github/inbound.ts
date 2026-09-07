@@ -1,7 +1,8 @@
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 
+import { registerOrJoinReplyReviewRound } from '@/channels/github-review-verdict-coordinator'
 import type { GithubReviewOn } from '@/channels/schema'
-import type { GithubReviewFollowupRound, InboundMessage } from '@/channels/types'
+import type { GithubReviewFollowupRound, GithubReviewThreadCloseout, InboundMessage } from '@/channels/types'
 
 import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
@@ -11,6 +12,7 @@ import { createBoundedMap, type BoundedMap, type DeliveryDedup } from './dedup'
 import { isGithubEventAllowed } from './event-allowlist'
 import { encodeGithubReactionRef, type GithubReactionTarget } from './reactions'
 import { fetchSelfReviewBlocking } from './review-state'
+import { invalidateGithubReviewSubmission } from './review-submitter'
 import { listUnresolvedSelfReviewThreads, type UnresolvedSelfReviewThread } from './review-thread-resolver'
 
 export type GithubInboundLogger = { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void }
@@ -50,7 +52,25 @@ export type GithubWebhookHandlerOptions = {
   scheduleBackgroundTask?: (task: () => Promise<void>) => void
   sleepImpl?: (ms: number) => Promise<void>
   fetchImpl?: typeof fetch
+  generateReviewRoundId?: () => string
+  now?: () => number
+  abortGithubPrTurn?: (
+    workspace: string,
+    prNumber: number,
+    reason: string,
+  ) => Promise<
+    | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+    | { kind: 'no-live-session' }
+  >
+  clearReconcileCooldown?: (workspace: string, prId: number) => Promise<'cleared' | 'not-initialized'>
 }
+
+export const GITHUB_REVIEW_STATE_UNKNOWN_TTL_MS = 2 * 60_000
+
+type ReplyReviewRoundResolution =
+  | { kind: 'round'; round: GithubReviewFollowupRound }
+  | { kind: 'clear' }
+  | { kind: 'unknown'; expiresAt: number }
 
 export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions): (req: Request) => Promise<Response> {
   return async (req: Request): Promise<Response> => {
@@ -83,19 +103,35 @@ export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions)
 // the live handler verifies the body; the sweep trusts the authenticated API.
 export async function processVerifiedGithubDelivery(
   options: GithubWebhookHandlerOptions,
-  input: { event: string; delivery: string; payload: Record<string, unknown> },
+  input: { event: string; delivery: string; payload: Record<string, unknown>; recovered?: true },
 ): Promise<void> {
   const { event, delivery, payload } = input
   const action = readString(payload, 'action')
+  const eventAllowed = isGithubEventAllowed(options.allowlist(), event, action)
+  let staleRecoveredDraft = false
+  if (input.recovered === true && eventAllowed && event === 'pull_request' && action === 'converted_to_draft') {
+    const repository = readRepository(payload)
+    const prNumber = readNumber(readRecord(payload.pull_request), 'number')
+    if (repository !== null && prNumber !== null) {
+      staleRecoveredDraft = !(await recoveredPullRequestIsStillDraft(
+        options,
+        repository,
+        prNumber,
+        `${repository.owner}/${repository.name}`,
+      ))
+    }
+  }
   const isSynchronize = event === 'pull_request' && action === 'synchronize'
   if (!isSynchronize && delivery !== '') {
     if (options.dedup.has(delivery)) {
       options.logger.info(`[github] duplicate delivery ignored id=${delivery}`)
       return
     }
-    // Reserve the delivery id synchronously, BEFORE the awaits below, so a live
-    // webhook and the recovery sweep can never both clear the dedup gate for the
-    // same event and route it twice. Synchronize uses its own synchronous,
+    // Reserve the delivery id synchronously before routing awaits so a live
+    // webhook and the recovery sweep can never both route the same event. A
+    // recovered draft's retryable freshness read is the sole earlier await; a
+    // concurrent live delivery reserves here first and wins this dedup check.
+    // Synchronize uses its own synchronous,
     // releasable head-SHA reservation so a failed redelivery can retry. JS is
     // single-threaded: nothing else runs between this has-check and add, so the
     // reservation is atomic. The awaits and classify that follow are all
@@ -103,7 +139,24 @@ export async function processVerifiedGithubDelivery(
     options.dedup.add(delivery)
   }
 
-  if (!isGithubEventAllowed(options.allowlist(), event, action)) return
+  if (!eventAllowed || staleRecoveredDraft) return
+
+  // This control event must run before the self-author drop: a maintainer can
+  // draft the bot's PR, and the bot can draft its own PR. Either action must
+  // still stop review work instead of silently leaving the reviewer running.
+  if (event === 'pull_request' && action === 'converted_to_draft') {
+    const repository = readRepository(payload)
+    const pr = readRecord(payload.pull_request)
+    const prNumber = readNumber(pr, 'number')
+    if (repository === null || prNumber === null) {
+      options.logger.warn('[github] draft abort skipped: delivery missing repository or pull request number')
+      return
+    }
+    const workspace = `${repository.owner}/${repository.name}`
+    invalidateGithubReviewSubmission(workspace, prNumber)
+    scheduleDraftAbort({ workspace, prNumber, prId: readNumber(pr, 'id'), options })
+    return
+  }
 
   const selfId = options.selfId()
   const selfLogin = options.selfLogin()
@@ -131,6 +184,7 @@ export async function processVerifiedGithubDelivery(
 
   const teamIsBotMember = await resolveTeamMembership(event, payload, options)
   const reviewCommentParent = await resolveReviewCommentParent(event, payload, selfId, selfLogin, options)
+  const replyReviewRound = await resolveReplyReviewRound(event, payload, selfLogin, reviewCommentParent, options)
   const classified = classifyGithubInbound(event, payload, selfLogin, {
     teamIsBotMember,
     authType: options.authType?.() ?? 'pat',
@@ -139,7 +193,20 @@ export async function processVerifiedGithubDelivery(
   })
   if (classified === null) return
 
-  options.route(withApprovalPolicy(classified, options.allowApprove?.() ?? true))
+  const routed =
+    replyReviewRound?.kind === 'round'
+      ? { ...classified, githubReviewRound: replyReviewRound.round }
+      : replyReviewRound?.kind === 'unknown' && classified.githubReviewThreadCloseout !== undefined
+        ? {
+            ...classified,
+            githubReviewThreadCloseout: {
+              ...classified.githubReviewThreadCloseout,
+              deferUntil: { kind: 'review-state-unknown' as const, expiresAt: replyReviewRound.expiresAt },
+            },
+          }
+        : classified
+
+  options.route(withApprovalPolicy(routed, options.allowApprove?.() ?? true))
 }
 
 export const PR_APPROVAL_DISABLED_NOTE =
@@ -230,6 +297,108 @@ function defaultScheduleBackgroundTask(task: () => Promise<void>): void {
   void task().catch(() => {})
 }
 
+async function recoveredPullRequestIsStillDraft(
+  options: GithubWebhookHandlerOptions,
+  repository: { owner: string; name: string },
+  prNumber: number,
+  workspace: string,
+): Promise<boolean> {
+  if (options.authToken === undefined) {
+    throw new Error(`recovered draft freshness check unavailable for ${workspace}#${prNumber}: auth unavailable`)
+  }
+  try {
+    const token = await options.authToken({ repoSlug: workspace })
+    const response = await (options.fetchImpl ?? fetch)(
+      `${GITHUB_API_BASE}/repos/${repository.owner}/${repository.name}/pulls/${prNumber}`,
+      { headers: githubJsonHeaders(token) },
+    )
+    if (!response.ok) {
+      throw new Error(`pull request fetch returned ${response.status}`)
+    }
+    const current = readRecord(await response.json().catch(() => null))
+    const draft = readBoolean(current, 'draft')
+    if (draft === null) {
+      throw new Error('pull request response missing draft state')
+    }
+    if (!draft) {
+      options.logger.info(`[github] recovered draft abort skipped for ${workspace}#${prNumber}: pull request is ready`)
+    }
+    return draft
+  } catch (err) {
+    throw new Error(`recovered draft freshness check failed for ${workspace}#${prNumber}: ${describeError(err)}`)
+  }
+}
+
+function scheduleDraftAbort(input: {
+  workspace: string
+  prNumber: number
+  prId: number | null
+  options: GithubWebhookHandlerOptions
+}): void {
+  const { workspace, prNumber, prId, options } = input
+  const target = `${workspace}#${prNumber}`
+  const schedule = options.scheduleBackgroundTask ?? defaultScheduleBackgroundTask
+  schedule(async () => {
+    const abortPromise = runGithubPrAbort(options, workspace, prNumber, target)
+    const cooldownPromise = clearDraftReconcileCooldown(options, workspace, prId, target)
+    const [outcome] = await Promise.all([abortPromise, cooldownPromise])
+    if (outcome === null) return
+    if (outcome.kind === 'no-live-session') {
+      options.logger.info(`[github] draft abort ${target}: no-live-session`)
+      return
+    }
+    options.logger.info(
+      `[github] draft abort ${target}: sessions=${outcome.matchedSessions} reviewers=${outcome.matchedReviewers} failures=${outcome.abortFailures}`,
+    )
+  })
+}
+
+async function runGithubPrAbort(
+  options: GithubWebhookHandlerOptions,
+  workspace: string,
+  prNumber: number,
+  target: string,
+): Promise<
+  | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+  | { kind: 'no-live-session' }
+  | null
+> {
+  if (options.abortGithubPrTurn === undefined) {
+    options.logger.info(`[github] draft abort unavailable for ${target}: router callback not registered`)
+    return null
+  }
+  try {
+    return await options.abortGithubPrTurn(workspace, prNumber, 'pull request converted to draft')
+  } catch (err) {
+    options.logger.warn(`[github] draft abort failed for ${target}: ${describeError(err)}`)
+    return null
+  }
+}
+
+async function clearDraftReconcileCooldown(
+  options: GithubWebhookHandlerOptions,
+  workspace: string,
+  prId: number | null,
+  target: string,
+): Promise<void> {
+  if (prId === null) {
+    options.logger.warn(`[github] draft reconcile cooldown clear skipped for ${target}: pull request id missing`)
+    return
+  }
+  if (options.clearReconcileCooldown === undefined) {
+    options.logger.info(`[github] draft reconcile cooldown clear skipped for ${target}: store not initialized`)
+    return
+  }
+  try {
+    const outcome = await options.clearReconcileCooldown(workspace, prId)
+    if (outcome === 'not-initialized') {
+      options.logger.info(`[github] draft reconcile cooldown clear skipped for ${target}: store not initialized`)
+    }
+  } catch (err) {
+    options.logger.warn(`[github] draft reconcile cooldown clear failed for ${target}: ${describeError(err)}`)
+  }
+}
+
 const MAX_REVIEW_FOLLOWUP_ATTEMPTS = 3
 const REVIEW_FOLLOWUP_RETRY_BASE_MS = 1000
 const REVIEW_FOLLOWUP_DEDUP_LIMIT = 1000
@@ -297,6 +466,7 @@ function scheduleReviewFollowup(input: {
   const fetchImpl = options.fetchImpl ?? fetch
   const schedule = options.scheduleBackgroundTask ?? defaultScheduleBackgroundTask
   const sleepImpl = options.sleepImpl ?? defaultSleep
+  const generateReviewRoundId = options.generateReviewRoundId ?? randomUUID
   const target = `${repository.owner}/${repository.name}#${pullNumber}`
 
   const runFollowupAttempt = async (): Promise<'completed' | 'retry'> => {
@@ -340,7 +510,7 @@ function scheduleReviewFollowup(input: {
 
       if (threads.threads.length === 0) {
         if (selfBlocking) {
-          const round = buildReviewRound(repository, pullNumber, headSha, null)
+          const round = buildReviewRound(repository, pullNumber, headSha, null, generateReviewRoundId)
           options.route(
             withApprovalPolicy(
               buildReviewFollowupInbound({
@@ -361,7 +531,13 @@ function scheduleReviewFollowup(input: {
       }
 
       const round = selfBlocking
-        ? buildReviewRound(repository, pullNumber, headSha, String(threads.threads[0]!.rootCommentId))
+        ? buildReviewRound(
+            repository,
+            pullNumber,
+            headSha,
+            String(threads.threads[0]!.rootCommentId),
+            generateReviewRoundId,
+          )
         : undefined
       for (const [index, thread] of threads.threads.entries()) {
         // Deliver the PR-level blocking obligation through exactly one sibling
@@ -453,8 +629,11 @@ function buildReviewRound(
   prNumber: number,
   headSha: string,
   carrierThread: string | null,
+  generateRoundId: () => string,
 ): GithubReviewFollowupRound {
   return {
+    kind: 'push',
+    roundId: generateRoundId(),
     workspace: `${repository.owner}/${repository.name}`,
     prNumber,
     headSha,
@@ -554,6 +733,10 @@ export function classifyGithubInbound(
     const parent =
       parentId !== null && options?.reviewCommentParent?.parentId === parentId ? options.reviewCommentParent : null
     const commenter = readUser(comment.user)
+    const githubReviewThreadCloseout: GithubReviewThreadCloseout | undefined =
+      parent?.isSelf === true && commenter !== null && !isBotUser(commenter)
+        ? { workspace: base.workspace, prNumber: number, rootCommentId: String(root) }
+        : undefined
     const directedAtBot =
       parentId === null &&
       isSelfPr(readUser(pr.user), selfLogin, options?.authType ?? 'pat') &&
@@ -573,6 +756,7 @@ export function classifyGithubInbound(
         ...(directedAtBot ? { forceBotMention: true } : {}),
         replyToBotMessageId: parent?.isSelf === true ? String(parent.parentId) : null,
         replyToOtherMessageId: parent?.isSelf === false ? String(parent.parentId) : null,
+        ...(githubReviewThreadCloseout !== undefined ? { githubReviewThreadCloseout } : {}),
       },
     )
   }
@@ -767,6 +951,7 @@ type BuildInboundOptions = {
   suppressSticky?: boolean
   replyToBotMessageId?: string | null
   replyToOtherMessageId?: string | null
+  githubReviewThreadCloseout?: GithubReviewThreadCloseout
   // Forces isBotMention=true with no @-handle in the body. A review (or
   // top-level review comment) on a PR the agent ITSELF authored is directed at
   // the bot — the inverse of review_requested — so it engages even though the
@@ -991,9 +1176,12 @@ function buildInbound(
     ...(reactionTarget !== null ? { reactionRef: encodeGithubReactionRef(reactionTarget) } : {}),
     authorId: String(user.id),
     authorName: user.login,
-    authorIsBot: user.type === 'Bot',
+    authorIsBot: isBotUser(user),
     isBotMention,
     ...(options?.suppressSticky === true ? { suppressSticky: true } : {}),
+    ...(options?.githubReviewThreadCloseout !== undefined
+      ? { githubReviewThreadCloseout: options.githubReviewThreadCloseout }
+      : {}),
     replyToBotMessageId,
     replyToOtherMessageId,
     ts: typeof rawTs === 'string' ? Date.parse(rawTs) || 0 : 0,
@@ -1108,6 +1296,63 @@ async function resolveReviewCommentParent(
   }
 }
 
+async function resolveReplyReviewRound(
+  event: string,
+  payload: Record<string, unknown>,
+  selfLogin: string | null,
+  parent: ReviewCommentParent | null,
+  options: GithubWebhookHandlerOptions,
+): Promise<ReplyReviewRoundResolution | null> {
+  if (event !== 'pull_request_review_comment' || parent?.isSelf !== true) return null
+  const comment = readRecord(payload.comment)
+  const parentId = readNumber(comment, 'in_reply_to_id')
+  if (parentId === null || parent.parentId !== parentId) return null
+  const expiresAt = (options.now ?? Date.now)() + GITHUB_REVIEW_STATE_UNKNOWN_TTL_MS
+  if (selfLogin === null) return { kind: 'unknown', expiresAt }
+  const repository = readRepository(payload)
+  const pr = readRecord(payload.pull_request)
+  const prNumber = readNumber(pr, 'number')
+  const headSha = readString(readRecord(pr?.head), 'sha')
+  const authToken = options.authToken
+  if (repository === null || prNumber === null || headSha === null || authToken === undefined) {
+    return { kind: 'unknown', expiresAt }
+  }
+
+  const target = `${repository.owner}/${repository.name}#${prNumber}`
+  try {
+    const token = await authToken({ repoSlug: `${repository.owner}/${repository.name}` })
+    const blocking = await fetchSelfReviewBlocking({
+      token,
+      selfLogin,
+      owner: repository.owner,
+      repo: repository.name,
+      prNumber,
+      fetchImpl: options.fetchImpl ?? fetch,
+    })
+    if (!blocking.ok) {
+      options.logger.warn(`[github] reply review-state lookup failed for ${target}: ${blocking.error}`)
+      return { kind: 'unknown', expiresAt }
+    }
+    if (!blocking.selfBlocking) return { kind: 'clear' }
+    if (blocking.selfBlockingReviewId === null) return { kind: 'unknown', expiresAt }
+    return {
+      kind: 'round',
+      round: registerOrJoinReplyReviewRound({
+        workspace: `${repository.owner}/${repository.name}`,
+        prNumber,
+        headSha,
+        blockingReviewId: blocking.selfBlockingReviewId,
+        thread: String(parentId),
+        ...(options.now !== undefined ? { now: options.now } : {}),
+        generateRoundId: options.generateReviewRoundId ?? randomUUID,
+      }),
+    }
+  } catch (err) {
+    options.logger.warn(`[github] reply review-state lookup failed for ${target}: ${describeError(err)}`)
+    return { kind: 'unknown', expiresAt }
+  }
+}
+
 function readRepository(payload: Record<string, unknown>): { owner: string; name: string } | null {
   const repository = readRecord(payload.repository)
   const owner = readRecord(repository?.owner)
@@ -1174,6 +1419,10 @@ function isSelfAuthor(author: GithubUser, selfId: string | null, selfLogin: stri
   if (selfId !== null && String(author.id) === selfId) return true
   if (selfLogin !== null && author.login === selfLogin) return true
   return false
+}
+
+function isBotUser(user: GithubUser): boolean {
+  return user.type === 'Bot'
 }
 
 // Whether the PR's OPENER is this agent. Distinct from isSelfAuthor (which

@@ -66,6 +66,14 @@ export function buildGitCredentialEnv(
     GIT_TERMINAL_PROMPT: '0',
     // Git applies local insteadOf rewrites after analysis; HTTPS-only blocks ext:: from inheriting the token.
     GIT_ALLOW_PROTOCOL: 'https',
+    // Do not let a host or runner-level credential helper/configuration answer
+    // before this brokered environment. GIT_CONFIG_COUNT only overrides keys
+    // named below; global/system config can still supply helpers, proxies, or
+    // transport settings unless those sources are disabled explicitly.
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_PARAMETERS: '',
     GIT_CONFIG_COUNT: String(config.length),
     ...Object.fromEntries(
       config.flatMap(([key, value], index) => [

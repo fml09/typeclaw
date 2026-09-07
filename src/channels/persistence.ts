@@ -6,7 +6,7 @@ import type { ChannelParticipant } from '@/agent/session-origin'
 import { toRef } from './adapters/webex-id-ref'
 import { describeError } from './describe-error'
 import type { AdapterId } from './schema'
-import type { ChannelKey, GithubReviewFollowupRound } from './types'
+import type { ChannelKey, GithubReviewFollowupRound, GithubReviewThreadCloseout } from './types'
 
 const FILE_VERSION = 7
 
@@ -36,6 +36,7 @@ export type ChannelSessionRecord = {
     dismissalAttempted?: true
     requestChangesAttempted?: true
   }
+  githubReviewThreadCloseout?: GithubReviewThreadCloseout & { deferred: true }
 }
 
 type FileV4 = {
@@ -100,12 +101,12 @@ export async function loadChannelSessions(
   if (version === FILE_VERSION) {
     const file = parsed as FileV7
     if (!Array.isArray(file.sessions)) return []
-    return dedupe(file.sessions.filter(isValidRecord))
+    return dedupe(file.sessions.filter(isValidRecord).map(normalizeGithubReviewRound))
   }
   if (version === 5) {
     const file = parsed as FileV5
     if (!Array.isArray(file.sessions)) return []
-    return dedupe(file.sessions.filter(isValidRecord))
+    return dedupe(file.sessions.filter(isValidRecord).map(normalizeGithubReviewRound))
   }
   if (version === 6) {
     const file = parsed as FileV6
@@ -198,6 +199,19 @@ function dropLegacyGithubReviewRound(record: ChannelSessionRecord): ChannelSessi
   return rest
 }
 
+function normalizeGithubReviewRound(record: ChannelSessionRecord): ChannelSessionRecord {
+  const round = record.githubReviewRound
+  if (round === undefined || (round.kind !== undefined && round.roundId !== undefined)) return record
+  return {
+    ...record,
+    githubReviewRound: {
+      ...round,
+      kind: 'push',
+      roundId: `legacy:${round.workspace}#${round.prNumber}#${round.headSha}`,
+    },
+  }
+}
+
 function recordKey(record: ChannelSessionRecord): string {
   return `${record.adapter}:${record.workspace}:${record.chat}:${record.thread ?? ''}`
 }
@@ -233,7 +247,32 @@ function isValidRecord(v: unknown): v is ChannelSessionRecord {
     (r.sessionFile === undefined || typeof r.sessionFile === 'string') &&
     (r.lastInboundAt === undefined || typeof r.lastInboundAt === 'number') &&
     Array.isArray(r.participants) &&
-    (r.githubReviewRound === undefined || isValidGithubReviewRound(r.githubReviewRound, r))
+    (r.githubReviewRound === undefined || isValidGithubReviewRound(r.githubReviewRound, r)) &&
+    (r.githubReviewThreadCloseout === undefined || isValidGithubReviewThreadCloseout(r.githubReviewThreadCloseout, r))
+  )
+}
+
+function isValidGithubReviewThreadCloseout(value: unknown, record: Record<string, unknown>): boolean {
+  if (!isObject(value)) return false
+  const deferUntil = value.deferUntil
+  return (
+    record.adapter === 'github' &&
+    typeof value.workspace === 'string' &&
+    value.workspace === record.workspace &&
+    typeof value.prNumber === 'number' &&
+    Number.isInteger(value.prNumber) &&
+    value.prNumber > 0 &&
+    record.chat === `pr:${value.prNumber}` &&
+    typeof value.rootCommentId === 'string' &&
+    value.rootCommentId.length > 0 &&
+    value.rootCommentId === record.thread &&
+    (deferUntil === undefined ||
+      (isObject(deferUntil) &&
+        deferUntil.kind === 'review-state-unknown' &&
+        typeof deferUntil.expiresAt === 'number' &&
+        Number.isFinite(deferUntil.expiresAt) &&
+        deferUntil.expiresAt >= 0)) &&
+    value.deferred === true
   )
 }
 
@@ -246,6 +285,9 @@ function isValidV6Record(v: unknown): v is ChannelSessionRecord {
 
 function isValidGithubReviewRound(value: unknown, record: Record<string, unknown>): boolean {
   if (!isObject(value)) return false
+  const hasLegacyIdentity = value.kind === undefined && value.roundId === undefined
+  const hasCurrentIdentity =
+    (value.kind === 'push' || value.kind === 'reply') && typeof value.roundId === 'string' && value.roundId.length > 0
   return (
     (value.status === 'pending' || value.status === 'completed') &&
     record.adapter === 'github' &&
@@ -265,6 +307,7 @@ function isValidGithubReviewRound(value: unknown, record: Record<string, unknown
     value.attemptedCarriers.length > 0 &&
     value.attemptedCarriers.every((thread) => thread === null || typeof thread === 'string') &&
     value.attemptedCarriers.some((thread) => thread === value.carrierThread) &&
+    (hasLegacyIdentity || hasCurrentIdentity) &&
     (value.dismissalAttempted === undefined || value.dismissalAttempted === true) &&
     (value.requestChangesAttempted === undefined || value.requestChangesAttempted === true)
   )

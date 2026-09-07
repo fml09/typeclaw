@@ -7,6 +7,11 @@ import {
   type ReviewerPayload,
   reviewerPayloadSchema,
 } from '@/bundled-plugins/reviewer/reviewer'
+import {
+  forgetGithubReviewRound,
+  promoteGithubReviewRound,
+  registerGithubReviewRound,
+} from '@/channels/github-review-verdict-coordinator'
 import type { PermissionService } from '@/permissions'
 import { createStream } from '@/stream'
 
@@ -180,6 +185,210 @@ describe('createSpawnSubagentTool — visibility gate', () => {
     const result = await tool.execute('call_1', { subagent_type: 'explorer', prompt: 'q' }, undefined, undefined, ctx)
     const text = result.content[0]?.type === 'text' ? result.content[0].text : ''
     expect(text).toContain('Available: (none)')
+  })
+})
+
+describe('createSpawnSubagentTool — GitHub review-round carrier gate', () => {
+  const round = () => ({
+    kind: 'reply' as const,
+    roundId: 'round-1',
+    workspace: 'acme/widgets',
+    prNumber: 42,
+    headSha: 'a'.repeat(40),
+    carrierThread: 'thread-carrier',
+  })
+
+  function spawnWithLiveOrigin(getOrigin: () => SessionOrigin) {
+    let sessionsCreated = 0
+    const tool = createSpawnSubagentTool({
+      registry: makeRegistry({ reviewer: { systemPrompt: 'Review the PR.', visibility: 'public' } }),
+      liveRegistry: new LiveSubagentRegistry(),
+      createSessionForSubagent: async () => {
+        sessionsCreated += 1
+        return stubSession()
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin,
+      generateTaskId: () => 'bg_round',
+      now: () => 1_000,
+    })
+    return { tool, sessionsCreated: () => sessionsCreated }
+  }
+
+  test('denies a non-carrier reviewer before creating a subagent session', async () => {
+    const { tool, sessionsCreated } = spawnWithLiveOrigin(() => ({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/widgets',
+      chat: 'pr:42',
+      thread: 'thread-sibling',
+      githubReviewRound: round(),
+    }))
+
+    const result = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'Review the PR.' },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(result.details).toEqual({
+      ok: false,
+      error:
+        "reviewer spawn denied: another session of this PR is the designated carrier for this review round and will post the review; close out only this session's thread.",
+    })
+    expect(sessionsCreated()).toBe(0)
+  })
+
+  test('allows the designated carrier to spawn a reviewer', async () => {
+    const { tool, sessionsCreated } = spawnWithLiveOrigin(() => ({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/widgets',
+      chat: 'pr:42',
+      thread: 'thread-carrier',
+      githubReviewRound: round(),
+    }))
+
+    const result = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'Review the PR.' },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(result.details).toEqual(expect.objectContaining({ ok: true }))
+    expect(sessionsCreated()).toBe(1)
+  })
+
+  test('allows a non-carrier to spawn a non-reviewer subagent', async () => {
+    const { tool, sessionsCreated } = spawnWithLiveOrigin(() => ({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/widgets',
+      chat: 'pr:42',
+      thread: 'thread-sibling',
+      githubReviewRound: round(),
+    }))
+
+    const result = await tool.execute(
+      'call_1',
+      { subagent_type: 'explorer', prompt: 'Inspect metadata.' },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(result.details).toEqual(expect.objectContaining({ ok: true }))
+    expect(sessionsCreated()).toBe(1)
+  })
+
+  test('allows a GitHub PR session without a round to spawn a reviewer', async () => {
+    const { tool, sessionsCreated } = spawnWithLiveOrigin(() => ({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/widgets',
+      chat: 'pr:42',
+      thread: 'thread-sibling',
+    }))
+
+    const result = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'Review the PR.' },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(result.details).toEqual(expect.objectContaining({ ok: true }))
+    expect(sessionsCreated()).toBe(1)
+  })
+
+  test('does not affect a non-GitHub session carrying round-shaped state', async () => {
+    const { tool, sessionsCreated } = spawnWithLiveOrigin(() => ({
+      kind: 'channel',
+      adapter: 'slack-bot',
+      workspace: 'T1',
+      chat: 'pr:42',
+      thread: 'thread-sibling',
+      githubReviewRound: round(),
+    }))
+
+    const result = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'Review the PR.' },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(result.details).toEqual(expect.objectContaining({ ok: true }))
+    expect(sessionsCreated()).toBe(1)
+  })
+
+  test('does not affect a GitHub non-PR session carrying round-shaped state', async () => {
+    const { tool, sessionsCreated } = spawnWithLiveOrigin(() => ({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/widgets',
+      chat: 'issue:42',
+      thread: 'thread-sibling',
+      githubReviewRound: round(),
+    }))
+
+    const result = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'Review the issue.' },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(result.details).toEqual(expect.objectContaining({ ok: true }))
+    expect(sessionsCreated()).toBe(1)
+  })
+
+  test('allows a previously denied sibling after live promotion makes it the carrier', async () => {
+    const origin: Extract<SessionOrigin, { kind: 'channel' }> = {
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/widgets',
+      chat: 'pr:42',
+      thread: 'thread-sibling',
+      githubReviewRound: round(),
+    }
+    const { tool, sessionsCreated } = spawnWithLiveOrigin(() => origin)
+
+    const denied = await tool.execute(
+      'call_1',
+      { subagent_type: 'reviewer', prompt: 'Review the PR.' },
+      undefined,
+      undefined,
+      ctx,
+    )
+    expect(denied.details).toEqual(expect.objectContaining({ ok: false }))
+    expect(sessionsCreated()).toBe(0)
+
+    const activeRound = origin.githubReviewRound
+    if (activeRound === undefined) throw new Error('test origin is missing its review round')
+    registerGithubReviewRound(activeRound)
+    const promoted = promoteGithubReviewRound(activeRound, origin.thread)
+    if (promoted === null) throw new Error('review-round promotion failed')
+    origin.githubReviewRound = promoted
+    const allowed = await tool.execute(
+      'call_2',
+      { subagent_type: 'reviewer', prompt: 'Review the PR.' },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(allowed.details).toEqual(expect.objectContaining({ ok: true }))
+    expect(sessionsCreated()).toBe(1)
+    forgetGithubReviewRound(promoted)
   })
 })
 
@@ -716,6 +925,216 @@ describe('createSpawnSubagentTool — concurrency', () => {
     expect(providerExecutions).toBe(1)
 
     releasePrompt()
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+
+  test('stamps a canonical PR-wide work key only on reviewer jobs with validated identity', async () => {
+    let releaseReviewer: () => void = () => {}
+    const reviewerSession = stubSession()
+    reviewerSession.prompt = () =>
+      new Promise<void>((resolve) => {
+        releaseReviewer = resolve
+      })
+    const liveRegistry = new LiveSubagentRegistry()
+    const { registry } = reviewerRegistry()
+    const tool = createSpawnSubagentTool({
+      registry: { ...registry, ...makeRegistry() },
+      liveRegistry,
+      createSessionForSubagent: async (_subagent, options) =>
+        options?.name === 'reviewer' ? reviewerSession : stubSession(),
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: (() => {
+        let task = 0
+        return () => `bg_work${++task}`
+      })(),
+    })
+
+    await tool.execute(
+      'call_reviewer',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'review it',
+        review_identity: {
+          repo: 'Acme/Widgets',
+          pull_request: 42,
+          head_sha: 'a'.repeat(40),
+          base_sha: 'b'.repeat(40),
+          review_kind: 'review',
+        },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+    await tool.execute('call_explorer', { subagent_type: 'explorer', prompt: 'inspect it' }, undefined, undefined, ctx)
+
+    expect(liveRegistry.get('bg_work1')?.workKey).toBe('reviewer:github:acme/widgets#42')
+    expect(liveRegistry.get('bg_work2')?.workKey).toBeUndefined()
+
+    releaseReviewer()
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+
+  test('aborting a parent AgentSession alone leaves its background reviewer running', async () => {
+    let releaseReviewer: () => void = () => {}
+    const reviewerSession = stubSession()
+    reviewerSession.prompt = () =>
+      new Promise<void>((resolve) => {
+        releaseReviewer = resolve
+      })
+    const parentSession = stubSession()
+    const liveRegistry = new LiveSubagentRegistry()
+    const { registry } = reviewerRegistry()
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => reviewerSession,
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => 'bg_reviewer',
+    })
+
+    await tool.execute(
+      'call_reviewer',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'review it',
+        review_identity: {
+          repo: 'acme/widgets',
+          pull_request: 42,
+          head_sha: 'a'.repeat(40),
+          base_sha: 'b'.repeat(40),
+          review_kind: 'review',
+        },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    await parentSession.abort()
+
+    expect(parentSession.abortCount.n).toBe(1)
+    expect(reviewerSession.abortCount.n).toBe(0)
+    expect(liveRegistry.get('bg_reviewer')?.status).toBe('running')
+
+    releaseReviewer()
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+
+  test('cancels a reviewer when its subagent session is still being created', async () => {
+    const sessionCreationStarted = Promise.withResolvers<void>()
+    const finishSessionCreation = Promise.withResolvers<AgentSession>()
+    const reviewerSession = stubSession()
+    const liveRegistry = new LiveSubagentRegistry()
+    const { registry } = reviewerRegistry()
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => {
+        sessionCreationStarted.resolve()
+        return finishSessionCreation.promise
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => 'bg_pending_reviewer',
+    })
+    const pendingSpawn = tool.execute(
+      'call_reviewer',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'review it',
+        review_identity: {
+          repo: 'acme/widgets',
+          pull_request: 42,
+          head_sha: 'a'.repeat(40),
+          base_sha: 'b'.repeat(40),
+          review_kind: 'review',
+        },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    await sessionCreationStarted.promise
+    expect(
+      await liveRegistry.cancelRunningByWorkKey('reviewer:github:acme/widgets#42', 'pull request converted to draft'),
+    ).toEqual({ matched: 0, cancelled: 0, failures: 0 })
+    finishSessionCreation.resolve(reviewerSession)
+    const result = await pendingSpawn
+
+    expect(result.details).toMatchObject({ ok: false, error: expect.stringContaining('cancelled') })
+    expect(reviewerSession.abortCount.n).toBe(1)
+    expect(liveRegistry.get('bg_pending_reviewer')).toBeUndefined()
+  })
+
+  test('keeps a pending reviewer observable and coalesced when its delayed abort fails', async () => {
+    const sessionCreationStarted = Promise.withResolvers<void>()
+    const finishSessionCreation = Promise.withResolvers<AgentSession>()
+    const finishPrompt = Promise.withResolvers<void>()
+    const reviewerSession = stubSession()
+    reviewerSession.prompt = async () => finishPrompt.promise
+    reviewerSession.abort = async () => {
+      reviewerSession.abortCount.n += 1
+      throw new Error('provider refused abort')
+    }
+    const liveRegistry = new LiveSubagentRegistry()
+    const coalescer = new SubagentCoalescer()
+    const { registry } = reviewerRegistry()
+    let task = 0
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => {
+        sessionCreationStarted.resolve()
+        return finishSessionCreation.promise
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => `bg_pending_abort${++task}`,
+      coalescer,
+    })
+    const review_identity = {
+      repo: 'acme/widgets',
+      pull_request: 42,
+      head_sha: 'a'.repeat(40),
+      base_sha: 'b'.repeat(40),
+      review_kind: 'review' as const,
+    }
+    const pendingSpawn = tool.execute(
+      'call_reviewer',
+      { subagent_type: 'reviewer', prompt: 'review it', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    await sessionCreationStarted.promise
+    await liveRegistry.cancelRunningByWorkKey('reviewer:github:acme/widgets#42', 'pull request converted to draft')
+    finishSessionCreation.resolve(reviewerSession)
+    const failedCancellation = await pendingSpawn
+    const duplicate = await tool.execute(
+      'call_duplicate',
+      { subagent_type: 'reviewer', prompt: 'review it again', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(failedCancellation.details).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('provider refused abort'),
+    })
+    expect(liveRegistry.get('bg_pending_abort1')?.status).toBe('running')
+    expect(duplicate.details).toMatchObject({ ok: false, error: expect.stringContaining('already in progress') })
+
+    finishPrompt.resolve()
     await new Promise((resolve) => setImmediate(resolve))
   })
 

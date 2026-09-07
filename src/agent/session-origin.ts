@@ -395,6 +395,7 @@ function renderChannelOrigin(
     chat: string
     chatName?: string
     thread: string | null
+    githubReviewRound?: GithubReviewFollowupRound
     reactionRef?: ReactionRef
     participants?: readonly ChannelParticipant[]
     membership?: MembershipCount
@@ -448,10 +449,24 @@ function renderChannelOrigin(
       'One verdict, one surface. After submitting the review, use',
       '`skip_response({ reason: "verdict posted as review" })`.',
       '',
+      '**Never post your own coordination state.** Write only what a PR',
+      'participant needs. Do not narrate carriers, review rounds, sessions,',
+      'a verdict not yet being registered, or sticky review state.',
+      '',
       'GitHub renders real Markdown; use it freely.',
       'The GitHub adapter cannot send file attachments.',
       'GitHub has no typing indicator.',
     )
+
+    if (/^pr:\d+$/.test(origin.chat) && origin.githubReviewRound !== undefined) {
+      const isCarrier = origin.thread === origin.githubReviewRound.carrierThread
+      lines.push(
+        '',
+        isCarrier
+          ? '**This session is the review-round carrier.** Perform one whole-PR re-review and post the verdict.'
+          : '**This session is not the review-round carrier.** Do not spawn a reviewer, review, or publish findings. While waiting, the correct action is silence via `skip_response`; posting a "waiting for the verdict" or "I\'ll tidy this up later" status comment is a defect. When the verdict lands, close out only this thread in one message.',
+      )
+    }
 
     // Models reliably address review-comment feedback and then end the turn
     // WITHOUT resolving the thread — leaving a wall of "open" threads on the PR.

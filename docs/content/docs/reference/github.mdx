@@ -38,6 +38,7 @@ PAT brokerage deliberately excludes shapes where the destination cannot be enfor
 - `gh api graphql` is blocked for PATs because the query can name repositories that are not visible in argv. Use a repository-confined REST endpoint, App mode with an explicit `-R owner/repo` mint hint, or run the PAT-backed query host-side.
 - A PAT explicitly declared in the agent `.env` can be brokered to one standalone GitHub `git push` for a role entitled to use secrets. TypeClaw verifies that the live value is exactly the operator-declared value, suppresses ambient aliases, disables hooks and credential helpers, forces exact-repository TLS verification with the system CA bundle, clears local HTTP/remote proxy settings, and delivers the PAT through `GIT_ASKPASS` rather than argv or Git config. Reads (`clone`, `fetch`, `pull`, `ls-remote`) remain unbrokered on the PAT path: public repositories work anonymously and private ones fail at Git's own auth. A process-only, replaced, malformed, or unauthorized PAT never silently falls through to another broad credential. `gh pr checkout` remains unavailable; broad private-repository reviews use the reviewer-only `github_prepare_review_checkout` action.
 - Chained commands, substitutions, aliases, extensions, auth/config management, token-display forms (`gh auth token`, `gh auth status -t`, and `--show-token`), and other shapes that could expose the command-scoped token are rejected rather than run with broad ambient credentials.
+- Flag names are interpreted per command, not globally. `-F` is `--field` for `gh api` and `gh workflow run` but `--body-file` on `pr`/`issue` commands, so it is accepted only where it means a field; file-backed input is unavailable under every spelling.
 
 ### GitHub App mode
 
@@ -80,7 +81,7 @@ These extend the [shared base config](/docs/reference/channel-adapters) for `cha
 | ---------------- | ----------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `webhookUrl`     | string                                    | —                    | Public URL for webhook delivery; tunnel used when omitted                                                        |
 | `webhookPort`    | number                                    | `8975`               | Container-side port the webhook server listens on                                                                |
-| `eventAllowlist` | string[]                                  | (11 defaults)        | Events that trigger the adapter                                                                                  |
+| `eventAllowlist` | string[]                                  | (12 defaults)        | Events that trigger the adapter                                                                                  |
 | `repos`          | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start                                                               |
 | `review.on`      | `'review_requested' \| 'opened' \| 'off'` | `'review_requested'` | When to fire a review                                                                                            |
 | `review.approve` | boolean                                   | `true`               | `false` downgrades APPROVE verdicts to COMMENT; a re-review that clears the bot's own block dismisses it instead |
@@ -93,6 +94,7 @@ pull_request_review_comment.created
 discussion_comment.created
 issues.opened
 pull_request.opened
+pull_request.converted_to_draft
 pull_request.ready_for_review
 pull_request.review_requested
 pull_request.review_request_removed
@@ -123,6 +125,12 @@ Reviews fire on the event named in `review.on` (default `review_requested`).
 - **PAT mode**: the bot is requested by its GitHub login.
 - **App mode**: request the [decoy user account](/docs/internals/github-decoy-reviewer); the App itself can't be a reviewer.
 - Team-reviewer requests are honored when the bot is a member of the requested team.
+
+### Draft transitions
+
+Converting a PR to draft immediately stops its in-progress review turn, cancels its reviewer subagent, and clears pending review rounds. A later `ready_for_review` starts a fresh review.
+
+Custom `eventAllowlist` values must include `pull_request.converted_to_draft` to enable this behavior. If the allowlist currently contains no `pull_request.*` entry, restart after adding it so TypeClaw re-registers the hook's coarse `pull_request` event.
 
 ### Push re-review
 

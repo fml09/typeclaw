@@ -16,7 +16,10 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS } from '@/agent/tools-without-local-file-operands'
-import { RECOVER_MISSING_OR_UNSEARCHABLE_OR_TOO_LONG, realIntendedPathSync } from '@/path-safety/real-intended-path'
+import {
+  RECOVER_MISSING_OR_UNSEARCHABLE_OR_NAME_TOO_LONG,
+  realIntendedPathSync,
+} from '@/path-safety/real-intended-path'
 import type { ToolFileOperands, ToolProvenance } from '@/plugin'
 import {
   CANONICAL_AGENT_SECRET_FILES,
@@ -1073,13 +1076,12 @@ function hasSameFileIdentity(candidate: string, deniedFile: string): boolean {
 }
 
 // Sync keeps the guard synchronous; the cost is one syscall per existing
-// component, negligible at the tool-call boundary. EACCES and ENAMETOOLONG
-// are recoverable here (but NOT in allowlist/write policies): this is denylist
-// matching, so an unsearchable or overlong tail is reattached only after every
-// existing ancestor is canonicalized. See @/path-safety/real-intended-path.
+// component, negligible at the tool-call boundary. The broader errno recovery
+// is confined to this denylist matcher; guard plugin write policies retain the
+// allowlist-oriented default. See @/path-safety/real-intended-path.
 function realpathRealIntendedPath(absolutePath: string, realpath: (candidate: string) => string): string {
   return realIntendedPathSync(absolutePath, realpath, {
-    recoverable: RECOVER_MISSING_OR_UNSEARCHABLE_OR_TOO_LONG,
+    recoverable: RECOVER_MISSING_OR_UNSEARCHABLE_OR_NAME_TOO_LONG,
     onExhausted: 'return-input',
   })
 }

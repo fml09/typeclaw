@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createHmac } from 'node:crypto'
 
+import { __resetReviewVerdictGuardForTest } from '@/channels/github-review-verdict-coordinator'
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
 import type { InboundMessage } from '@/channels/types'
 
@@ -51,6 +52,11 @@ describe('classifyGithubInbound', () => {
       expect(msg?.replyToBotMessageId).toBe('101')
       expect(msg?.replyToOtherMessageId).toBe(null)
       expect(msg?.suppressSticky).toBe(true)
+      expect(msg?.githubReviewThreadCloseout).toEqual({
+        workspace: 'acme/project',
+        prNumber: 7,
+        rootCommentId: '101',
+      })
     })
 
     it('marks a reply to someone else review comment as explicit-only and reply-to-other', () => {
@@ -60,6 +66,20 @@ describe('classifyGithubInbound', () => {
       expect(msg?.replyToBotMessageId).toBe(null)
       expect(msg?.replyToOtherMessageId).toBe('101')
       expect(msg?.suppressSticky).toBe(true)
+      expect(msg?.githubReviewThreadCloseout).toBeUndefined()
+    })
+
+    it('does not stamp a closeout obligation on a peer-bot reply to the bot review comment', () => {
+      const payload = reviewCommentPayload()
+      ;(payload.comment as Record<string, unknown>).user = { login: 'peer-bot', id: 20, type: 'Bot' }
+
+      const msg = classifyGithubInbound('pull_request_review_comment', payload, 'typeclaw-bot', {
+        reviewCommentParent: { isSelf: true, parentId: 101 },
+      })
+
+      expect(msg?.authorIsBot).toBe(true)
+      expect(msg?.replyToBotMessageId).toBe('101')
+      expect(msg?.githubReviewThreadCloseout).toBeUndefined()
     })
 
     it('marks a top-level review comment as explicit-only without reply fields', () => {
@@ -72,6 +92,7 @@ describe('classifyGithubInbound', () => {
       expect(msg?.replyToBotMessageId).toBe(null)
       expect(msg?.replyToOtherMessageId).toBe(null)
       expect(msg?.suppressSticky).toBe(true)
+      expect(msg?.githubReviewThreadCloseout).toBeUndefined()
     })
 
     it('preserves @mention detection on explicit-only review comments', () => {
@@ -1130,6 +1151,184 @@ describe('createGithubWebhookHandler', () => {
   })
 })
 
+describe('createGithubWebhookHandler — pull_request.converted_to_draft control', () => {
+  type AbortCall = { workspace: string; prNumber: number; reason: string }
+  type CooldownClear = { workspace: string; prId: number }
+
+  function draftHandler(input: {
+    allowlist?: () => readonly string[]
+    selfId?: string | null
+    selfLogin?: string | null
+    abortCalls: AbortCall[]
+    cooldownClears?: CooldownClear[]
+    routed: InboundMessage[]
+    tasks: Array<() => Promise<void>>
+    info?: string[]
+    abortResult?:
+      | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+      | { kind: 'no-live-session' }
+  }): (req: Request) => Promise<Response> {
+    return createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: input.allowlist ?? (() => ['pull_request.converted_to_draft']),
+      selfId: () => input.selfId ?? '99',
+      selfLogin: () => input.selfLogin ?? 'typeclaw-bot',
+      abortGithubPrTurn: async (workspace, prNumber, reason) => {
+        input.abortCalls.push({ workspace, prNumber, reason })
+        return input.abortResult ?? { kind: 'aborted', matchedSessions: 2, matchedReviewers: 1, abortFailures: 0 }
+      },
+      clearReconcileCooldown: async (workspace, prId) => {
+        input.cooldownClears?.push({ workspace, prId })
+        return 'cleared'
+      },
+      scheduleBackgroundTask: (task) => {
+        input.tasks.push(task)
+      },
+      logger: { info: (message) => input.info?.push(message), warn: () => {}, error: () => {} },
+      route: (message) => {
+        input.routed.push(message)
+      },
+    })
+  }
+
+  it('is allowlist-gated, deduplicated, and never routes a conversational inbound', async () => {
+    const abortCalls: AbortCall[] = []
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    let allowed = false
+    const handler = draftHandler({
+      abortCalls,
+      routed,
+      tasks,
+      allowlist: () => (allowed ? ['pull_request.converted_to_draft'] : []),
+    })
+    const body = JSON.stringify(convertedToDraftPayload())
+
+    await handler(signedRequest(body, 'pull_request', 'draft-excluded'))
+    allowed = true
+    await handler(signedRequest(body, 'pull_request', 'draft-admitted'))
+    await handler(signedRequest(body, 'pull_request', 'draft-admitted'))
+
+    expect(tasks).toHaveLength(1)
+    await tasks[0]?.()
+    expect(abortCalls).toHaveLength(1)
+    expect(routed).toHaveLength(0)
+  })
+
+  it('aborts the exact repo and PR, clears its cooldown marker, and logs outcome counts', async () => {
+    const abortCalls: AbortCall[] = []
+    const cooldownClears: CooldownClear[] = []
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const info: string[] = []
+    const handler = draftHandler({ abortCalls, cooldownClears, routed, tasks, info })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(convertedToDraftPayload({ owner: 'Acme', name: 'Widgets', prNumber: 1, prId: 101 })),
+        'pull_request',
+        'draft-target',
+      ),
+    )
+    await tasks[0]?.()
+
+    expect(abortCalls).toEqual([{ workspace: 'Acme/Widgets', prNumber: 1, reason: 'pull request converted to draft' }])
+    expect(cooldownClears).toEqual([{ workspace: 'Acme/Widgets', prId: 101 }])
+    expect(
+      info.some(
+        (message) => message.includes('Acme/Widgets#1') && message.includes('sessions=2 reviewers=1 failures=0'),
+      ),
+    ).toBe(true)
+    expect(routed).toHaveLength(0)
+  })
+
+  it('still aborts when the draft transition is self-authored', async () => {
+    const abortCalls: AbortCall[] = []
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = draftHandler({ abortCalls, routed, tasks })
+    const payload = convertedToDraftPayload()
+    payload.sender = { login: 'typeclaw-bot', id: 99, type: 'Bot' }
+
+    await handler(signedRequest(JSON.stringify(payload), 'pull_request', 'draft-self-authored'))
+    await tasks[0]?.()
+
+    expect(abortCalls).toHaveLength(1)
+    expect(routed).toHaveLength(0)
+  })
+
+  it('targets neither another PR nor another repository', async () => {
+    const active = new Set(['acme/project#1', 'acme/project#2', 'acme/other#1'])
+    const tasks: Array<() => Promise<void>> = []
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request.converted_to_draft'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      abortGithubPrTurn: async (workspace, prNumber) => {
+        active.delete(`${workspace}#${prNumber}`)
+        return { kind: 'aborted', matchedSessions: 1, matchedReviewers: 0, abortFailures: 0 }
+      },
+      scheduleBackgroundTask: (task) => tasks.push(task),
+      logger,
+      route: () => {},
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(convertedToDraftPayload({ owner: 'acme', name: 'project', prNumber: 1 })),
+        'pull_request',
+        'draft-scope',
+      ),
+    )
+    await tasks[0]?.()
+
+    expect([...active]).toEqual(['acme/project#2', 'acme/other#1'])
+  })
+
+  it('logs no-live-session distinctly when there was no running review', async () => {
+    const info: string[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = draftHandler({
+      abortCalls: [],
+      routed: [],
+      tasks,
+      info,
+      abortResult: { kind: 'no-live-session' },
+    })
+
+    await handler(signedRequest(JSON.stringify(convertedToDraftPayload()), 'pull_request', 'draft-idle'))
+    await tasks[0]?.()
+
+    expect(info.some((message) => message.includes('acme/project#7') && message.includes('no-live-session'))).toBe(true)
+  })
+
+  it('logs and skips when abort wiring and the cooldown store are unavailable', async () => {
+    const info: string[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request.converted_to_draft'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      scheduleBackgroundTask: (task) => tasks.push(task),
+      logger: { info: (message) => info.push(message), warn: () => {}, error: () => {} },
+      route: () => {},
+    })
+
+    await handler(signedRequest(JSON.stringify(convertedToDraftPayload()), 'pull_request', 'draft-unwired'))
+    await tasks[0]?.()
+
+    expect(info.some((message) => message.includes('abort unavailable'))).toBe(true)
+    expect(
+      info.some((message) => message.includes('cooldown clear skipped') && message.includes('not initialized')),
+    ).toBe(true)
+  })
+})
+
 describe('createGithubWebhookHandler — review comment parent lookup', () => {
   function handlerWithParentLookup(
     routed: InboundMessage[],
@@ -1164,6 +1363,11 @@ describe('createGithubWebhookHandler — review comment parent lookup', () => {
     expect(routed[0]?.replyToBotMessageId).toBe('101')
     expect(routed[0]?.replyToOtherMessageId).toBe(null)
     expect(routed[0]?.suppressSticky).toBe(true)
+    expect(routed[0]?.githubReviewThreadCloseout).toMatchObject({
+      workspace: 'acme/project',
+      prNumber: 7,
+      rootCommentId: '101',
+    })
   })
 
   it('routes review-comment replies to other authors with replyToOtherMessageId', async () => {
@@ -1176,6 +1380,252 @@ describe('createGithubWebhookHandler — review comment parent lookup', () => {
     expect(routed[0]?.replyToBotMessageId).toBe(null)
     expect(routed[0]?.replyToOtherMessageId).toBe('101')
     expect(routed[0]?.suppressSticky).toBe(true)
+    expect(routed[0]?.githubReviewThreadCloseout).toBeUndefined()
+  })
+})
+
+describe('createGithubWebhookHandler — reply review rounds', () => {
+  function replyRoundHandler(input: {
+    routed: InboundMessage[]
+    fetchImpl: typeof fetch
+    generateReviewRoundId?: () => string
+    now?: () => number
+  }): (req: Request) => Promise<Response> {
+    return createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request_review_comment.created'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot[bot]',
+      authToken: async () => 'tok',
+      fetchImpl: input.fetchImpl,
+      generateReviewRoundId: input.generateReviewRoundId,
+      now: input.now,
+      logger,
+      route: (message) => input.routed.push(message),
+    })
+  }
+
+  function replyRoundFetch(input: {
+    parentAuthors?: Record<number, Record<string, unknown>>
+    reviewState?: 'blocking' | 'blocking-without-id' | 'clear' | 'failed'
+    calls?: string[]
+  }): typeof fetch {
+    return fakeFetch((url) => {
+      input.calls?.push(url)
+      const parentMatch = /\/pulls\/comments\/(\d+)$/.exec(url)
+      if (parentMatch !== null) {
+        const parentId = Number(parentMatch[1])
+        const author = input.parentAuthors?.[parentId] ?? { login: 'typeclaw-bot[bot]', id: 99, type: 'Bot' }
+        return new Response(JSON.stringify({ id: parentId, user: author }), { status: 200 })
+      }
+      if (url.includes('/pulls/') && url.includes('/reviews')) {
+        if (input.reviewState === 'failed') return new Response('boom', { status: 500 })
+        const reviews =
+          input.reviewState === 'clear'
+            ? [{ id: 7001, state: 'APPROVED', user: { login: 'typeclaw-bot[bot]', type: 'Bot' } }]
+            : [
+                {
+                  ...(input.reviewState === 'blocking-without-id' ? {} : { id: 7001 }),
+                  state: 'CHANGES_REQUESTED',
+                  user: { login: 'typeclaw-bot[bot]', type: 'Bot' },
+                },
+              ]
+        return new Response(JSON.stringify(reviews), { status: 200 })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+  }
+
+  async function expectQualifyingControlToArm(delivery: string): Promise<void> {
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({}),
+      generateReviewRoundId: () => `${delivery}-round`,
+    })
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 909, headSha: 'sha-control' })),
+        'pull_request_review_comment',
+        delivery,
+      ),
+    )
+    expect(routed[0]?.githubReviewRound?.roundId).toBe(`${delivery}-round`)
+  }
+
+  it('coalesces replies to different self-authored threads and keeps the first thread as carrier', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    let nonce = 0
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({}),
+      generateReviewRoundId: () => `reply-${++nonce}`,
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, id: 201, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-first',
+      ),
+    )
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 102, id: 202, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-second',
+      ),
+    )
+
+    expect(routed).toHaveLength(2)
+    expect(routed[0]?.githubReviewRound).toEqual({
+      kind: 'reply',
+      roundId: 'reply-1',
+      workspace: 'acme/project',
+      prNumber: 7,
+      headSha: 'sha-one',
+      carrierThread: '101',
+    })
+    expect(routed[1]?.githubReviewRound).toEqual(routed[0]?.githubReviewRound)
+    expect(routed[0]?.thread).toBe('101')
+    expect(routed[1]?.thread).toBe('102')
+    expect(nonce).toBe(1)
+  })
+
+  it('makes a lone qualifying reply the carrier of a singleton round', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({}),
+      generateReviewRoundId: () => 'singleton-reply',
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-singleton',
+      ),
+    )
+
+    expect(routed[0]?.githubReviewRound?.roundId).toBe('singleton-reply')
+    expect(routed[0]?.githubReviewRound?.carrierThread).toBe('101')
+  })
+
+  it('does not arm a round or read review state for a reply rooted by a human', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const calls: string[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({
+        parentAuthors: { 101: { login: 'alice', id: 10, type: 'User' } },
+        calls,
+      }),
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-human-root',
+      ),
+    )
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    expect(calls.filter((url) => url.includes('/reviews'))).toHaveLength(0)
+    await expectQualifyingControlToArm('reply-round-human-root-control')
+  })
+
+  it('does not arm a round or make network calls for a top-level inline comment', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const calls: string[] = []
+    const handler = replyRoundHandler({ routed, fetchImpl: replyRoundFetch({ calls }) })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: null, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-top-level',
+      ),
+    )
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    expect(calls).toHaveLength(0)
+    await expectQualifyingControlToArm('reply-round-top-level-control')
+  })
+
+  it('does not arm a round when the bot has no effective blocking review', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({ routed, fetchImpl: replyRoundFetch({ reviewState: 'clear' }) })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-clear',
+      ),
+    )
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    await expectQualifyingControlToArm('reply-round-clear-control')
+  })
+
+  it('does not arm a round when the blocking review has no stable id', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({ reviewState: 'blocking-without-id' }),
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-missing-review-id',
+      ),
+    )
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    await expectQualifyingControlToArm('reply-round-missing-review-id-control')
+  })
+
+  it('routes a lookup failure with a bounded unknown-state close-out deferral', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({ reviewState: 'failed' }),
+      now: () => 10_000,
+    })
+
+    const response = await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-failed-state',
+      ),
+    )
+
+    expect(response.status).toBe(200)
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.thread).toBe('101')
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    expect(routed[0]?.githubReviewThreadCloseout?.deferUntil).toEqual({
+      kind: 'review-state-unknown',
+      expiresAt: 130_000,
+    })
+    await expectQualifyingControlToArm('reply-round-failed-state-control')
   })
 })
 
@@ -1671,6 +2121,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
       ...(input.allowApprove !== undefined ? { allowApprove: () => input.allowApprove! } : {}),
       ...(input.reviewOn !== undefined ? { reviewOn: () => input.reviewOn! } : {}),
       authToken: input.authToken ?? (async () => 'tok'),
+      generateReviewRoundId: () => 'round-id',
       fetchImpl: input.fetchImpl,
       scheduleBackgroundTask: (task) => {
         input.tasks.push(task)
@@ -2004,6 +2455,8 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(routed[0]!.text).toContain('CHANGES_REQUESTED')
     expect(routed[0]!.text).not.toContain('end your turn without replying')
     expect(routed[0]!.githubReviewRound).toEqual({
+      kind: 'push',
+      roundId: 'round-id',
       workspace: 'acme/project',
       prNumber: 7,
       headSha: 'abc1234def',
@@ -2030,8 +2483,22 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     await tasks[0]?.()
 
     expect(routed.map((message) => message.githubReviewRound)).toEqual([
-      { workspace: 'acme/project', prNumber: 7, headSha: 'round-sha', carrierThread: '100' },
-      { workspace: 'acme/project', prNumber: 7, headSha: 'round-sha', carrierThread: '100' },
+      {
+        kind: 'push',
+        roundId: 'round-id',
+        workspace: 'acme/project',
+        prNumber: 7,
+        headSha: 'round-sha',
+        carrierThread: '100',
+      },
+      {
+        kind: 'push',
+        roundId: 'round-id',
+        workspace: 'acme/project',
+        prNumber: 7,
+        headSha: 'round-sha',
+        carrierThread: '100',
+      },
     ])
   })
 
@@ -2315,14 +2782,25 @@ function issueCommentPayload(options: { pullRequest: boolean; body?: string }): 
   }
 }
 
-function reviewCommentPayload(options: { inReplyToId?: number | null; body?: string } = {}): Record<string, unknown> {
+function reviewCommentPayload(
+  options: {
+    inReplyToId?: number | null
+    body?: string
+    id?: number
+    prNumber?: number
+    headSha?: string
+  } = {},
+): Record<string, unknown> {
   const inReplyToId = options.inReplyToId === undefined ? 101 : options.inReplyToId
   return {
     action: 'created',
     repository: repo(),
-    pull_request: { number: 7 },
+    pull_request: {
+      number: options.prNumber ?? 7,
+      ...(options.headSha !== undefined ? { head: { sha: options.headSha } } : {}),
+    },
     comment: {
-      id: 102,
+      id: options.id ?? 102,
       ...(inReplyToId !== null ? { in_reply_to_id: inReplyToId } : {}),
       body: options.body ?? 'review',
       created_at: '2026-01-01T00:00:00Z',
@@ -2363,6 +2841,22 @@ function readyForReviewPayload(options: { updatedAt?: string; draft?: boolean } 
     repository: repo(),
     pull_request,
     sender: { login: 'alice', id: 10, type: 'User' },
+  }
+}
+
+function convertedToDraftPayload(
+  options: { owner?: string; name?: string; prNumber?: number; prId?: number } = {},
+): Record<string, unknown> {
+  return {
+    action: 'converted_to_draft',
+    repository: { name: options.name ?? 'project', owner: { login: options.owner ?? 'acme' } },
+    pull_request: {
+      number: options.prNumber ?? 7,
+      id: options.prId ?? 700,
+      draft: true,
+      user: user(),
+    },
+    sender: user(),
   }
 }
 

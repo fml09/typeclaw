@@ -77,15 +77,21 @@ describe('renderPrVerdictStandDownReminder', () => {
   test('renders verified dismissal activity as permission to close addressed threads', () => {
     const text = renderPrVerdictStandDownReminder({ prNumber: 42, verdict: 'DISMISSED' })
     expect(text).toContain('DISMISSED')
-    expect(text).toContain('Close out')
+    expect(text).toContain('exactly one participant-facing close-out')
+    expect(text).toContain('Do not describe')
   })
   test('names the verdict and PR, and scopes the stand-down to redundant verdicts only', () => {
     const text = renderPrVerdictStandDownReminder({ prNumber: 42, verdict: 'APPROVE' })
     expect(text).toContain('<system-reminder>')
     expect(text).toContain('#42')
     expect(text).toContain('APPROVE')
-    // verdict-only carve-out: thread replies are still allowed
-    expect(text.toLowerCase()).toContain('inline')
+    expect(text).toContain('ONLY to formal PR-level verdicts')
+    expect(text).toContain('exactly one participant-facing close-out')
+    expect(text).toContain('short substantive acknowledgement')
+    expect(text).toContain('specific technical reason')
+    expect(text).toContain('Do not describe')
+    expect(text).not.toContain('you must still reply to the inline thread as normal')
+    expect(text).not.toMatch(/tell .*carrier|mention .*review round|report .*verdict registration/i)
     // soft wording: a genuine new-evidence verdict is not suppressed
     expect(text.toLowerCase()).toContain('unless new information')
   })
