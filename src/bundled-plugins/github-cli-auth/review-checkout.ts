@@ -8,7 +8,7 @@ import { z } from 'zod'
 import { GITHUB_API_BASE, githubJsonHeaders } from '@/channels/adapters/github/auth-pat'
 import type { ResolveGithubTokenForRepo } from '@/channels/github-token-bridge'
 import { defineTool } from '@/plugin'
-import { ensureSessionTmpDir } from '@/sandbox'
+import { ensureSessionTmpDir, sessionTmpDir } from '@/sandbox'
 
 import { ensureGitAskPassHelper } from './git-askpass'
 
@@ -80,7 +80,15 @@ export async function prepareReviewerCheckout(options: {
       ],
       { env: baseEnv },
     )
-    return { path: checkout, repoSlug: options.repoSlug, headSha: options.headSha.toLocaleLowerCase() }
+    return {
+      // File tools and sandboxed bash both treat /tmp as a per-session virtual
+      // root. Return that model-facing path, not the backing path under
+      // SESSION_TMP_ROOT; returning the latter makes the file-tool redirect
+      // prepend the session root a second time.
+      path: modelFacingCheckoutPath(options.sessionId, checkout),
+      repoSlug: options.repoSlug,
+      headSha: options.headSha.toLocaleLowerCase(),
+    }
   } catch (error) {
     await rm(checkout, { recursive: true, force: true }).catch(() => {})
     throw error
@@ -122,6 +130,19 @@ export function createReviewerCheckoutTool(resolveTokenForRepo: ResolveGithubTok
   })
 }
 
+function modelFacingCheckoutPath(sessionId: string, checkout: string): string {
+  const sessionRoot = sessionTmpDir(sessionId)
+  const relativeCheckout = path.relative(sessionRoot, checkout)
+  if (
+    relativeCheckout === '' ||
+    path.isAbsolute(relativeCheckout) ||
+    relativeCheckout === '..' ||
+    relativeCheckout.startsWith(`..${path.sep}`)
+  ) {
+    throw new Error('reviewer checkout escaped the session tmp directory')
+  }
+  return path.posix.join('/tmp', relativeCheckout.split(path.sep).join('/'))
+}
 async function verifyCommit(fetchImpl: GithubFetch, repoSlug: string, sha: string, token: string): Promise<void> {
   const response = await fetchImpl(`${GITHUB_API_BASE}/repos/${repoSlug}/commits/${sha}`, {
     headers: githubJsonHeaders(token),
