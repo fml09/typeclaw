@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { rm } from 'node:fs/promises'
 import path from 'node:path'
 
-import { SESSION_TMP_ROOT } from '@/sandbox'
+import { mapVirtualTmpPath, SESSION_TMP_ROOT } from '@/sandbox'
 
 import { prepareReviewerCheckout } from './review-checkout'
 
@@ -33,7 +33,11 @@ describe('prepareReviewerCheckout', () => {
       },
     })
 
-    expect(receipt.path).toStartWith(path.join(SESSION_TMP_ROOT, sessionId, 'review-checkout-'))
+    expect(receipt.path).toStartWith('/tmp/review-checkout-')
+    expect(receipt.path).not.toContain(SESSION_TMP_ROOT)
+    expect(mapVirtualTmpPath('/agent', sessionId, receipt.path)).toBe(
+      path.join(SESSION_TMP_ROOT, sessionId, path.basename(receipt.path)),
+    )
     expect(calls).toHaveLength(3)
     expect(calls.flatMap((call) => call.args).join(' ')).not.toContain('ghs_secret')
     expect(calls[1]?.env.TYPECLAW_GIT_TOKEN).toBe('ghs_secret')
