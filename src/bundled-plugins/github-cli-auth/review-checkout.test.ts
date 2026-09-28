@@ -38,6 +38,7 @@ describe('prepareReviewerCheckout', () => {
     expect(mapVirtualTmpPath('/agent', sessionId, receipt.path)).toBe(
       path.posix.join(sessionTmpDir(sessionId), path.posix.basename(receipt.path)),
     )
+
     expect(calls).toHaveLength(3)
     expect(calls.flatMap((call) => call.args).join(' ')).not.toContain('ghs_secret')
     expect(calls[1]?.env.TYPECLAW_GIT_TOKEN).toBe('ghs_secret')

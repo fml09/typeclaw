@@ -2,7 +2,8 @@ import { accessSync, constants as fsConstants, readFileSync, statSync, writeFile
 import { homedir } from 'node:os'
 import { isAbsolute, join, posix, resolve } from 'node:path'
 
-import type { KnownApi, Model } from '@mariozechner/pi-ai'
+import type { KnownApi, Model } from '@earendil-works/pi-ai'
+import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all'
 import { z } from 'zod'
 
 import { channelsSchema, SEEDED_GITHUB_EVENT_ALLOWLISTS } from '@/channels/schema'
@@ -485,13 +486,21 @@ export const symlinkSchema = z.object({
 
 export type SandboxSymlink = z.infer<typeof symlinkSchema>
 
+// Docker treats the profile as one argument, but keeping the value to the
+// kernel profile-name alphabet prevents whitespace or option-like text from
+// turning a hand-edited config into ambiguous docker argv.
+const apparmorProfileSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_.-]+$/, 'AppArmor profile must be non-empty and contain only letters, digits, _, ., or -')
+
 export const sandboxSchema = z
   .object({
+    apparmorProfile: apparmorProfileSchema.default('unconfined'),
     realProc: z.boolean().default(false),
     writablePaths: z.array(relativeAgentPathSchema).default([]),
     symlinks: z.array(symlinkSchema).default([]),
   })
-  .default({ realProc: false, writablePaths: [], symlinks: [] })
+  .default({ apparmorProfile: 'unconfined', realProc: false, writablePaths: [], symlinks: [] })
 
 export type SandboxConfig = z.infer<typeof sandboxSchema>
 
@@ -670,10 +679,11 @@ function asModelRef(value: string): ModelRef {
 // level. `migrateLegacyConfigShape` rewrites that to `models: { default: ... }`
 // on first load (and writes the result back to disk + commits via
 // `persistMigratedConfig`), so every downstream consumer sees the new shape.
-// Tracks pi-coding-agent's thinking-level vocabulary, including the
-// forward-compatible `max` value. Kept as a local enum (rather than importing
-// the SDK type) so the schema owns the canonical value list and zod can
-// validate `typeclaw.json` without a runtime SDK dependency.
+
+// Mirrors pi-coding-agent's `ThinkingLevel`. Kept as a local enum (rather than
+// importing the SDK type) so the schema owns the canonical value list and zod
+// can validate `typeclaw.json` without a runtime SDK dependency.
+
 export const thinkingLevelSchema = z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 export type ThinkingLevel = z.infer<typeof thinkingLevelSchema>
 
@@ -840,44 +850,84 @@ export function resolveModel(ref: KnownModelRef | ModelRef | string): Model<Know
   }
 
   const meta = getConfig().customModels[ref]
+  // `api`, `baseUrl`, and (by default) `compat` come from the provider template
+  // because they describe the PROVIDER's wire dialect, not the model. pi-ai
+  // infers compat from the baseUrl and only recognises first-party hosts, so a
+  // custom ref on a provider that pins compat (OpenGateway, Upstage) would
+  // otherwise fall back to OpenAI-native defaults and send `store`, the
+  // `developer` role, `strict` tool schemas and `max_completion_tokens` to an
+  // endpoint that never accepts them.
+  //
+  // The exception is a ref that pi-ai's catalog already knows, exactly or as
+  // its undated `-YYYYMMDD` base, on the same transport. The catalog describes
+  // the MODEL, so its name, capabilities, limits, and pricing are the defaults;
+  // `customModels` remains the explicit per-field override. pi 0.87 reads some
+  // behavior only from per-model metadata: e.g. Anthropic adaptive thinking is
+  // `compat.forceAdaptiveThinking` and is no longer inferred from the id.
+  // Anthropic's streamSimple gates adaptive thinking on the resolved model's
+  // `reasoning` capability, so a dated Sonnet 5 alias must inherit that too.
+  // That entry's compat and thinkingLevelMap are used, minus
+  // `allowedFallbackModels` (see the Fable 5 record) and `supportsStrictTools`
+  // (see the Anthropic records in providers.ts). Without a catalog match
+  // `thinkingLevelMap` is deliberately not carried: it varies per model even
+  // within one provider, so copying the template's would be a guess.
+  const builtin = findBuiltinModel(providerId, modelId)
+  const catalogMetadata = builtin !== undefined && builtin.api === template.api ? builtin : undefined
+  let compat = template.compat
+  if (catalogMetadata !== undefined) {
+    const catalogCompat: Record<string, unknown> | undefined =
+      catalogMetadata.compat === undefined ? undefined : { ...catalogMetadata.compat }
+    if (catalogCompat !== undefined) {
+      delete catalogCompat.allowedFallbackModels
+      delete catalogCompat.supportsStrictTools
+    }
+    compat = catalogCompat as Model<KnownApi>['compat']
+  }
   return {
     id: modelId,
     provider: providerId,
     baseUrl: provider.baseUrl ?? template.baseUrl,
     api: template.api,
-    // Carried from the template for the same reason `api` and `baseUrl` are:
-    // it describes the PROVIDER's wire dialect, not the model. pi-ai infers
-    // compat from the baseUrl and only recognises first-party hosts, so a
-    // custom ref on a provider that pins compat (OpenGateway, Upstage) would
-    // otherwise fall back to OpenAI-native defaults and send `store`, the
-    // `developer` role, `strict` tool schemas and `max_completion_tokens` to
-    // an endpoint that never accepts them. `thinkingLevelMap` is deliberately
-    // NOT carried: it varies per model even within one provider, so copying
-    // the template's would be a guess.
-    ...(template.compat !== undefined ? { compat: template.compat } : {}),
-    name: meta?.name ?? modelId,
-    reasoning: meta?.reasoning ?? false,
-    input: resolveCustomModelInput(meta?.input),
-    contextWindow: meta?.contextWindow ?? template.contextWindow,
-    maxTokens: meta?.maxTokens ?? template.maxTokens,
-    cost: resolveCustomModelCost(meta?.cost),
+    ...(compat !== undefined ? { compat } : {}),
+    ...(catalogMetadata?.thinkingLevelMap !== undefined ? { thinkingLevelMap: catalogMetadata.thinkingLevelMap } : {}),
+    name: meta?.name ?? catalogMetadata?.name ?? modelId,
+    reasoning: meta?.reasoning ?? catalogMetadata?.reasoning ?? false,
+    input: resolveCustomModelInput(meta?.input, catalogMetadata?.input),
+    contextWindow: meta?.contextWindow ?? catalogMetadata?.contextWindow ?? template.contextWindow,
+    maxTokens: meta?.maxTokens ?? catalogMetadata?.maxTokens ?? template.maxTokens,
+    cost: resolveCustomModelCost(meta?.cost, catalogMetadata?.cost),
   }
 }
 
-function resolveCustomModelInput(input: readonly string[] | undefined): Model<KnownApi>['input'] {
-  if (input === undefined) return ['text']
+function findBuiltinModel(providerId: string, modelId: string): Model<KnownApi> | undefined {
+  const direct = getBuiltinModel(providerId as never, modelId as never) as Model<KnownApi> | undefined
+  if (direct !== undefined) return direct
+  const undatedId = modelId.replace(/-\d{8}$/, '')
+  return undatedId === modelId
+    ? undefined
+    : (getBuiltinModel(providerId as never, undatedId as never) as Model<KnownApi> | undefined)
+}
+
+function resolveCustomModelInput(
+  input: readonly string[] | undefined,
+  fallback: Model<KnownApi>['input'] | undefined,
+): Model<KnownApi>['input'] {
+  if (input === undefined) return fallback ?? ['text']
   const supported = input.filter(
     (value): value is Model<KnownApi>['input'][number] => value === 'text' || value === 'image',
   )
   return supported.length > 0 ? supported : ['text']
 }
 
-function resolveCustomModelCost(cost: CustomModelMeta['cost']): Model<KnownApi>['cost'] {
+function resolveCustomModelCost(
+  cost: CustomModelMeta['cost'],
+  fallback: Model<KnownApi>['cost'] | undefined,
+): Model<KnownApi>['cost'] {
   return {
-    input: cost?.input ?? 0,
-    output: cost?.output ?? 0,
-    cacheRead: cost?.cacheRead ?? 0,
-    cacheWrite: cost?.cacheWrite ?? 0,
+    input: cost?.input ?? fallback?.input ?? 0,
+    output: cost?.output ?? fallback?.output ?? 0,
+    cacheRead: cost?.cacheRead ?? fallback?.cacheRead ?? 0,
+    cacheWrite: cost?.cacheWrite ?? fallback?.cacheWrite ?? 0,
   }
 }
 

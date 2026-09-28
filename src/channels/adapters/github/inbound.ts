@@ -33,13 +33,9 @@ export type GithubWebhookHandlerOptions = {
   // an appended operator-policy note telling the agent not to submit an APPROVE
   // review; the github skill keys off that note to downgrade approve→COMMENT.
   allowApprove?: () => boolean
-  // Which pull_request action triggers an agent code review. Defaults to
-  // 'review_requested' when omitted, preserving the request-driven behavior.
-  // 'opened' additionally wakes the bot to review every PR the moment it opens;
-  // 'off' suppresses the dedicated review-trigger synthesis entirely (an
-  // explicit review_requested no longer wakes a session). Orthogonal to the
-  // eventAllowlist (the outer "process this webhook?" gate) — this is the inner
-  // "does an admitted pull_request event become a review-trigger inbound?" gate.
+  // Which GitHub event starts a code review. `comment_requested` admits only a
+  // new PR issue comment with an explicit `@reviewerLogin review` command.
+  // Orthogonal to eventAllowlist (the outer webhook admission gate).
   reviewOn?: () => GithubReviewOn
   route: (message: InboundMessage) => void
   logger: GithubInboundLogger
@@ -160,6 +156,11 @@ export async function processVerifiedGithubDelivery(
     scheduleDraftAbort({ workspace, prNumber, prId: readNumber(pr, 'id'), options })
     return
   }
+
+  // Keep the draft abort above active, but do not let any other webhook start
+  // or resume a session in explicit comment mode. This includes synchronize
+  // follow-ups, review requests, review-thread replies and sticky PR comments.
+  if (options.reviewOn?.() === 'comment_requested' && event !== 'issue_comment') return
 
   const selfId = options.selfId()
   const selfLogin = options.selfLogin()
@@ -697,6 +698,9 @@ export function classifyGithubInbound(
 ): InboundMessage | null {
   const repository = readRepository(payload)
   if (repository === null) return null
+  if (options?.reviewOn === 'comment_requested') {
+    return event === 'issue_comment' ? classifyCommentReviewRequest(payload, repository, selfLogin, options) : null
+  }
   const mention = resolveBotMentionLogins(selfLogin, options?.authType ?? 'pat', options?.reviewerLogin)
   const base = {
     adapter: 'github' as const,
@@ -939,6 +943,53 @@ export function classifyGithubInbound(
   }
 
   return null
+}
+
+function classifyCommentReviewRequest(
+  payload: Record<string, unknown>,
+  repository: { owner: string; name: string },
+  selfLogin: string | null,
+  options: { authType?: 'pat' | 'app'; reviewerLogin?: string },
+): InboundMessage | null {
+  if (readString(payload, 'action') !== 'created' || selfLogin === null) return null
+  const issue = readRecord(payload.issue)
+  const comment = readRecord(payload.comment)
+  if (readRecord(issue?.pull_request) === null || comment === null) return null
+  const number = readNumber(issue, 'number')
+  const id = readNumber(comment, 'id')
+  const author = readUser(comment.user)
+  const body = readString(comment, 'body')
+  if (number === null || id === null || author === null || body === null) return null
+  const reviewerLogin =
+    resolveDecoyReviewerLogin(selfLogin, options.authType ?? 'pat', options.reviewerLogin) ?? selfLogin
+  if (!hasReviewCommand(body, reviewerLogin)) return null
+
+  const title = readString(issue, 'title') ?? `#${number}`
+  return buildInbound(
+    {
+      adapter: 'github',
+      workspace: `${repository.owner}/${repository.name}`,
+      chat: `pr:${number}`,
+      thread: null,
+      isDm: false,
+      mentionsOthers: false,
+      replyToOtherMessageId: null,
+    },
+    `@${author.login} requested your review on PR #${number}: "${title}". ` +
+      `Please review the changes line-by-line and post your feedback.\n\nRequest comment: ${body}`,
+    id,
+    author,
+    [reviewerLogin],
+    comment.created_at,
+    { kind: 'issue-comment', owner: repository.owner, repo: repository.name, commentId: id },
+    false,
+    { forceBotMention: true, suppressSticky: true },
+  )
+}
+
+function hasReviewCommand(body: string, reviewerLogin: string): boolean {
+  const escapedLogin = reviewerLogin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`^\\s*@${escapedLogin}\\s+review(?:\\s|$)`, 'i').test(body)
 }
 
 type ReviewRequestInput = {

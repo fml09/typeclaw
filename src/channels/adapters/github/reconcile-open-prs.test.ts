@@ -125,6 +125,14 @@ describe('reconcileOpenPrs', () => {
     expect(routed).toHaveLength(0)
   })
 
+  test("reviewOn 'comment_requested' does not infer a request from open PR state", async () => {
+    const routed: InboundMessage[] = []
+    await reconcileOpenPrs(
+      baseOptions({ routed, reviewOn: 'comment_requested', fetchImpl: fakeGithub([{ number: 7, id: 700 }]) }),
+    )
+    expect(routed).toHaveLength(0)
+  })
+
   test("reviewOn 'review_requested' replays only when the bot is a requested reviewer", async () => {
     const routed: InboundMessage[] = []
     await reconcileOpenPrs(

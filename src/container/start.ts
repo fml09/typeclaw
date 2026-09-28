@@ -36,11 +36,20 @@ import {
   type GithubCliProvisionResult,
   type ProvisionGithubCliStoreOptions,
 } from '@/secrets/provision-github-cli-store'
+import { SecretsBackend } from '@/secrets/storage'
 import { isWindows } from '@/shared'
 import { hostLocaleIsCjk } from '@/shared/host-locale'
 
 import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
-import { archiveContainerLogs, type DockerLogArchiver } from './log-archive'
+import { acquireManagedBuildCache, type ManagedBuildCacheLease } from './build-cache'
+import { COMPOSE_PROJECT } from './compose-project'
+import { archiveContainerLogs, dockerLogsUnavailableWarning, type DockerLogArchiver } from './log-archive'
+import { formatMemorySize, readDockerTotalMemory, resolveMemoryLimit } from './memory-limit'
+import {
+  decideMemoryOversubscription,
+  formatOversubscriptionWarning,
+  readRunningAgentMemoryClaims,
+} from './memory-oversubscription'
 import { CONTAINER_PORT, TUI_TOKEN_LABEL, findFreePort, isPortAllocatedError, resolveTuiToken } from './port'
 import {
   buildxAvailable,
@@ -59,7 +68,12 @@ import {
   sanitizeDockerConfigJson,
   sanitizeDockerStderr,
 } from './shared'
-import { buildCrashReason, createVerifyRunning, type VerifyRunningFn } from './verify-running'
+import {
+  buildCrashReason,
+  createVerifyRunning,
+  describeUnremovableContainer,
+  type VerifyRunningFn,
+} from './verify-running'
 
 const PACKAGE_FILE = 'package.json'
 const TYPECLAW_PACKAGE = 'typeclaw'
@@ -67,7 +81,6 @@ const DEV_SOURCE_CONTAINER_PATH = '/agent/node_modules/typeclaw'
 const BUN_LOCK_FILE = 'bun.lock'
 const DEPENDENCY_FILES = [PACKAGE_FILE, BUN_LOCK_FILE] as const
 const ENV_FILE = '.env'
-const COMPOSE_PROJECT = 'typeclaw'
 const CONTAINER_HOSTD_HOST = 'host.docker.internal'
 const HOST_GATEWAY_ALIAS = `${CONTAINER_HOSTD_HOST}:host-gateway`
 
@@ -82,6 +95,7 @@ export type StartPlan = {
   needsBuild: boolean
   hostPort: number
   tuiToken: string | null
+  memoryLimitBytes: number
 }
 
 export type PlanStartOptions = {
@@ -99,6 +113,12 @@ export type PlanStartOptions = {
   // Omitted when unavailable (native Windows and unusual JS hosts).
   hostIdentity?: { uid: number; gid: number } | null
   gitIdentity?: GitIdentity | null
+  // Total memory of the machine the CONTAINER runs on, used only to clamp the
+  // default memory limit down when it will not fit. On macOS and Windows that
+  // is the Docker VM, not the workstation, so start() reads it from the daemon
+  // rather than from os.totalmem(). Omitted by callers that have no exec (and
+  // by tests), in which case the default applies unclamped.
+  totalMemoryBytes?: number | undefined
 }
 
 export type HostDaemonControl = {
@@ -197,6 +217,8 @@ export type StartOptions = {
   archiveLogs?: DockerLogArchiver
   operationLock?: WithAgentOperationLock
   operationLease?: AgentOperationLease
+  buildCacheStateDir?: string
+  acquireBuildCache?: typeof acquireManagedBuildCache | null
 }
 
 export type HostDaemonStatus =
@@ -267,16 +289,30 @@ async function runStart({
   assertConfigWritable = assertAgentConfigWritable,
   provisionGithubCliStore: provisionGithubCliStoreForAgent = provisionGithubCliStore,
   archiveLogs = archiveContainerLogs,
+  buildCacheStateDir,
+  acquireBuildCache = acquireManagedBuildCache,
 }: StartOptions): Promise<StartResult> {
   try {
     const containerName = containerNameFromCwd(cwd)
     const imageTagValue = imageTagFromCwd(cwd)
-    const archiveBeforeRemove = async (containerId: string) =>
-      await archiveLogs({
+    const archiveBeforeRemove = async (containerId: string) => {
+      const archive = await archiveLogs({
         agentDir: cwd,
         containerId,
         retentionDays: (await loadTypeclawConfig(cwd)).logs.retentionDays,
       })
+      if (archive.ok) return { ok: true as const }
+      if (archive.kind === 'failed') return { ok: false as const, reason: archive.reason }
+      // Dispatch on the callback, NOT on streamOutput. `streamOutput` defaults
+      // to true, and standalone start/restart both stream Docker build output
+      // AND pass a collector so they can render warnings after their spinner
+      // settles; keying on streamOutput writes under the live spinner and
+      // leaves that collector empty. stderr stays the no-callback fallback.
+      const warning = dockerLogsUnavailableWarning(containerId)
+      if (onWarning !== undefined) onWarning(warning)
+      else if (streamOutput) process.stderr.write(`${warning}\n`)
+      return { ok: true as const }
+    }
 
     // Probe container state BEFORE refreshing Dockerfile/.gitignore: when the
     // container is already running, start() is a no-op and must not produce
@@ -525,14 +561,16 @@ async function runStart({
         }
       }
       if (cleanup === 'stuck') {
+        const reason = `Container ${containerName} could not be safely inspected or removed; preserving it and refusing to docker run --name to avoid a conflict.`
+        const diagnosis = await describeUnremovableContainer(exec, state.containerId)
         return {
           ok: false,
-          reason: `Container ${containerName} could not be safely inspected or removed; preserving it and refusing to docker run --name to avoid a conflict.`,
+          reason: diagnosis === null ? reason : `${reason} ${diagnosis}`,
         }
       }
     }
 
-    const imageExisted = await imageExists(exec, imageTagValue)
+    const previousImageId = await inspectImageId(exec, imageTagValue)
 
     // First attempt uses the user's preferred host port (8973 by default, or
     // whatever they passed via --port / typeclaw.json). If it's already bound
@@ -549,28 +587,64 @@ async function runStart({
 
     const publishHost = await resolvePublishHost(exec)
     const tuiToken = randomBytes(32).toString('base64url')
+    const totalMemoryBytes = await readDockerTotalMemory(exec)
     let plan = await planStart({
       cwd,
       hostPort,
-      imageExists: imageExisted,
+      imageExists: previousImageId !== null,
       forceBuild: forceBuild || dockerfileRefresh.changed,
       hostdControl,
       publishHost,
       tuiToken,
       platform,
       hostIdentity,
+      totalMemoryBytes,
+    })
+
+    await warnOnMemoryOversubscription({
+      exec,
+      containerName,
+      memoryLimitBytes: plan.memoryLimitBytes,
+      totalMemoryBytes,
+      onWarning,
+      streamOutput,
     })
 
     let built = false
     if (plan.needsBuild) {
-      const buildResult = await runImageBuild({
-        exec,
-        cwd,
-        imageTag: plan.imageTag,
-        buildContext: plan.buildContext,
-        hasBuildx,
-        streamOutput,
-      })
+      const buildWarning = (warning: string): void => {
+        if (streamOutput) process.stderr.write(`typeclaw: ${warning}\n`)
+        else onWarning?.(warning)
+      }
+      const protection = await protectImageForRebuild(exec, plan.imageTag, previousImageId)
+      if (protection.warning !== null) {
+        if (streamOutput) process.stderr.write(`typeclaw: ${protection.warning}\n`)
+        else onWarning?.(protection.warning)
+      }
+
+      let buildResult: Awaited<ReturnType<typeof runImageBuild>>
+      try {
+        buildResult = await runImageBuild({
+          exec,
+          cwd,
+          cacheScope: containerName,
+          imageTag: plan.imageTag,
+          buildContext: plan.buildContext,
+          hasBuildx,
+          acquireBuildCache,
+          buildCacheStateDir,
+          streamOutput,
+          onWarning: buildWarning,
+        })
+      } finally {
+        if (protection.tag !== null) {
+          const releaseWarning = await releaseImageProtection(exec, protection.tag)
+          if (releaseWarning !== null) {
+            if (streamOutput) process.stderr.write(`typeclaw: ${releaseWarning}\n`)
+            else onWarning?.(releaseWarning)
+          }
+        }
+      }
       if (!buildResult.ok) {
         await cleanupHostDaemonRegistration(containerName, hostd)
         const retryDetail = buildResult.credentialHelperRetried
@@ -625,6 +699,7 @@ async function runStart({
           tuiToken,
           platform,
           hostIdentity,
+          totalMemoryBytes,
         })
       }
     } catch (error) {
@@ -697,6 +772,12 @@ async function runStart({
         publishHost,
         tuiToken,
         platform,
+        // Every replan must carry the daemon total. planStart resolves the
+        // memory limit from it, so dropping it here silently replaces a
+        // clamped limit with the unconditional default right before
+        // `docker run` — the launch would exceed what the VM can honor while
+        // the already-emitted warning still described the clamped figure.
+        totalMemoryBytes,
       })
       run = await execRunWithConflictRetry(exec, plan.runArgs, cwd, containerName, archiveBeforeRemove)
     }
@@ -745,11 +826,31 @@ async function refreshGithubCliStore(
   }
   if (refreshed) return null
 
+  // Only a failure that leaves an EXISTING store to go stale is worth an
+  // operator warning; with no store nothing regressed. This credential is
+  // OPTIONAL — authenticated `git push` and PR review ride the agent's own
+  // per-repo App token (`github.resolveTokenForRepo`, injected via GIT_ASKPASS
+  // by `github-cli-auth` and the backup runner), and the host store only backs
+  // `gh` invocations the broker cannot scope to a literal owner/repo. Warning
+  // unconditionally told every agent to run `gh auth login` for a capability
+  // most never use, citing a persisted store that did not exist.
+  if (!hasPersistedGithubCliStore(agentDir)) return null
+
   return (
     'typeclaw: warning: Could not refresh GitHub CLI credentials from the host. ' +
     'Keeping the previously persisted credential store. Run `gh auth login --hostname github.com` on the host, ' +
     'then restart TypeClaw.\n'
   )
+}
+
+// An unreadable or malformed secrets.json cannot prove the store is absent, so
+// it takes the warning — silence is reserved for a confirmed no-store agent.
+function hasPersistedGithubCliStore(agentDir: string): boolean {
+  try {
+    return new SecretsBackend(join(agentDir, 'secrets.json')).tryReadGithubCliSync() !== undefined
+  } catch {
+    return true
+  }
 }
 
 function resolveGithubCliDeniedRoots(cwd: string, config: Config): string[] {
@@ -808,6 +909,7 @@ export async function planStart({
   platform = process.platform,
   hostIdentity = currentHostIdentity(),
   gitIdentity,
+  totalMemoryBytes,
 }: PlanStartOptions): Promise<StartPlan> {
   const containerName = containerNameFromCwd(cwd)
   const imageTag = imageTagFromCwd(cwd)
@@ -815,6 +917,8 @@ export async function planStart({
   const devSourcePath = await detectDevSource(cwd)
   const cfg = await loadTypeclawConfig(cwd)
   const mounts = cfg.mounts
+  const memoryLimit = resolveMemoryLimit({ totalMemoryBytes })
+  const memoryLimitArg = formatMemorySize(memoryLimit.bytes)
 
   // No `--rm`: a crashed container's logs MUST survive past exit. Lifecycle
   // cleanup archives them under host-stage <agent>/.typeclaw/logs/ before
@@ -870,21 +974,28 @@ export async function planStart({
   // Operators must `typeclaw restart` (removes and recreates), not
   // `docker restart` (reuses the old HostConfig).
   //
-  // `seccomp=unconfined` lets `bwrap(1)` (installed in baseline; see
-  // BASELINE_APT_PACKAGES in src/init/dockerfile.ts) create user/pid/mount
-  // namespaces from inside the container. Docker's default seccomp profile
-  // rejects `unshare(CLONE_NEWUSER)` and `clone(CLONE_NEWUSER)` for
-  // non-privileged containers, which is the right default for multi-tenant
-  // hosts (Kubernetes nodes, CI runners) but wrong for typeclaw: the outer
-  // container is a single-tenant trust boundary — the user trusts everything
-  // inside it equally, the .env and agent folder are already mounted in —
-  // so the multi-tenant protections seccomp adds are not load-bearing for
-  // typeclaw's threat model. The per-tool sandbox bwrap builds for subagents
-  // IS the real boundary against prompt-injected commands; that boundary is
-  // what `--security-opt seccomp=unconfined` exists to enable. See
-  // `docs/internals/sandbox.mdx` for the full rationale including why
-  // `--cap-add=SYS_ADMIN` was rejected as an alternative (narrower in
-  // syscalls but strictly worse in capability semantics).
+  // These two security options are a load-bearing pair for `bwrap(1)`
+  // (installed in baseline; see BASELINE_APT_PACKAGES in
+  // src/init/dockerfile.ts). Docker's default seccomp profile rejects the
+  // namespace syscalls, while moby's docker-default AppArmor profile has an
+  // explicit `deny mount,` rule that rejects bwrap's opening
+  // mount(NULL, "/", MS_SLAVE|MS_REC). Selecting `apparmor=unconfined` removes
+  // that mount denial; it selects a profile, it does NOT grant a capability.
+  // On stock Ubuntu 23.10+ the host's `unprivileged_userns` catch-all then
+  // denies bwrap's /proc/<pid>/uid_map write when
+  // kernel.apparmor_restrict_unprivileged_userns=1. The complete path there is
+  // the shipped host-loaded `typeclaw-bwrap` profile plus
+  // sandbox.apparmorProfile="typeclaw-bwrap"; doctor reports the exact install
+  // and restart commands.
+  //
+  // CAP_SYS_ADMIN is not an alternative: the entrypoint drops to the host's
+  // non-root UID with an empty capability set, so Docker's --cap-add grant is
+  // void in the production process. These outer defaults are appropriate
+  // because the container is a single-tenant trust boundary — the user trusts
+  // everything inside it equally, and the .env and agent folder are already
+  // mounted in. Seccomp/AppArmor's multi-tenant protections are therefore not
+  // load-bearing for this threat model; the per-tool bwrap sandbox is the real
+  // boundary against prompt-injected commands. See docs/internals/sandbox.mdx.
   const runArgs = [
     'run',
     '-d',
@@ -892,8 +1003,25 @@ export async function planStart({
     '--name',
     containerName,
     '--shm-size=2g',
+    // `--memory-swap` equal to `--memory` disables swap for the container, and
+    // that equality is the load-bearing half. Without a cgroup limit at all,
+    // growth is charged to the host VM, and the guest kernel answers memory
+    // pressure by writing to swap: every vCPU ends up in direct reclaim
+    // (shrink_folio_list -> swap_writeout) while the OOM killer frees nothing
+    // reclaimable, and the VM livelocks instead of killing one process. With
+    // the limit the charge fails at the cgroup boundary and a single agent is
+    // killed. Letting the container swap would restore the original livelock
+    // inside the cgroup, which is why these are set as a pair.
+    //
+    // A cgroup limit also makes /dev/shm pages count against the container
+    // rather than the host, which matters because shm is not reclaimable by
+    // killing a process — see the --shm-size note above.
+    `--memory=${memoryLimitArg}`,
+    `--memory-swap=${memoryLimitArg}`,
     '--security-opt',
     'seccomp=unconfined',
+    '--security-opt',
+    `apparmor=${cfg.sandbox.apparmorProfile}`,
     '-p',
     `${publishHost}:${hostPort}:${CONTAINER_PORT}`,
   ]
@@ -919,17 +1047,17 @@ export async function planStart({
   // sandbox.realProc (default FALSE) opts into the per-tool bwrap sandbox's
   // 'real-proc' strategy (src/sandbox/build.ts), which prefixes the sandbox with
   // `unshare --pid --fork --mount --mount-proc`. Mounting a fresh procfs for the
-  // new PID namespace needs real CAP_SYS_ADMIN — seccomp=unconfined alone is not
-  // enough (it only unblocks the unshare/clone SYSCALLS; the kernel still
-  // rejects mount(2) of proc without the capability). So the grant is gated on
-  // the flag and is OFF by default: external-package execution (`bunx agent-*`)
+  // new PID namespace needs real CAP_SYS_ADMIN, so the Docker grant remains
+  // gated on the flag and is OFF by default. The entrypoint's production
+  // non-root UID clears that cap before the agent starts today, and the runtime
+  // capability probe consequently falls back to proc-bind. External-package
+  // execution (`bunx agent-*`)
   // no longer needs it — the default 'proc-bind' strategy gives the runner real
   // /proc without any outer capability (see docs/internals/sandbox.mdx). Setting
-  // realProc:true adds the stricter PID-isolation posture at the cost of this
-  // broad "new root" grant. The container-side strategy resolution still probes
-  // whether the mount actually works (canMountRealProc) and falls back to
-  // proc-bind on runtimes where the cap is a no-op (e.g. OrbStack), so this grant
-  // is necessary-but-not-sufficient by design. Placed before the image tag (like
+  // realProc:true requests the stricter PID-isolation posture. The
+  // container-side strategy resolution probes whether the mount actually works
+  // (canMountRealProc) and falls back to proc-bind when the cap is absent or the
+  // runtime rejects the mount (e.g. OrbStack). Placed before the image tag (like
   // --cap-add=NET_ADMIN) so docker applies it at run time.
   if (cfg.sandbox.realProc) {
     runArgs.push('--cap-add=SYS_ADMIN')
@@ -1038,7 +1166,34 @@ export async function planStart({
     needsBuild: forceBuild || !imageExists,
     hostPort,
     tuiToken,
+    memoryLimitBytes: memoryLimit.bytes,
   }
+}
+
+// Surfaces the arithmetic when every agent's cap together exceeds what Docker
+// actually has. Never blocks: a fleet that has run fine at a nominal
+// oversubscription must not be bricked by an upgrade, and a refused start is a
+// worse failure than a crowded host.
+async function warnOnMemoryOversubscription(options: {
+  exec: DockerExec
+  containerName: string
+  memoryLimitBytes: number
+  totalMemoryBytes: number | undefined
+  onWarning: ((warning: string) => void) | undefined
+  streamOutput: boolean
+}): Promise<void> {
+  const { exec, containerName, memoryLimitBytes, totalMemoryBytes, onWarning, streamOutput } = options
+  const running = await readRunningAgentMemoryClaims(exec)
+  const warning = decideMemoryOversubscription({
+    running,
+    incoming: { containerName, bytes: memoryLimitBytes },
+    totalMemoryBytes,
+  })
+  if (warning === null) return
+
+  const text = formatOversubscriptionWarning(warning).join('\n')
+  if (onWarning !== undefined) onWarning(text)
+  else if (streamOutput) process.stderr.write(`${text}\n`)
 }
 
 async function resolvePublishHost(exec: DockerExec): Promise<string> {
@@ -1081,13 +1236,10 @@ export async function refreshDockerfile(
   return { changed: true, warnings }
 }
 
-// Builds the agent image with a seamless buildx->legacy fallback. The preferred
-// frontend is chosen from `hasBuildx`; if a buildx build FAILS (e.g. the plugin
-// is installed but there is no usable builder/driver), we transparently rewrite
-// the Dockerfile to its BuildKit-stripped form and retry once with the legacy
-// `docker build`. The user sees one successful `typeclaw start` instead of a
-// buildx-specific dead end. A genuine Dockerfile error fails both paths, so the
-// retry costs at most one extra attempt before the real error surfaces.
+// Builds the agent image with a managed-buildx -> current-buildx -> legacy
+// fallback. A managed builder failure first releases all isolated state and
+// retries the unchanged BuildKit Dockerfile on Docker's current builder. Only
+// when that also fails do we strip BuildKit syntax and try `docker build`.
 //
 // Layered on top is a credential-helper recovery: typeclaw only pulls PUBLIC
 // images (the BuildKit syntax frontend + the typeclaw-base FROM), but a broken
@@ -1101,56 +1253,105 @@ export async function refreshDockerfile(
 async function runImageBuild(args: {
   exec: DockerExec
   cwd: string
+  cacheScope: string
   imageTag: string
   buildContext: string
   hasBuildx: boolean
+  acquireBuildCache: typeof acquireManagedBuildCache | null
+  buildCacheStateDir?: string
   streamOutput: boolean
+  onWarning: (warning: string) => void
 }): Promise<{ ok: true } | { ok: false; exitCode: number; credentialHelperRetried: boolean }> {
-  const { exec, cwd, imageTag, buildContext, hasBuildx, streamOutput } = args
+  const {
+    exec,
+    cwd,
+    cacheScope,
+    imageTag,
+    buildContext,
+    hasBuildx,
+    acquireBuildCache,
+    buildCacheStateDir,
+    streamOutput,
+    onWarning,
+  } = args
+  let lease: ManagedBuildCacheLease | undefined
   const buildArgv = (frontend: 'buildx' | 'legacy'): string[] =>
     frontend === 'buildx'
-      ? ['buildx', 'build', '--load', '-t', imageTag, buildContext]
+      ? [
+          'buildx',
+          'build',
+          ...(lease !== undefined ? ['--builder', lease.builder.builderName, ...lease.cacheArgs] : []),
+          '--load',
+          '-t',
+          imageTag,
+          buildContext,
+        ]
       : ['build', '-t', imageTag, buildContext]
 
   let sanitizedConfig: SanitizedDockerConfig | null = null
-  const attempt = async (frontend: 'buildx' | 'legacy'): Promise<DockerExecResult> =>
+  const attempt = async (
+    frontend: 'buildx' | 'legacy',
+    config: SanitizedDockerConfig | null,
+  ): Promise<DockerExecResult> =>
     exec(buildArgv(frontend), {
       cwd,
       ...(streamOutput ? { inheritStdio: true, captureStderr: true } : {}),
       ...(streamOutput ? {} : { captureStdout: false, maxCapturedStderrBytes: 32 * 1024 }),
-      env: sanitizedConfig?.env,
+      env: { ...(frontend === 'buildx' ? lease?.builder.env : {}), ...config?.env },
     })
+  const attemptWithCredentialRecovery = async (
+    frontend: 'buildx' | 'legacy',
+    config: SanitizedDockerConfig | null,
+  ): Promise<{ result: DockerExecResult; config: SanitizedDockerConfig | null }> => {
+    let result = await attempt(frontend, config)
+    if (result.exitCode !== 0 && config === null && isMissingDockerCredentialHelper(result.stderr)) {
+      config = await createSanitizedDockerConfig()
+      if (config !== null) result = await attempt(frontend, config)
+    }
+    return { result, config }
+  }
 
   try {
     let frontend: 'buildx' | 'legacy' = hasBuildx ? 'buildx' : 'legacy'
-    let result = await attempt(frontend)
+    let result: DockerExecResult
+    if (frontend === 'buildx' && acquireBuildCache !== null) {
+      const acquired = await acquireBuildCache({
+        exec,
+        cacheScope,
+        ...(buildCacheStateDir !== undefined ? { stateDir: buildCacheStateDir } : {}),
+      })
+      if (acquired.ok) {
+        lease = acquired.lease
+        for (const warning of acquired.warnings) onWarning(warning)
+      } else onWarning(`managed build cache unavailable; using Docker's current builder: ${acquired.reason}`)
+    }
+    if (frontend === 'buildx' && lease !== undefined) {
+      const managedLease = lease
+      let managedSuccess = false
+      try {
+        ;({ result, config: sanitizedConfig } = await attemptWithCredentialRecovery(frontend, sanitizedConfig))
+        managedSuccess = result.exitCode === 0
+      } finally {
+        const finished = await managedLease.finish(managedSuccess)
+        for (const warning of finished.warnings) onWarning(warning)
+        lease = undefined
+      }
+      if (result.exitCode !== 0) {
+        onWarning("managed buildx build failed; retrying with Docker's current builder")
+        ;({ result, config: sanitizedConfig } = await attemptWithCredentialRecovery(frontend, sanitizedConfig))
+      }
+    } else {
+      ;({ result, config: sanitizedConfig } = await attemptWithCredentialRecovery(frontend, sanitizedConfig))
+    }
     if (result.exitCode === 0) return { ok: true }
 
-    // Same-frontend retry: a broken credential helper aborts the pull before
-    // the builder ever matters, so strip it and retry the identical build.
-    if (sanitizedConfig === null && isMissingDockerCredentialHelper(result.stderr)) {
-      sanitizedConfig = await createSanitizedDockerConfig()
-      if (sanitizedConfig) {
-        result = await attempt(frontend)
-        if (result.exitCode === 0) return { ok: true }
-      }
-    }
-
     if (frontend === 'buildx') {
-      // buildx failed for a non-cred reason — fall back to the legacy builder
-      // against a stripped Dockerfile so a misconfigured-buildx host still ends
-      // up with an image. The sanitized config (if any) carries into the retry.
+      // Both managed and current buildx failed. Strip BuildKit-only syntax only
+      // now, preserving the current builder as the first compatibility fallback.
       await refreshDockerfile(cwd, { buildKit: false })
       frontend = 'legacy'
-      result = await attempt(frontend)
+      ;({ result, config: sanitizedConfig } = await attemptWithCredentialRecovery(frontend, sanitizedConfig))
       if (result.exitCode === 0) return { ok: true }
-      if (sanitizedConfig === null && isMissingDockerCredentialHelper(result.stderr)) {
-        sanitizedConfig = await createSanitizedDockerConfig()
-        if (sanitizedConfig) {
-          result = await attempt(frontend)
-          if (result.exitCode === 0) return { ok: true }
-        }
-      }
     }
 
     if (sanitizedConfig !== null && streamOutput) {
@@ -1214,9 +1415,45 @@ export async function refreshGitignore(cwd: string): Promise<void> {
 // the migration write with a commit on every read path, not only here.
 export const commitSystemFile = commitSystemFileShared
 
-async function imageExists(exec: DockerExec, tag: string): Promise<boolean> {
-  const result = await exec(['image', 'inspect', tag])
-  return result.exitCode === 0
+async function inspectImageId(exec: DockerExec, tag: string): Promise<string | null> {
+  const result = await exec(['image', 'inspect', '--format', '{{.Id}}', tag])
+  if (result.exitCode !== 0) return null
+  return result.stdout.trim() || null
+}
+
+async function protectImageForRebuild(
+  exec: DockerExec,
+  imageTag: string,
+  previousImageId: string | null,
+): Promise<{ tag: string | null; warning: string | null }> {
+  if (previousImageId === null) return { tag: null, warning: null }
+
+  const protectionTag = `${imageTag}:rebuild-${randomBytes(8).toString('hex')}`
+  try {
+    const result = await exec(['image', 'tag', previousImageId, protectionTag])
+    if (result.exitCode === 0) return { tag: protectionTag, warning: null }
+    const detail = sanitizeDockerStderr(result.stderr) || `docker image tag exited with code ${result.exitCode}`
+    return {
+      tag: null,
+      warning: `Could not protect existing Docker image ${previousImageId} for cleanup: ${detail}`,
+    }
+  } catch (error) {
+    return {
+      tag: null,
+      warning: `Could not protect existing Docker image ${previousImageId} for cleanup: ${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+}
+
+async function releaseImageProtection(exec: DockerExec, protectionTag: string): Promise<string | null> {
+  try {
+    const result = await exec(['image', 'rm', '--no-prune', protectionTag])
+    if (result.exitCode === 0) return null
+    const detail = sanitizeDockerStderr(result.stderr) || `docker image rm exited with code ${result.exitCode}`
+    return `Could not remove temporary Docker image protection tag ${protectionTag}: ${detail}`
+  } catch (error) {
+    return `Could not remove temporary Docker image protection tag ${protectionTag}: ${error instanceof Error ? error.message : String(error)}`
+  }
 }
 
 type InspectedState =
@@ -1252,8 +1489,7 @@ async function inspectContainer(exec: DockerExec, name: string): Promise<Inspect
 // container record behind, and start()'s own port-TOCTOU retry triggers
 // this path against that corpse).
 //
-// cleanupRunCorpse refuses to touch a running container and uses non-force rm,
-// so a container that starts after its inspect probe is also preserved. A concurrent
+// cleanupRunCorpse refuses to touch a running container and uses non-force rm. A concurrent
 // legitimate start of the same name (or a foreign-but-named container the
 // user wants alive) is surfaced as a hard failure rather than silently
 // killed. 'stuck' likewise surfaces — a wedged daemon that won't drain a

@@ -225,6 +225,11 @@ describe('channelsSchema', () => {
     expect(parsed.github?.review.on).toBe('opened')
   })
 
+  test('github review.on accepts explicit comment requests', () => {
+    const parsed = channelsSchema.parse({ github: { repos: ['owner/repo'], review: { on: 'comment_requested' } } })
+    expect(parsed.github?.review.on).toBe('comment_requested')
+  })
+
   test('github review.on rejects unknown values', () => {
     expect(() =>
       channelsSchema.parse({

@@ -81,10 +81,11 @@ jobs:
           # in ci.yml and release.yml so all three jobs use the same Bun.
           bun-version: 1.4.0
 
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
       - name: Generate base Dockerfile
-        # No `bun install` needed — scripts/emit-base-dockerfile.ts only
-        # imports dockerfile.ts, which has type-only imports from
-        # @/config/config.
+        # dockerfile.ts now loads config modules with runtime pi-ai imports.
         run: bun run scripts/emit-base-dockerfile.ts > base.Dockerfile
 
       - name: Show generated Dockerfile
