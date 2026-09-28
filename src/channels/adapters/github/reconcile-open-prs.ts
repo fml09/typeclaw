@@ -50,8 +50,9 @@ export type ReconcileOutcome = { repo: string; scanned: number; replayed: number
 const BOT_LOGIN_SUFFIX = '[bot]'
 
 export async function reconcileOpenPrs(options: ReconcileOpenPrsOptions): Promise<ReconcileOutcome[]> {
-  // `off` disables code review entirely, so there is nothing to catch up on.
-  if (options.reviewOn === 'off') return []
+  // A comment command cannot be inferred from the current PR state. Only its
+  // created delivery (or delivery recovery) may start a review in this mode.
+  if (options.reviewOn === 'off' || options.reviewOn === 'comment_requested') return []
   if (options.selfLogin === null) return []
   const fetchImpl = options.fetchImpl ?? fetch
   const selfLogin = options.selfLogin

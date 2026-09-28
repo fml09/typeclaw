@@ -332,16 +332,16 @@ export const SEEDED_GITHUB_EVENT_ALLOWLISTS: readonly (readonly string[])[] = [
   DEFAULT_GITHUB_EVENT_ALLOWLIST,
 ]
 
-// Which pull_request webhook action triggers an agent code review. The two
-// event values are GitHub's bare PR action names (the `pull_request.` event
-// prefix is implied by this field living under the review config); `off` is the
-// disable sentinel, matching the `engagement.stickiness: 'off'` convention:
+// Which GitHub event triggers an agent code review. The PR action values omit
+// the `pull_request.` prefix; comment_requested uses `issue_comment.created`.
 //   - 'review_requested' — review only when the bot is requested (default)
 //   - 'opened'           — review every non-draft PR as soon as it opens; a draft
 //                          PR wakes no session and is reviewed once it turns ready
 //                          (ready_for_review) or the bot is explicitly requested
+//   - 'comment_requested' — review only when a new PR comment says
+//                           `@<reviewerLogin> review`
 //   - 'off'              — disable code review entirely
-export const GITHUB_REVIEW_ON_VALUES = ['review_requested', 'opened', 'off'] as const
+export const GITHUB_REVIEW_ON_VALUES = ['review_requested', 'opened', 'comment_requested', 'off'] as const
 
 export type GithubReviewOn = (typeof GITHUB_REVIEW_ON_VALUES)[number]
 
@@ -351,7 +351,7 @@ export const DEFAULT_GITHUB_REVIEW_ON: GithubReviewOn = 'review_requested'
 // (`requestChanges`, severity thresholds) cluster here instead of flattening
 // onto the channel root.
 //
-// `on` gates which pull_request action triggers a code review (see values above).
+// `on` gates which GitHub event triggers a code review (see values above).
 //
 // `approve` gates *whether* the agent may submit a formal review with
 // `event: APPROVE`. When `false`, the adapter appends an operator-policy note

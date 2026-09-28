@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 // Stable TypeScript 7.0 ships no programmatic API (returns in 7.1); this meta-test
 // walks its own source AST, so it pulls the classic compiler API from the TS6 compat
@@ -16,6 +17,7 @@ import { buildGitignore } from '@/init/gitignore'
 import { isWindows } from '@/shared'
 
 import type { WithAgentOperationLock } from './agent-operation-lock'
+import { acquireManagedBuildCache } from './build-cache'
 import type { DockerExec } from './shared'
 import {
   commitSystemFile,
@@ -135,7 +137,12 @@ type ScaffoldedConfig = {
   docker?: { file?: DockerfileBlock }
   git?: { ignore?: GitignoreBlock }
   network?: { blockInternal?: boolean; autoAllowResolvers?: boolean; allow?: string[] }
-  sandbox?: { realProc?: boolean; writablePaths?: string[]; symlinks?: Array<{ from: string; to: string }> }
+  sandbox?: {
+    apparmorProfile?: string
+    realProc?: boolean
+    writablePaths?: string[]
+    symlinks?: Array<{ from: string; to: string }>
+  }
   logs?: { retentionDays?: number }
   memory?: Record<string, unknown>
 }
@@ -183,6 +190,7 @@ const bypassVerify = {
   ensureModels: noEnsureModels,
   archiveLogs: noArchiveLogs,
   provisionGithubCliStore: noGithubCliProvision,
+  acquireBuildCache: null,
 }
 
 function labelValue(runArgs: string[], key: string): string | undefined {
@@ -344,6 +352,21 @@ describe('planStart', () => {
     expect(plan.runArgs).toContain('--shm-size=2g')
   })
 
+  test('caps container memory with swap disabled so exhaustion kills one agent instead of livelocking the host', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+    const memory = plan.runArgs.find((arg) => arg.startsWith('--memory='))
+    const memorySwap = plan.runArgs.find((arg) => arg.startsWith('--memory-swap='))
+    expect(memory).toBeDefined()
+    // Equal values are what disables swap. Swap is what turns an OOM into an
+    // unrecoverable reclaim livelock, so the pair must never drift apart.
+    expect(memorySwap).toBe(`--memory-swap=${memory?.slice('--memory='.length)}`)
+    expect(plan.memoryLimitBytes).toBeGreaterThan(0)
+  })
+
   test('passes the host UID and GID to the container on POSIX so runtime writes keep host ownership', async () => {
     // given
     await writeDockerfile(root)
@@ -391,6 +414,33 @@ describe('planStart', () => {
     const idx = plan.runArgs.indexOf('--security-opt')
     expect(idx).toBeGreaterThan(-1)
     expect(plan.runArgs[idx + 1]).toBe('seccomp=unconfined')
+    expect(idx).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
+  })
+
+  test('sets --security-opt apparmor=unconfined by default before the image tag', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+    const idx = plan.runArgs.indexOf('apparmor=unconfined')
+
+    expect(idx).toBeGreaterThan(-1)
+    expect(plan.runArgs[idx - 1]).toBe('--security-opt')
+    expect(idx).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
+    expect(plan.runArgs).not.toContain('--privileged')
+    expect(plan.runArgs).not.toContain('--cap-add=SYS_ADMIN')
+  })
+
+  test('honors sandbox.apparmorProfile verbatim before the image tag', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeTypeclawConfig(root, { sandbox: { apparmorProfile: 'typeclaw-bwrap' } })
+
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+    const idx = plan.runArgs.indexOf('apparmor=typeclaw-bwrap')
+
+    expect(idx).toBeGreaterThan(-1)
+    expect(plan.runArgs[idx - 1]).toBe('--security-opt')
     expect(idx).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
   })
 
@@ -1559,6 +1609,12 @@ function isBuildCall(args: string[]): boolean {
   return args[0] === 'build' || (args[0] === 'buildx' && args[1] === 'build')
 }
 
+function protectionTagFrom(calls: RecordedCall[]): string {
+  const tag = calls.find((call) => call.args[0] === 'image' && call.args[1] === 'tag')?.args[3]
+  if (!tag) throw new Error('expected a temporary image protection tag')
+  return tag
+}
+
 type ContainerScenario =
   | { exists: false }
   | {
@@ -1567,6 +1623,7 @@ type ContainerScenario =
       rmFails?: boolean
       rmStderr?: string
       rmFindsRunning?: boolean
+      status?: 'running' | 'exited' | 'dead' | 'removing'
       // Models Docker's async removal-drain after a `docker rm` that
       // returned with "removal in progress" stderr: the container keeps
       // showing up in `inspect` until N post-rm inspect probes have run,
@@ -1578,12 +1635,23 @@ type ContainerScenario =
 
 function fakeDockerExec(scenario: {
   imageExists: boolean
+  imageIdBeforeBuild?: string
+  imageRmFails?: boolean
+  imageTags?: string[]
   container: ContainerScenario
   dockerPlatformName?: string
   buildxAvailable?: boolean
   buildxBuildFails?: boolean
+  managedBuildxBuildFails?: boolean
+  defaultBuildxBuildFails?: boolean
   buildFails?: boolean
   buildStderr?: string
+  daemonId?: string
+  daemonMemTotalBytes?: number
+  managedBuilderCreateFails?: boolean
+  managedBuilderRmFails?: boolean
+  buildThrows?: boolean
+  cacheExportMissing?: boolean
   // Simulate a broken credential helper: build calls fail with the helper-not-
   // found stderr UNTIL the call is made with DOCKER_CONFIG set in its env (the
   // sanitized-config retry), at which point the build succeeds.
@@ -1592,12 +1660,15 @@ function fakeDockerExec(scenario: {
 }): {
   exec: DockerExec
   calls: RecordedCall[]
+  hasImageTag: (tag: string) => boolean
 } {
   const calls: RecordedCall[] = []
+  const imageTags = new Set(scenario.imageTags)
   let containerState = scenario.container
   let rmReturned = false
   let inspectsAfterRm = 0
   let runningRacePending = scenario.container.exists && scenario.container.rmFindsRunning === true
+  let managedBuilderExists = false
   const exec: DockerExec = async (args, options) => {
     let dockerfileSnapshot: string | null = null
     if (options?.cwd) {
@@ -1621,7 +1692,22 @@ function fakeDockerExec(scenario: {
     })
 
     if (args[0] === 'image' && args[1] === 'inspect') {
-      return { exitCode: scenario.imageExists ? 0 : 1, stdout: '', stderr: '' }
+      if (!scenario.imageExists) return { exitCode: 1, stdout: '', stderr: '' }
+      const imageId = scenario.imageIdBeforeBuild ?? 'sha256:old-image'
+      return { exitCode: 0, stdout: `${imageId}\n`, stderr: '' }
+    }
+    if (args[0] === 'image' && args[1] === 'tag') {
+      imageTags.add(args[3] ?? '')
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    if (args[0] === 'image' && args[1] === 'rm') {
+      const target = args.at(-1) ?? ''
+      if (scenario.imageRmFails) {
+        return { exitCode: 1, stdout: '', stderr: 'image is being used by a container' }
+      }
+      if (target.startsWith('sha256:')) imageTags.clear()
+      else imageTags.delete(target)
+      return { exitCode: 0, stdout: '', stderr: '' }
     }
     if (args[0] === 'version') {
       return { exitCode: 0, stdout: `${scenario.dockerPlatformName ?? 'Docker Engine'}\n`, stderr: '' }
@@ -1632,6 +1718,31 @@ function fakeDockerExec(scenario: {
       return scenario.buildxAvailable === false
         ? { exitCode: 1, stdout: '', stderr: 'unknown command "buildx"' }
         : { exitCode: 0, stdout: 'buildx v0.0.0\n', stderr: '' }
+    }
+    if (args[0] === 'info' && args[2] === '{{.MemTotal}}') {
+      return scenario.daemonMemTotalBytes === undefined
+        ? { exitCode: 1, stdout: '', stderr: 'daemon memory unavailable' }
+        : { exitCode: 0, stdout: `${scenario.daemonMemTotalBytes}\n`, stderr: '' }
+    }
+    if (args[0] === 'info') {
+      return scenario.daemonId === undefined
+        ? { exitCode: 1, stdout: '', stderr: 'daemon identity unavailable' }
+        : { exitCode: 0, stdout: `${scenario.daemonId}\n`, stderr: '' }
+    }
+    if (args[0] === 'buildx' && args[1] === 'inspect') {
+      return managedBuilderExists
+        ? { exitCode: 0, stdout: 'managed builder\n', stderr: '' }
+        : { exitCode: 1, stdout: '', stderr: 'no builder found' }
+    }
+    if (args[0] === 'buildx' && args[1] === 'create') {
+      if (scenario.managedBuilderCreateFails) return { exitCode: 1, stdout: '', stderr: 'create failed' }
+      managedBuilderExists = true
+      return { exitCode: 0, stdout: `${args.at(-1)}\n`, stderr: '' }
+    }
+    if (args[0] === 'buildx' && args[1] === 'rm') {
+      if (scenario.managedBuilderRmFails) return { exitCode: 1, stdout: '', stderr: 'builder removal failed' }
+      managedBuilderExists = false
+      return { exitCode: 0, stdout: '', stderr: '' }
     }
     if (args[0] === 'inspect') {
       if (rmReturned && containerState.exists) {
@@ -1645,6 +1756,9 @@ function fakeDockerExec(scenario: {
       // The idempotent path probes `inspect --format {{.Id}}` after seeing
       // the container is up; mirror that here so the fake stays sufficient.
       const format = args[args.indexOf('--format') + 1] ?? ''
+      if (format === '{{.State.Status}}') {
+        return { exitCode: 0, stdout: `${containerState.status ?? 'exited'}\n`, stderr: '' }
+      }
       if (format === '{{.Id}}|{{.State.Running}}') {
         return {
           exitCode: 0,
@@ -1673,7 +1787,6 @@ function fakeDockerExec(scenario: {
         containerState = { ...containerState, running: true }
         return { exitCode: 1, stdout: '', stderr: 'cannot remove a running container' }
       }
-      rmReturned = true
       if (containerState.rmFails) {
         const stderr = containerState.rmStderr ?? 'rm failed'
         // "No such container" rm-failures mean the container is in fact gone
@@ -1682,9 +1795,12 @@ function fakeDockerExec(scenario: {
         // "Removal in progress" leaves the container present (drain pending).
         if (stderr.toLowerCase().includes('no such container')) {
           containerState = { exists: false }
+        } else if (stderr.toLowerCase().includes('removal of container')) {
+          rmReturned = true
         }
         return { exitCode: 1, stdout: '', stderr }
       }
+      rmReturned = true
       // Exit 0 from `docker rm` does NOT mean the name is free under
       // OrbStack load — the daemon acknowledges the rm before draining. The
       // inspect block above already advances containerState to "gone" after
@@ -1696,6 +1812,7 @@ function fakeDockerExec(scenario: {
       return { exitCode: 0, stdout: '', stderr: '' }
     }
     if (isBuildCall(args)) {
+      if (scenario.buildThrows) throw new Error('build process failed')
       if (scenario.buildFails) {
         return { exitCode: 1, stdout: '', stderr: scenario.buildStderr ?? 'build exploded' }
       }
@@ -1703,6 +1820,12 @@ function fakeDockerExec(scenario: {
       // builder). The legacy `docker build` retry still succeeds.
       if (scenario.buildxBuildFails && args[0] === 'buildx') {
         return { exitCode: 1, stdout: '', stderr: 'ERROR: no builder instance found' }
+      }
+      if (scenario.managedBuildxBuildFails && args[0] === 'buildx' && args.includes('--builder')) {
+        return { exitCode: 1, stdout: '', stderr: 'ERROR: managed builder failed' }
+      }
+      if (scenario.defaultBuildxBuildFails && args[0] === 'buildx' && !args.includes('--builder')) {
+        return { exitCode: 1, stdout: '', stderr: 'ERROR: default builder failed' }
       }
       if (scenario.credHelperMissingUntilSanitized && options?.env?.DOCKER_CONFIG === undefined) {
         return {
@@ -1712,6 +1835,12 @@ function fakeDockerExec(scenario: {
             'ERROR: failed to solve: error getting credentials - err: exec: ' +
             '"docker-credential-desktop": executable file not found in %PATH%',
         }
+      }
+      const cacheTo = args[args.indexOf('--cache-to') + 1]
+      const cacheDestination = cacheTo?.match(/^type=local,dest=(.+),mode=min$/)?.[1]
+      if (args[0] === 'buildx' && cacheDestination !== undefined && !scenario.cacheExportMissing) {
+        await mkdir(cacheDestination, { mode: 0o700 })
+        await writeFile(join(cacheDestination, 'index.json'), '{}')
       }
       return { exitCode: 0, stdout: '', stderr: '' }
     }
@@ -1728,7 +1857,7 @@ function fakeDockerExec(scenario: {
     }
     return { exitCode: 0, stdout: '', stderr: '' }
   }
-  return { exec, calls }
+  return { exec, calls, hasImageTag: (tag) => imageTags.has(tag) }
 }
 
 describe('start (composition)', () => {
@@ -2042,7 +2171,7 @@ describe('start (composition)', () => {
   test('warns and continues without replacing persisted GitHub CLI credentials when refresh fails', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
-    const persisted = '{"githubCli":{"hosts":"existing-good-store"}}\n'
+    const persisted = '{"version":2,"githubCli":{"hosts":"existing-good-store"}}\n'
     await writeFile(join(root, 'secrets.json'), persisted)
     const { exec, calls } = fakeDockerExec({ imageExists: true, container: { exists: false } })
     const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true)
@@ -2072,9 +2201,64 @@ describe('start (composition)', () => {
     }
   })
 
+  test('stays silent when a GitHub CLI refresh fails for an agent that never had a persisted store', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeFile(join(root, 'secrets.json'), '{"version":2,"channels":{}}\n')
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const warnings: string[] = []
+
+    try {
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        streamOutput: false,
+        onWarning: (warning) => warnings.push(warning),
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+        provisionGithubCliStore: () => ({ ok: false, reason: 'sensitive-command-output' }),
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warnings).toEqual([])
+      expect(stderr).not.toHaveBeenCalled()
+    } finally {
+      stderr.mockRestore()
+    }
+  })
+
+  test('warns when a GitHub CLI refresh fails and secrets.json cannot be read at all', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeFile(join(root, 'secrets.json'), 'not json\n')
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const warnings: string[] = []
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      provisionGithubCliStore: () => ({ ok: false, reason: 'sensitive-command-output' }),
+    })
+
+    expect(result.ok).toBe(true)
+    expect(warnings).toEqual([expect.stringContaining('Could not refresh GitHub CLI credentials')])
+  })
+
   test('returns warnings instead of writing them while a parent renderer owns the terminal', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeFile(join(root, 'secrets.json'), '{"version":2,"githubCli":{"hosts":"existing-good-store"}}\n')
     const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
     const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true)
     const warnings: string[] = []
@@ -2304,6 +2488,184 @@ describe('start (composition)', () => {
     expect(buildCall!.dockerfileSnapshot).not.toContain('FROM stale')
   })
 
+  test('reclaims a replaced image by releasing its temporary protection tag', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      imageIdBeforeBuild: 'sha256:replaced-image',
+      container: { exists: false },
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      forceBuild: true,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    const protectCall = calls.find((call) => call.args[0] === 'image' && call.args[1] === 'tag')
+    const protectionTag = protectionTagFrom(calls)
+    expect(protectCall?.args[2]).toBe('sha256:replaced-image')
+    expect(protectionTag).toStartWith(`typeclaw-${basename(root)}:rebuild-`)
+    expect(calls.map((call) => call.args)).toContainEqual(['image', 'rm', '--no-prune', protectionTag])
+    expect(calls.map((call) => call.args)).not.toContainEqual(['image', 'rm', '--no-prune', 'sha256:replaced-image'])
+  })
+
+  test('preserves another agent tag that points at the replaced image', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const otherAgentTag = 'typeclaw-other-agent:latest'
+    const { exec, hasImageTag } = fakeDockerExec({
+      imageExists: true,
+      imageIdBeforeBuild: 'sha256:shared-image',
+      imageTags: [otherAgentTag],
+      container: { exists: false },
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      forceBuild: true,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(hasImageTag(otherAgentTag)).toBe(true)
+  })
+
+  test('keeps the current image when a rebuild resolves to the same image ID', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      imageIdBeforeBuild: 'sha256:cached-image',
+      container: { exists: false },
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      forceBuild: true,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    const protectionTag = protectionTagFrom(calls)
+    expect(calls.map((call) => call.args)).toContainEqual(['image', 'rm', '--no-prune', protectionTag])
+    expect(calls.map((call) => call.args)).not.toContainEqual(['image', 'rm', '--no-prune', 'sha256:cached-image'])
+  })
+
+  test('preserves the prior image when its replacement build fails', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      imageIdBeforeBuild: 'sha256:prior-image',
+      buildFails: true,
+      container: { exists: false },
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      forceBuild: true,
+      streamOutput: false,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(false)
+    const protectionTag = protectionTagFrom(calls)
+    expect(calls.map((call) => call.args)).toContainEqual(['image', 'rm', '--no-prune', protectionTag])
+    expect(calls.map((call) => call.args)).not.toContainEqual(['image', 'rm', '--no-prune', 'sha256:prior-image'])
+  })
+
+  test('warns without blocking startup when Docker retains a replaced image', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const warnings: string[] = []
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      imageIdBeforeBuild: 'sha256:in-use-image',
+      imageRmFails: true,
+      container: { exists: false },
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      forceBuild: true,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    const protectionTag = protectionTagFrom(calls)
+    expect(calls.map((call) => call.args)).toContainEqual(['image', 'rm', '--no-prune', protectionTag])
+    expect(warnings).toEqual([
+      expect.stringMatching(
+        /^Could not remove temporary Docker image protection tag typeclaw-.+:rebuild-[0-9a-f]+: image is being used by a container$/,
+      ),
+    ])
+  })
+
+  test('prints a cleanup warning without calling the parent warning hook while streaming output', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const warnings: string[] = []
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const { exec } = fakeDockerExec({
+      imageExists: true,
+      imageIdBeforeBuild: 'sha256:in-use-image',
+      imageRmFails: true,
+      container: { exists: false },
+    })
+
+    try {
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        forceBuild: true,
+        onWarning: (warning) => warnings.push(warning),
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+      })
+
+      expect(result.ok).toBe(true)
+      expect(stderr.mock.calls.map(([chunk]) => String(chunk)).join('')).toContain(
+        'typeclaw: Could not remove temporary Docker image protection tag',
+      )
+      expect(warnings).toEqual([])
+    } finally {
+      stderr.mockRestore()
+    }
+  })
+
   test('builds via `docker buildx build` (BuildKit frontend) so the Dockerfile cache mounts are honored', async () => {
     await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
     await writePackageJson(root, { typeclaw: '^0.1.0' })
@@ -2329,6 +2691,234 @@ describe('start (composition)', () => {
     expect(buildCall?.dockerfileSnapshot).toContain('--mount=type=cache')
     expect(buildCall?.inheritStdio).toBe(true)
     expect(buildCall?.captureStderr).toBe(true)
+  })
+
+  test('uses exact managed cache flags and removes the owned builder after promotion', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      daemonId: 'managed-daemon',
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      buildCacheStateDir: join(root, 'build-cache'),
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      acquireBuildCache: acquireManagedBuildCache,
+    })
+
+    expect(result.ok).toBe(true)
+    const managedCalls = calls.filter(({ args }) => args[0] === 'buildx' && (args[1] === 'rm' || args[1] === 'build'))
+    expect(managedCalls.map(({ args }) => args[1])).toEqual(['build', 'rm'])
+    const build = managedCalls[0]!.args
+    const builderName = build[build.indexOf('--builder') + 1]
+    if (builderName === undefined) throw new Error('expected managed builder name')
+    expect(builderName).toMatch(/^typeclaw-[a-f0-9]{24}$/)
+    expect(managedCalls[1]!.args).toEqual(['buildx', 'rm', builderName])
+    expect(build).toContain('--load')
+    expect(build).not.toContain('--cache-from')
+    const cacheToIndex = build.indexOf('--cache-to')
+    // Parse the destination instead of regexing the whole CSV value: the path
+    // separator is platform-dependent, so a `/generations/` literal fails on Windows.
+    const cacheTo = /^type=local,dest=(.+),mode=min$/.exec(build[cacheToIndex + 1] ?? '')
+    if (cacheTo === null) throw new Error('expected a local managed cache export destination')
+    const dest = cacheTo[1]!
+    expect(basename(dest)).toMatch(/^[a-f0-9]{32}$/)
+    expect(basename(dirname(dest))).toBe('generations')
+    expect(managedCalls[0]!.env?.BUILDX_CONFIG).toStartWith(join(root, 'build-cache'))
+    expect(managedCalls[1]!.env?.BUILDX_CONFIG).toBe(managedCalls[0]!.env?.BUILDX_CONFIG)
+    expect(calls.some(({ args }) => args[0] === 'builder' || args[0] === 'system')).toBe(false)
+    expect(calls.some(({ args }) => args[0] === 'image' && args[1] === 'rm')).toBe(false)
+    expect(calls.some(({ args }) => args[0] === 'volume' || (args[0] === 'rm' && args.includes('-f')))).toBe(false)
+  })
+
+  test('surfaces retired-cache cleanup warnings without blocking the managed build', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const stateDir = join(root, 'build-cache')
+    const scopeHash = createHash('sha256').update(basename(root)).digest('hex')
+    await mkdir(join(stateDir, scopeHash, 'unsafe-entry'), { recursive: true })
+    const warnings: string[] = []
+    const { exec } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      daemonId: 'managed-daemon-warning',
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      buildCacheStateDir: stateDir,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      acquireBuildCache: acquireManagedBuildCache,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(warnings.join(' ')).toContain('unsafe managed build cache entry preserved')
+  })
+
+  test('failed thrown managed build does not promote staging and still removes its builder once', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      daemonId: 'managed-daemon-failure',
+      buildThrows: true,
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      buildCacheStateDir: join(root, 'build-cache'),
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      acquireBuildCache: acquireManagedBuildCache,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(calls.filter(({ args }) => args[0] === 'buildx' && args[1] === 'rm')).toHaveLength(1)
+    const build = calls.find(({ args }) => args[0] === 'buildx' && args[1] === 'build')
+    const cacheTo = build?.args[build.args.indexOf('--cache-to') + 1]
+    const staging = cacheTo?.match(/^type=local,dest=(.+),mode=min$/)?.[1]
+    expect(staging).toBeDefined()
+    expect(existsSync(staging!)).toBe(false)
+  })
+
+  test('builder removal failure warns but does not block the managed build', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const warnings: string[] = []
+    const { exec, calls } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      daemonId: 'managed-daemon-removal-failure',
+      managedBuilderRmFails: true,
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      buildCacheStateDir: join(root, 'build-cache'),
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      acquireBuildCache: acquireManagedBuildCache,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(warnings).toHaveLength(1)
+    expect(warnings.every((warning) => warning.includes('managed builder removal failed'))).toBe(true)
+    expect(calls.find(({ args }) => args[0] === 'buildx' && args[1] === 'build')?.args).toContain('--builder')
+  })
+
+  test('managed builder setup failure preserves default buildx then legacy fallback', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const warnings: string[] = []
+    const { exec, calls } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      daemonId: 'managed-daemon-setup-failure',
+      managedBuilderCreateFails: true,
+      buildxBuildFails: true,
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      buildCacheStateDir: join(root, 'build-cache'),
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      acquireBuildCache: acquireManagedBuildCache,
+    })
+
+    expect(result.ok).toBe(true)
+    const builds = calls.filter(({ args }) => isBuildCall(args))
+    expect(builds.map(({ args }) => args.slice(0, 2))).toEqual([
+      ['buildx', 'build'],
+      ['build', '-t'],
+    ])
+    expect(builds[0]!.args).not.toContain('--builder')
+    expect(builds[0]!.args).not.toContain('--cache-from')
+    expect(builds[0]!.args).not.toContain('--cache-to')
+    expect(builds[0]!.env?.BUILDX_CONFIG).toBeUndefined()
+    expect(calls.some(({ args }) => args[0] === 'buildx' && args[1] === 'rm')).toBe(false)
+    expect(warnings.some((warning) => warning.includes('managed build cache unavailable'))).toBe(true)
+  })
+
+  test('managed acquire release failure falls back to default buildx without rejecting start', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const warnings: string[] = []
+    const { exec, calls } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      daemonId: 'managed-daemon-release-failure',
+    })
+    const acquireWithReleaseFailure: typeof acquireManagedBuildCache = async (options) =>
+      await acquireManagedBuildCache({
+        ...options,
+        randomBuilderName: () => 'typeclaw-aaaaaaaaaaaaaaaaaaaaaaaa',
+        randomGenerationId: () => 'invalid',
+        faultInjection: {
+          releaseLock: async (release) => {
+            await release()
+            throw new Error('injected release failure')
+          },
+        },
+      })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      buildCacheStateDir: join(root, 'build-cache'),
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      acquireBuildCache: acquireWithReleaseFailure,
+    })
+
+    expect(result.ok).toBe(true)
+    const build = calls.find(({ args }) => isBuildCall(args))
+    expect(build?.args).not.toContain('--builder')
+    expect(build?.env?.BUILDX_CONFIG).toBeUndefined()
+    expect(warnings.join(' ')).toContain('injected release failure')
   })
 
   test('captures build output when streaming is disabled by a live parent renderer', async () => {
@@ -2429,19 +3019,29 @@ describe('start (composition)', () => {
       cwd: root,
       preferredHostPort: 8973,
       exec,
+      buildCacheStateDir: join(root, 'build-cache'),
       allocatePort: deterministicAllocator,
       ensureDeps: noEnsureDeps,
       autoUpgrade: noAutoUpgrade,
       ...bypassVerify,
+      acquireBuildCache: acquireManagedBuildCache,
     })
 
     expect(result.ok).toBe(true)
     const buildCall = calls.find((c) => isBuildCall(c.args))
     expect(buildCall?.args[0]).toBe('build')
     expect(buildCall?.args).not.toContain('buildx')
+    expect(buildCall?.args).not.toContain('--cache-from')
+    expect(buildCall?.args).not.toContain('--cache-to')
+    expect(buildCall?.env?.BUILDX_CONFIG).toBeUndefined()
     // The Dockerfile on disk must be BuildKit-free, or the legacy build chokes.
     expect(buildCall?.dockerfileSnapshot).not.toContain('# syntax=')
     expect(buildCall?.dockerfileSnapshot).not.toContain('--mount=type=cache')
+    // Narrowed to the daemon-identity probe the managed build cache uses.
+    // start() also runs `docker info --format {{.MemTotal}}` to size the
+    // container memory limit, which is unrelated to the build path.
+    expect(calls.some((c) => c.args[0] === 'info' && c.args[2] === '{{.ID}}')).toBe(false)
+    expect(calls.some((c) => c.args[0] === 'buildx' && c.args[1] === 'rm')).toBe(false)
   })
 
   test('when a buildx BUILD fails, transparently falls back to legacy `docker build` and start still succeeds', async () => {
@@ -2451,6 +3051,7 @@ describe('start (composition)', () => {
       imageExists: false,
       container: { exists: false },
       buildxAvailable: true,
+      daemonId: 'managed-daemon-build-fallback',
       buildxBuildFails: true,
     })
 
@@ -2458,10 +3059,12 @@ describe('start (composition)', () => {
       cwd: root,
       preferredHostPort: 8973,
       exec,
+      buildCacheStateDir: join(root, 'build-cache'),
       allocatePort: deterministicAllocator,
       ensureDeps: noEnsureDeps,
       autoUpgrade: noAutoUpgrade,
       ...bypassVerify,
+      acquireBuildCache: acquireManagedBuildCache,
     })
 
     expect(result.ok).toBe(true)
@@ -2470,10 +3073,71 @@ describe('start (composition)', () => {
     expect(buildCalls[0]?.args.slice(0, 2)).toEqual(['buildx', 'build'])
     const legacy = buildCalls.find((c) => c.args[0] === 'build')
     expect(legacy).toBeDefined()
+    expect(legacy?.env?.BUILDX_CONFIG).toBeUndefined()
+    expect(legacy?.args).not.toContain('--cache-from')
+    expect(legacy?.args).not.toContain('--cache-to')
+    expect(
+      calls
+        .filter(({ args }) => args[0] === 'build' || (args[0] === 'buildx' && ['rm', 'build'].includes(args[1]!)))
+        .map(({ args }) => args.slice(0, 2).join(' ')),
+    ).toEqual(['buildx build', 'buildx rm', 'buildx build', 'build -t'])
     // The retry rewrote the Dockerfile to its BuildKit-stripped form.
     expect(legacy?.dockerfileSnapshot).not.toContain('# syntax=')
     expect(legacy?.dockerfileSnapshot).not.toContain('--mount=type=cache')
+    const managed = buildCalls[0]!
+    const cacheTo = managed.args[managed.args.indexOf('--cache-to') + 1]
+    const staging = cacheTo?.match(/^type=local,dest=(.+),mode=min$/)?.[1]
+    expect(staging).toBeDefined()
+    expect(existsSync(staging!)).toBe(false)
+    expect(existsSync(join(staging!, '..', '..', 'active.json'))).toBe(false)
     expect(calls.find((c) => c.args[0] === 'run')).toBeDefined()
+  })
+
+  test('managed buildx failure cleans up then retries default buildx without managed state', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      daemonId: 'managed-daemon-default-retry',
+      managedBuildxBuildFails: true,
+    })
+    const warnings: string[] = []
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      buildCacheStateDir: join(root, 'build-cache'),
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      acquireBuildCache: acquireManagedBuildCache,
+    })
+
+    expect(result.ok).toBe(true)
+    const relevant = calls.filter(
+      ({ args }) => args[0] === 'build' || (args[0] === 'buildx' && ['rm', 'build'].includes(args[1]!)),
+    )
+    expect(relevant.map(({ args }) => args.slice(0, 2).join(' '))).toEqual([
+      'buildx build',
+      'buildx rm',
+      'buildx build',
+    ])
+    const managed = relevant[0]!
+    const current = relevant[2]!
+    expect(managed.args).toContain('--builder')
+    expect(current.args).not.toContain('--builder')
+    expect(current.args).not.toContain('--cache-from')
+    expect(current.args).not.toContain('--cache-to')
+    expect(current.env?.BUILDX_CONFIG).toBeUndefined()
+    expect(current.dockerfileSnapshot).toContain('# syntax=docker/dockerfile:1.7')
+    expect(warnings).toContain("managed buildx build failed; retrying with Docker's current builder")
+    expect(warnings.join(' ')).not.toContain('managed builder failed')
   })
 
   test('when a build fails on a missing credential helper, retries the same build under a sanitized DOCKER_CONFIG and succeeds', async () => {
@@ -2495,6 +3159,7 @@ describe('start (composition)', () => {
       imageExists: false,
       container: { exists: false },
       buildxAvailable: true,
+      daemonId: 'managed-daemon-credential-retry',
       credHelperMissingUntilSanitized: true,
     })
 
@@ -2504,9 +3169,11 @@ describe('start (composition)', () => {
         cwd: root,
         preferredHostPort: 8973,
         exec,
+        buildCacheStateDir: join(root, 'build-cache'),
         allocatePort: deterministicAllocator,
         ensureDeps: noEnsureDeps,
         ...bypassVerify,
+        acquireBuildCache: acquireManagedBuildCache,
       })
 
       // then it recovers transparently and the container comes up
@@ -2514,12 +3181,19 @@ describe('start (composition)', () => {
       const buildCalls = calls.filter((c) => isBuildCall(c.args))
       // first build runs without the override and fails on the cred helper
       expect(buildCalls[0]?.env?.DOCKER_CONFIG).toBeUndefined()
+      expect(buildCalls[0]?.args).toContain('--builder')
+      expect(buildCalls[0]?.env?.BUILDX_CONFIG).toBeDefined()
       // the retry runs the SAME buildx frontend, now pointed at a sanitized dir
       // (the dir's contents are removed by runImageBuild's cleanup; the sanitize
       // transform itself is asserted in sanitizeDockerConfigJson's unit tests)
       const retry = buildCalls.find((c) => c.env?.DOCKER_CONFIG !== undefined)
       expect(retry).toBeDefined()
       expect(retry?.args.slice(0, 2)).toEqual(['buildx', 'build'])
+      const firstBuilderIndex = buildCalls[0]!.args.indexOf('--builder')
+      const retryBuilderIndex = retry!.args.indexOf('--builder')
+      expect(buildCalls[0]!.args[firstBuilderIndex + 1]).toBe(retry!.args[retryBuilderIndex + 1])
+      expect(buildCalls[0]!.args).toEqual(retry!.args)
+      expect(buildCalls[0]!.env?.BUILDX_CONFIG).toBe(retry!.env?.BUILDX_CONFIG)
       // the retry must NOT point at the user's real config dir
       expect(retry?.env?.DOCKER_CONFIG).not.toBe(dockerCfg)
       // regression guard: the sanitized dir is a DEEP COPY that preserved the
@@ -2530,6 +3204,51 @@ describe('start (composition)', () => {
     } finally {
       if (prevDockerConfig === undefined) delete process.env.DOCKER_CONFIG
       else process.env.DOCKER_CONFIG = prevDockerConfig
+      await rm(dockerCfg, { recursive: true, force: true })
+    }
+  })
+
+  test('default buildx retry applies credential-helper recovery after managed buildx fails', async () => {
+    const dockerCfg = await mkdtemp(join(tmpdir(), 'typeclaw-test-dockercfg-'))
+    await writeFile(join(dockerCfg, 'config.json'), JSON.stringify({ credsStore: 'desktop' }))
+    const previousDockerConfig = process.env.DOCKER_CONFIG
+    process.env.DOCKER_CONFIG = dockerCfg
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      daemonId: 'managed-daemon-default-credential-retry',
+      managedBuildxBuildFails: true,
+      credHelperMissingUntilSanitized: true,
+    })
+
+    try {
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        exec,
+        buildCacheStateDir: join(root, 'build-cache'),
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+        acquireBuildCache: acquireManagedBuildCache,
+      })
+
+      expect(result.ok).toBe(true)
+      const builds = calls.filter(({ args }) => isBuildCall(args))
+      expect(builds).toHaveLength(3)
+      expect(builds[0]!.args).toContain('--builder')
+      expect(builds[1]!.args).not.toContain('--builder')
+      expect(builds[1]!.env?.DOCKER_CONFIG).toBeUndefined()
+      expect(builds[2]!.args).toEqual(builds[1]!.args)
+      expect(builds[2]!.env?.DOCKER_CONFIG).toBeDefined()
+      expect(builds.some(({ args }) => args[0] === 'build')).toBe(false)
+    } finally {
+      if (previousDockerConfig === undefined) delete process.env.DOCKER_CONFIG
+      else process.env.DOCKER_CONFIG = previousDockerConfig
       await rm(dockerCfg, { recursive: true, force: true })
     }
   })
@@ -3477,6 +4196,94 @@ describe('start (composition)', () => {
     },
   )
 
+  test('keeps the daemon-clamped memory limit across the hostd-refresh replan', async () => {
+    // given a 4 GiB Docker VM, which cannot afford the 6 GiB default and so
+    // clamps to 2 GiB after the 2 GiB host headroom
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeTypeclawConfig(root)
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      container: { exists: false },
+      daemonMemTotalBytes: 4 * 1024 * 1024 * 1024,
+    })
+
+    // when start replans at the run boundary to refresh hostd tokens
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      cliEntry: '/placeholder/cli.ts',
+      reuseCurrentHostDaemon: true,
+      currentHostDaemon: {
+        httpPort: 49999,
+        register: async () => ({ ok: true }),
+        deregister: async () => {},
+      },
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then the container actually launches with the clamp, not the
+    // unconditional default the replan would otherwise resolve
+    expect(result.ok).toBe(true)
+    const runCall = calls.filter((c) => c.args[0] === 'run').at(-1)
+    const expected = 2 * 1024 * 1024 * 1024
+    expect(runCall?.args).toContain(`--memory=${expected}`)
+    expect(runCall?.args).toContain(`--memory-swap=${expected}`)
+  })
+
+  test('keeps the daemon-clamped memory limit across the port-conflict retry replan', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeTypeclawConfig(root)
+    const base = fakeDockerExec({
+      imageExists: true,
+      container: { exists: false },
+      daemonMemTotalBytes: 4 * 1024 * 1024 * 1024,
+    })
+    const calls = base.calls
+    let runs = 0
+    // given the first docker run losing a TOCTOU race for the host port
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'run') {
+        runs += 1
+        if (runs === 1) {
+          // Record the attempt without letting the fake create a container:
+          // a live corpse would make cleanup refuse the retry outright.
+          calls.push({ args, dockerfileSnapshot: null, env: options?.env })
+          return {
+            exitCode: 125,
+            stdout: '',
+            stderr:
+              'docker: Error response from daemon: driver failed programming external connectivity: Bind for 127.0.0.1:8973 failed: port is already allocated.',
+          }
+        }
+      }
+      return await base.exec(args, options)
+    }
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then the retry launches with the clamp too
+    expect(result.ok).toBe(true)
+    expect(runs).toBeGreaterThan(1)
+    const runCall = calls.filter((c) => c.args[0] === 'run').at(-1)
+    const expected = 2 * 1024 * 1024 * 1024
+    expect(runCall?.args).toContain(`--memory=${expected}`)
+    expect(runCall?.args).toContain(`--memory-swap=${expected}`)
+  })
+
   test('uses only replacement hostd tokens in the final docker run', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
@@ -3857,6 +4664,100 @@ describe('start (composition)', () => {
     expect(calls[rmIdx]?.args).toEqual(['rm', 'a'.repeat(64)])
   })
 
+  test('warns, removes a stale container with unavailable logs, and launches its replacement', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      container: { exists: true, running: false },
+    })
+    const warnings: string[] = []
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs: async () => ({ ok: false, kind: 'unavailable', reason: 'terminal Docker state' }),
+    })
+
+    expect(result.ok).toBe(true)
+    expect(calls).toContainEqual(expect.objectContaining({ args: ['rm', 'a'.repeat(64)] }))
+    expect(calls.some((call) => call.args[0] === 'run')).toBe(true)
+    expect(warnings).toEqual([expect.stringContaining('no new snapshot was captured')])
+  })
+
+  test('routes the unavailable-logs warning to onWarning on the streaming CLI default', async () => {
+    // given: the exact shape `typeclaw start`/`restart` use — streamOutput left
+    // at its true default AND a collector supplied, so the CLI can print the
+    // warning after its spinner settles instead of under a live one.
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: true, running: false } })
+    const warnings: string[] = []
+    const stderrWrites: string[] = []
+    const write = spyOn(process.stderr, 'write')
+    write.mockImplementation((chunk: unknown) => {
+      stderrWrites.push(String(chunk))
+      return true
+    })
+
+    try {
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        onWarning: (warning) => warnings.push(warning),
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+        archiveLogs: async () => ({ ok: false, kind: 'unavailable', reason: 'terminal Docker state' }),
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warnings).toEqual([expect.stringContaining('no new snapshot was captured')])
+      expect(stderrWrites.some((text) => text.includes('no new snapshot was captured'))).toBe(false)
+    } finally {
+      write.mockRestore()
+    }
+  })
+
+  test('writes the unavailable-logs warning to stderr when no collector is supplied', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: true, running: false } })
+    const stderrWrites: string[] = []
+    const write = spyOn(process.stderr, 'write')
+    write.mockImplementation((chunk: unknown) => {
+      stderrWrites.push(String(chunk))
+      return true
+    })
+
+    try {
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+        archiveLogs: async () => ({ ok: false, kind: 'unavailable', reason: 'terminal Docker state' }),
+      })
+
+      expect(result.ok).toBe(true)
+      expect(stderrWrites.some((text) => text.includes('no new snapshot was captured'))).toBe(true)
+    } finally {
+      write.mockRestore()
+    }
+  })
+
   test('preserves a stale stopped container when its logs cannot be archived', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
@@ -3873,7 +4774,7 @@ describe('start (composition)', () => {
       ensureDeps: noEnsureDeps,
       autoUpgrade: noAutoUpgrade,
       ...bypassVerify,
-      archiveLogs: async () => ({ ok: false, reason: 'disk full' }),
+      archiveLogs: async () => ({ ok: false, kind: 'failed', reason: 'disk full' }),
     })
 
     expect(result.ok).toBe(false)
@@ -4163,7 +5064,7 @@ describe('start (composition)', () => {
     await writePackageJson(root, { typeclaw: '^0.1.0' })
     const { exec, calls } = fakeDockerExec({
       imageExists: true,
-      container: { exists: true, running: false, rmFails: true, rmStderr: 'permission denied' },
+      container: { exists: true, running: false, rmFails: true, rmStderr: 'permission denied', status: 'dead' },
     })
 
     const result = await start({
@@ -4177,8 +5078,12 @@ describe('start (composition)', () => {
     })
 
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.reason).toMatch(/could not be safely inspected or removed/)
+    if (!result.ok) {
+      expect(result.reason).toMatch(/could not be safely inspected or removed/)
+      expect(result.reason).toMatch(/marked this container dead.*busy mount or restart Docker/)
+    }
     expect(calls.find((c) => c.args[0] === 'run')).toBeUndefined()
+    expect(calls.some((call) => call.args.includes('-f') || call.args.includes('--force'))).toBe(false)
   })
 
   test('retries docker run after removing the non-running corpse that holds the name', async () => {
@@ -4299,13 +5204,67 @@ describe('start (composition)', () => {
       ensureDeps: noEnsureDeps,
       autoUpgrade: noAutoUpgrade,
       ...bypassVerify,
-      archiveLogs: async () => ({ ok: false, reason: 'read-only filesystem' }),
+      archiveLogs: async () => ({ ok: false, kind: 'failed', reason: 'read-only filesystem' }),
     })
 
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toMatch(/logs could not be archived.*read-only filesystem.*preserving/i)
     expect(rmCalls).toBe(0)
     expect(runCalls).toBe(1)
+  })
+
+  test('retries a docker run conflict when the failed-run corpse has permanently unavailable logs', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const corpseId = 'c'.repeat(64)
+    let inspectCalls = 0
+    let runCalls = 0
+    let corpseExists = false
+    const warnings: string[] = []
+    const conflictStderr =
+      `docker: Error response from daemon: Conflict. The container name "/x" is already in use by container "${corpseId}". ` +
+      'You have to remove (or rename) that container to be able to reuse that name.'
+    const exec: DockerExec = async (args) => {
+      if (args[0] === 'image' && args[1] === 'inspect') return { exitCode: 0, stdout: '', stderr: '' }
+      if (args[0] === 'inspect') {
+        inspectCalls++
+        if (inspectCalls <= 2 || !corpseExists) return { exitCode: 1, stdout: '', stderr: 'Error: No such container' }
+        if (args.includes('{{.Id}}|{{.State.Running}}')) {
+          return { exitCode: 0, stdout: `${corpseId}|false\n`, stderr: '' }
+        }
+        return { exitCode: 0, stdout: 'false\n', stderr: '' }
+      }
+      if (args[0] === 'rm') {
+        corpseExists = false
+        return { exitCode: 0, stdout: '', stderr: '' }
+      }
+      if (args[0] === 'run') {
+        runCalls++
+        if (runCalls === 1) {
+          corpseExists = true
+          return { exitCode: 125, stdout: '', stderr: conflictStderr }
+        }
+        return { exitCode: 0, stdout: 'fake-id\n', stderr: '' }
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs: async () => ({ ok: false, kind: 'unavailable', reason: 'terminal Docker state' }),
+    })
+
+    expect(result.ok).toBe(true)
+    expect(runCalls).toBe(2)
+    expect(warnings).toEqual([expect.stringContaining('no new snapshot was captured')])
   })
 
   test('does NOT remove a RUNNING same-name container when docker run reports conflict', async () => {

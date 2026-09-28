@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 
-import { SessionManager } from '@mariozechner/pi-coding-agent'
+import { SessionManager } from '@earendil-works/pi-coding-agent'
 
 import { createSession, createSessionWithDispose } from '@/agent'
 import { createProviderAuthReloadable } from '@/agent/auth-reloadable'
@@ -111,6 +111,7 @@ import { installLlmFetchObserver } from './llm-fetch-observer'
 import { loadPlatformExtensions, resolvePlatformExtensionPaths } from './platform-extensions'
 import { createPluginRuntime, type PluginRuntime, type PluginSubagentEntry } from './plugin-runtime'
 import { logResourceReport } from './resource-report'
+import { startResourceSampler } from './resource-sample'
 import { createRuntimeShutdownHandler } from './shutdown'
 import { acquireSubagentCoalesceLease } from './subagent-coalescing'
 
@@ -180,6 +181,9 @@ export type StartAgentOptions = {
   // a refresh that holds the real secrets lock on a gate, proving the boot
   // barrier settles this before any session-producing consumer starts.
   refreshProviderOAuth?: (options: { agentDir: string; log: (message: string) => void }) => Promise<unknown>
+  // Injectable so a test can prove the sampler's disposer is wired into BOTH
+  // teardown paths without waiting out a real sampling interval.
+  startResourceSampler?: () => () => void
 }
 
 export type StartAgentResult = {
@@ -261,6 +265,7 @@ async function startAgentRuntime(
     exportClaudeCredentialsFile = exportClaudeCredentialsFileForAgent,
     exportGithubCliStore = exportGithubCliStoreForAgent,
     refreshProviderOAuth = refreshProviderOAuthForAgent,
+    startResourceSampler: startResourceSamplerFor = startResourceSampler,
   }: StartAgentOptions,
   registerBootCleanup: (cleanup: () => void | Promise<void>) => void,
   drainBootCleanups: () => Promise<void>,
@@ -431,6 +436,16 @@ async function startAgentRuntime(
   // startup index build is itself an OOM path; if it kills the process, this
   // line must already be in the log so the ceiling is still recorded.
   logResourceReport(cwd)
+  // The boot line names the ceiling; this names the climb toward it. Without a
+  // series there is no way to tell a leak from a spike after the fact, which is
+  // exactly the question an OOM post-mortem opens with.
+  //
+  // Registered for boot-failure cleanup the instant it exists, and torn down by
+  // stop() on the normal path. `unref()` only keeps it from holding the process
+  // open; without an explicit clear, repeated start/stop cycles accumulate
+  // intervals that scan /proc and log after their runtime is gone.
+  const stopResourceSampler = startResourceSamplerFor()
+  registerBootCleanup(() => stopResourceSampler())
   const vectorStartupPromise = runVectorStartup(cwd)
   let pluginsLoaded: LoadPluginsResult
   try {
@@ -505,15 +520,15 @@ async function startAgentRuntime(
   //
   // MUST be awaited, and MUST run before the credential-file exporters below
   // and the first session-producing consumer (subagentConsumer.start /
-  // cronConsumer.start / channelManager.start / the websocket server). The SDK
-  // refresh holds SecretsBackend's async file lock across its network request;
-  // getAuthFor()'s synchronous lock read gives up after ~200ms and
-  // process.exit(1)s on ELOCKED. Fire-and-forget here would let a slow refresh
-  // still own the lock when an exporter or consumer reads secrets — worse than
-  // the lazy path. Awaiting behind this barrier guarantees no synchronous auth
-  // reader exists while the refresh owns the lock. Never throws (the wrapper
-  // swallows and logs), so a probe failure can't block boot; a refresh that
-  // hangs on a wedged network hangs the first turn today anyway.
+  // cronConsumer.start / channelManager.start / the websocket server). The
+  // refresh holds SecretsBackend's file lock across its network request
+  // (`CredentialStore.modify`), while the synchronous readers the exporters and
+  // channel hydration use give up after ~200ms and throw ELOCKED.
+  // Fire-and-forget here would let a slow refresh still own the lock when an
+  // exporter or consumer reads secrets — worse than the lazy path. Awaiting
+  // behind this barrier guarantees no synchronous reader races the refresh.
+  // Never throws (the wrapper swallows and logs), so a probe failure can't block
+  // boot; a refresh that hangs on a wedged network hangs the first turn anyway.
   await refreshProviderOAuth({
     agentDir: cwd,
     log: (message) => console.warn(message),
@@ -1015,7 +1030,7 @@ async function startAgentRuntime(
   // session teardown observes it. secrets.json provider credentials are not
   // part of the typeclaw.json config diff, so a rotated key takes effect on
   // `typeclaw reload` only via this dedicated scope. Live sessions captured
-  // their AuthStorage at creation, so teardown recreates them with fresh auth.
+  // their ModelRuntime at creation, so teardown recreates them with fresh auth.
   reloadRegistry.register(
     createProviderAuthReloadable({
       onProviderAuthChanged: () => channelManager.router.tearDownAllLive(),
@@ -1258,6 +1273,7 @@ async function startAgentRuntime(
     // rejection cannot strand process-global listeners or plugin-owned handles
     // into the next `startAgent`.
     try {
+      stopResourceSampler()
       scheduler?.stop()
       cronConsumer.stop()
       subagentConsumer.stop()

@@ -80,12 +80,14 @@ export async function prepareReviewerCheckout(options: {
       ],
       { env: baseEnv },
     )
+
     return {
       // File tools and sandboxed bash both treat /tmp as a per-session virtual
       // root. Return that model-facing path, not the backing path under
       // SESSION_TMP_ROOT; returning the latter makes the file-tool redirect
       // prepend the session root a second time.
       path: modelFacingCheckoutPath(options.sessionId, checkout),
+
       repoSlug: options.repoSlug,
       headSha: options.headSha.toLocaleLowerCase(),
     }

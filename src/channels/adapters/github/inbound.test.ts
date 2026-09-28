@@ -674,6 +674,75 @@ describe('classifyGithubInbound', () => {
         expect(msg?.text).not.toContain('Please review the changes line-by-line')
       })
     })
+
+    describe("reviewOn: 'comment_requested'", () => {
+      const config = {
+        reviewOn: 'comment_requested' as const,
+        authType: 'app' as const,
+        reviewerLogin: 'coltrane-review',
+      }
+
+      it('starts a review from the explicit PR comment command', () => {
+        const msg = classifyGithubInbound(
+          'issue_comment',
+          issueCommentPayload({ pullRequest: true, body: '@coltrane-review review' }),
+          'typeclaw[bot]',
+          config,
+        )
+        expect(msg?.chat).toBe('pr:7')
+        expect(msg?.isBotMention).toBe(true)
+        expect(msg?.text).toContain('Please review the changes line-by-line')
+      })
+
+      it.each([
+        'looks good',
+        '@coltrane-review',
+        '@coltrane-review reviewed',
+        'please @coltrane-review review',
+        '> @coltrane-review review',
+      ])('ignores a comment without the exact command: %s', (body) => {
+        const msg = classifyGithubInbound(
+          'issue_comment',
+          issueCommentPayload({ pullRequest: true, body }),
+          'typeclaw[bot]',
+          config,
+        )
+        expect(msg).toBe(null)
+      })
+
+      it('ignores the command on an issue or edited comment', () => {
+        expect(
+          classifyGithubInbound(
+            'issue_comment',
+            issueCommentPayload({ pullRequest: false, body: '@coltrane-review review' }),
+            'typeclaw[bot]',
+            config,
+          ),
+        ).toBe(null)
+        const edited = issueCommentPayload({ pullRequest: true, body: '@coltrane-review review' })
+        edited.action = 'edited'
+        expect(classifyGithubInbound('issue_comment', edited, 'typeclaw[bot]', config)).toBe(null)
+      })
+
+      it('ignores GitHub reviewer requests and PR review replies', () => {
+        expect(
+          classifyGithubInbound(
+            'pull_request',
+            reviewRequestedPayload({ reviewerLogin: 'coltrane-review' }),
+            'typeclaw[bot]',
+            config,
+          ),
+        ).toBe(null)
+        expect(
+          classifyGithubInbound(
+            'pull_request_review_comment',
+            reviewCommentPayload({ body: '@coltrane-review review' }),
+            'typeclaw[bot]',
+            config,
+          ),
+        ).toBe(null)
+      })
+    })
   })
 })
 
@@ -1178,6 +1247,34 @@ describe('createGithubWebhookHandler', () => {
     ])
 
     expect(count).toBe(1)
+  })
+
+  it('routes only an explicit PR comment in comment_requested mode, even with a broad allowlist', async () => {
+    const routed: InboundMessage[] = []
+    const options: GithubWebhookHandlerOptions = {
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['issue_comment.created', 'pull_request.synchronize', 'pull_request.review_requested'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw[bot]',
+      authType: () => 'app',
+      reviewerLogin: () => 'coltrane-review',
+      reviewOn: () => 'comment_requested',
+      logger,
+      route: (message) => routed.push(message),
+    }
+    const deliveries = [
+      { event: 'issue_comment', payload: issueCommentPayload({ pullRequest: true, body: 'ordinary comment' }) },
+      { event: 'issue_comment', payload: issueCommentPayload({ pullRequest: false, body: '@coltrane-review review' }) },
+      { event: 'pull_request', payload: { ...openedPayload(), action: 'synchronize' } },
+      { event: 'pull_request', payload: reviewRequestedPayload({ reviewerLogin: 'coltrane-review' }) },
+      { event: 'issue_comment', payload: issueCommentPayload({ pullRequest: true, body: '@coltrane-review review' }) },
+    ]
+    for (const [index, item] of deliveries.entries()) {
+      await processVerifiedGithubDelivery(options, { ...item, delivery: `comment-mode-${index}` })
+    }
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.text).toContain('Please review the changes line-by-line')
   })
 })
 

@@ -49,8 +49,12 @@ auth.json
 # Sisyphus working files (plans, scratchpads)
 .sisyphus
 
+
 # Local CocoIndex code-search metadata
 .cocoindex_code/
+# OhMyOpenCode working files (plans, drafts, evidence, notepads)
+.omo/
+
 
 # Local agent state created by tests / dev runs.
 # Anchored with a leading slash so they only match the dev-stage repo root,
@@ -60,3 +64,14 @@ auth.json
 /memory/
 /channels/
 /todo/
+
+
+# Linked git worktrees (`git worktree add .worktrees/<name> -b <branch>`).
+# Root-anchored: they only ever live at the dev-stage repo root. Ignoring them
+# also keeps `bun run lint` / `bun run format` in the main checkout from walking
+# into — and rewriting — other branches' checkouts; inside a linked worktree the
+# checks still cover that worktree's own files. Keep the pattern exactly
+# `/.worktrees/`: oxlint also reads this file from inside a linked worktree, and
+# `.worktrees/**` would match that worktree's own files there, so its lint run
+# would silently check nothing.
+/.worktrees/
