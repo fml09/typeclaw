@@ -11,6 +11,7 @@ JSON Schema–validated. `typeclaw init` scaffolds a `$schema` pointer at `./nod
 | Field                   | Type                                            | Reload                                       | Concept                                                                                  |
 | ----------------------- | ----------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `models`                | `Record<string, ref \| ref[] \| ProfileObject>` | live                                         | model profile → ref, fallback chain, or object with a per-profile `thinkingLevel`        |
+| `customModels`          | `Record<string, CustomModelMeta>`               | live                                         | capability overrides for refs outside the curated model list                             |
 | `port`                  | `number`                                        | restart-required                             | preferred host port; CLI falls back to ephemeral on conflict                             |
 | `mounts`                | `Mount[]`                                       | restart-required                             | host files or directories exposed inside the container                                   |
 | `plugins`               | `string[]`                                      | restart-required                             | plugin module specifiers                                                                 |
@@ -90,6 +91,42 @@ Two well-known profiles ship with a built-in `thinkingLevel`: **`fast` defaults 
 The object form accepts `model` (a single ref) **or** `models` (a single ref or a fallback-chain array) — exactly one — plus the optional `thinkingLevel`. Bare string/array profile values keep working unchanged (no migration needed); a profile only becomes an object when you attach a `thinkingLevel`. Live-reloadable: a change lands on the next session without a container restart.
 
 Set it from the CLI with `typeclaw model set <profile> <ref> --thinking <level>` (targets that profile), or `typeclaw model thinking <level>` for the `default` profile's level. Supported levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `--thinking default` clears a profile's override.
+
+## `customModels`
+
+A ref outside TypeClaw's curated list uses its known provider's transport. If the SDK catalog knows the exact model or its undated alias, TypeClaw inherits the catalog's capabilities. Otherwise the ref defaults to `reasoning: false`. Declare a new model's supported reasoning efforts with `customModels` so the SDK preserves the profile's requested level:
+
+```json
+{
+  "models": {
+    "default": "openai/gpt-5.4-nano",
+    "deep": {
+      "model": "openai-codex/gpt-6.1-sol",
+      "thinkingLevel": "xhigh"
+    }
+  },
+  "customModels": {
+    "openai-codex/gpt-6.1-sol": {
+      "reasoning": true,
+      "thinkingLevelMap": {
+        "off": null,
+        "minimal": null,
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max"
+      }
+    }
+  }
+}
+```
+
+The map's keys are TypeClaw thinking levels; each value is the effort string sent to the provider, or `null` to mark that level unsupported. Use the provider's documented capabilities. The example marks `off` and `minimal` unsupported, so the SDK clamps those requests to `low`. It preserves `xhigh` and the Codex transport sends `reasoning.effort: "xhigh"`.
+
+An explicit `thinkingLevelMap` replaces the catalog map for that ref. Omitted keys use SDK defaults, except `xhigh` and `max`, which require explicit map entries to be supported. Without a custom map, catalog mappings continue to apply. These overrides apply to refs outside TypeClaw's curated list and take effect for new sessions after reload.
+
+Other optional metadata fields are `name`, `reasoning`, `input`, `contextWindow`, `maxTokens`, and `cost`. Set only the fields whose capabilities you need to override.
 
 ## `network`
 

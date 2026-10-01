@@ -620,6 +620,17 @@ const tunnelsArraySchema = z
     }
   })
 
+// Mirrors pi-coding-agent's `ThinkingLevel`. Kept as a local enum (rather than
+// importing the SDK type) so the schema owns the canonical value list and zod
+// can validate `typeclaw.json` without a runtime SDK dependency.
+export const thinkingLevelSchema = z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+export type ThinkingLevel = z.infer<typeof thinkingLevelSchema>
+
+const customModelThinkingLevelMapSchema = z.partialRecord(
+  thinkingLevelSchema,
+  z.string().min(1).nullable(),
+) satisfies z.ZodType<NonNullable<Model<KnownApi>['thinkingLevelMap']>>
+
 const customModelCostSchema = z
   .object({
     input: z.number().optional(),
@@ -633,6 +644,7 @@ export const customModelMetaSchema = z
   .object({
     name: z.string().min(1).optional(),
     reasoning: z.boolean().optional(),
+    thinkingLevelMap: customModelThinkingLevelMapSchema.optional(),
     input: z.array(z.string().min(1)).optional(),
     contextWindow: z.number().optional(),
     maxTokens: z.number().optional(),
@@ -679,13 +691,6 @@ function asModelRef(value: string): ModelRef {
 // level. `migrateLegacyConfigShape` rewrites that to `models: { default: ... }`
 // on first load (and writes the result back to disk + commits via
 // `persistMigratedConfig`), so every downstream consumer sees the new shape.
-
-// Mirrors pi-coding-agent's `ThinkingLevel`. Kept as a local enum (rather than
-// importing the SDK type) so the schema owns the canonical value list and zod
-// can validate `typeclaw.json` without a runtime SDK dependency.
-
-export const thinkingLevelSchema = z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
-export type ThinkingLevel = z.infer<typeof thinkingLevelSchema>
 
 // Reject exact duplicates in a chain — retrying the same ref after the same
 // class of failure is almost certainly a config typo, and silently deduping
@@ -868,11 +873,12 @@ export function resolveModel(ref: KnownModelRef | ModelRef | string): Model<Know
   // `reasoning` capability, so a dated Sonnet 5 alias must inherit that too.
   // That entry's compat and thinkingLevelMap are used, minus
   // `allowedFallbackModels` (see the Fable 5 record) and `supportsStrictTools`
-  // (see the Anthropic records in providers.ts). Without a catalog match
-  // `thinkingLevelMap` is deliberately not carried: it varies per model even
-  // within one provider, so copying the template's would be a guess.
+  // (see the Anthropic records in providers.ts). An explicit `customModels`
+  // thinkingLevelMap replaces the catalog map. Without either, the map stays
+  // absent: copying the provider template's would guess model capabilities.
   const builtin = findBuiltinModel(providerId, modelId)
   const catalogMetadata = builtin !== undefined && builtin.api === template.api ? builtin : undefined
+  const thinkingLevelMap = meta?.thinkingLevelMap ?? catalogMetadata?.thinkingLevelMap
   let compat = template.compat
   if (catalogMetadata !== undefined) {
     const catalogCompat: Record<string, unknown> | undefined =
@@ -889,7 +895,7 @@ export function resolveModel(ref: KnownModelRef | ModelRef | string): Model<Know
     baseUrl: provider.baseUrl ?? template.baseUrl,
     api: template.api,
     ...(compat !== undefined ? { compat } : {}),
-    ...(catalogMetadata?.thinkingLevelMap !== undefined ? { thinkingLevelMap: catalogMetadata.thinkingLevelMap } : {}),
+    ...(thinkingLevelMap !== undefined ? { thinkingLevelMap } : {}),
     name: meta?.name ?? catalogMetadata?.name ?? modelId,
     reasoning: meta?.reasoning ?? catalogMetadata?.reasoning ?? false,
     input: resolveCustomModelInput(meta?.input, catalogMetadata?.input),

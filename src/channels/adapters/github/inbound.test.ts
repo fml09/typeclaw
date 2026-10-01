@@ -695,11 +695,60 @@ describe('classifyGithubInbound', () => {
       })
 
       it.each([
+        '  @COLTRANE-REVIEW REVIEW focus on the migration\r\n',
+        '@coltrane-review review. Focus on the migration',
+        '@coltrane-review 리뷰해줘\r\n',
+        '@coltrane-review 리뷰해주세요',
+        '@coltrane-review 리뷰해 주세요.',
+        '@coltrane-review 리뷰 부탁드립니다! 변경된 파일을 확인해 주세요.',
+        '@coltrane-review レビューしてください。',
+        '@coltrane-review 请审查',
+        '@coltrane-review revisa por favor',
+        '@coltrane-review relis ce PR',
+        '@coltrane-review rivedi questo PR',
+        '@coltrane-review revise por favor',
+        '@coltrane-review bitte prüfen',
+        '@coltrane-review PRÜFE bitte',
+        '@coltrane-review pru\u0308fe bitte',
+        '@coltrane-review проверь пожалуйста',
+        '@coltrane-review راجع من فضلك',
+        '@coltrane-review कृपया समीक्षा करें',
+        '@coltrane-review lütfen incele',
+        '@coltrane-review vui lòng xem xét',
+        '@coltrane-review tolong tinjau',
+      ])('starts a review from an explicit multilingual command: %s', (body) => {
+        const msg = classifyGithubInbound(
+          'issue_comment',
+          issueCommentPayload({ pullRequest: true, body }),
+          'typeclaw[bot]',
+          config,
+        )
+        expect(msg?.chat).toBe('pr:7')
+        expect(msg?.isBotMention).toBe(true)
+        expect(msg?.suppressSticky).toBe(true)
+        expect(msg?.text).toContain('Please review the changes line-by-line')
+        expect(msg?.text).toContain(body)
+      })
+
+      it.each([
         'looks good',
         '@coltrane-review',
         '@coltrane-review reviewed',
+        '@coltrane-review-other 리뷰해줘',
+        '@someone-else 리뷰해줘',
+        '@coltrane-review 리뷰',
+        '@coltrane-review 리뷰 하지마',
+        '@coltrane-review 리뷰하지 마세요',
+        '@coltrane-review 리뷰해줘서 고마워',
+        '@coltrane-review 리뷰해주세요라고 했어요',
+        '@coltrane-review レビューしないで',
+        '@coltrane-review 不要审查',
+        '@coltrane-review no revises',
+        '@coltrane-review reviewed. Thank you',
         'please @coltrane-review review',
         '> @coltrane-review review',
+        '> @coltrane-review 리뷰해줘',
+        '```\n@coltrane-review 리뷰해줘\n```',
       ])('ignores a comment without the exact command: %s', (body) => {
         const msg = classifyGithubInbound(
           'issue_comment',
@@ -1247,6 +1296,108 @@ describe('createGithubWebhookHandler', () => {
     ])
 
     expect(count).toBe(1)
+  })
+
+  it('routes the Korean review request received on bodmi-appointment through the signed webhook', async () => {
+    const routed: InboundMessage[] = []
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['issue_comment.created', 'pull_request.converted_to_draft'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw[bot]',
+      authType: () => 'app',
+      reviewerLogin: () => 'coltrane-review',
+      reviewOn: () => 'comment_requested',
+      logger,
+      route: (message) => routed.push(message),
+    })
+    const payload = issueCommentPayload({ pullRequest: true, body: '@coltrane-review 리뷰해줘\r\n' })
+    payload.repository = { name: 'bodmi-appointment', owner: { login: 'fml09' } }
+    Object.assign(payload.issue as Record<string, unknown>, { number: 1395 })
+    Object.assign(payload.comment as Record<string, unknown>, {
+      id: 5922676847,
+      created_at: '2026-10-01T01:09:52Z',
+      user: { login: 'fml09', id: 91314791, type: 'User' },
+    })
+    const response = await handler(signedRequest(JSON.stringify(payload), 'issue_comment', 'bodmi-korean-review'))
+
+    expect(response.status).toBe(200)
+    expect(routed).toHaveLength(1)
+    expect(routed[0]).toMatchObject({
+      workspace: 'fml09/bodmi-appointment',
+      chat: 'pr:1395',
+      externalMessageId: '5922676847',
+      authorId: '91314791',
+      authorName: 'fml09',
+      isBotMention: true,
+      suppressSticky: true,
+    })
+  })
+
+  it('logs unsupported leading reviewer commands without logging comment bodies', async () => {
+    const info: string[] = []
+    const routed: InboundMessage[] = []
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['issue_comment.created'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw[bot]',
+      authType: () => 'app',
+      reviewerLogin: () => 'coltrane-review',
+      reviewOn: () => 'comment_requested',
+      logger: { ...logger, info: (message) => info.push(message) },
+      route: (message) => routed.push(message),
+    })
+    const payload = issueCommentPayload({ pullRequest: true, body: '@coltrane-review unsupported-private-text' })
+    await handler(signedRequest(JSON.stringify(payload), 'issue_comment', 'unsupported-review-command'))
+
+    expect(routed).toHaveLength(0)
+    expect(info).toHaveLength(1)
+    expect(info[0]).toContain('comment review skipped acme/project#7')
+    expect(info[0]).toContain('comment=99')
+    expect(info[0]).toContain('review.on=comment_requested')
+    expect(info[0]).toContain('@coltrane-review review')
+    expect(info[0]).not.toContain('unsupported-private-text')
+  })
+
+  it('keeps unrelated, quoted, non-PR, edited, and self-authored review comments out of command diagnostics', async () => {
+    const info: string[] = []
+    const routed: InboundMessage[] = []
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['issue_comment.created', 'issue_comment.edited'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw[bot]',
+      authType: () => 'app',
+      reviewerLogin: () => 'coltrane-review',
+      reviewOn: () => 'comment_requested',
+      logger: { ...logger, info: (message) => info.push(message) },
+      route: (message) => routed.push(message),
+    })
+    const edited = issueCommentPayload({ pullRequest: true, body: '@coltrane-review 리뷰해줘' })
+    edited.action = 'edited'
+    const selfAuthored = issueCommentPayload({ pullRequest: true, body: '@coltrane-review 리뷰해줘' })
+    Object.assign(selfAuthored.comment as Record<string, unknown>, {
+      user: { login: 'typeclaw[bot]', id: 99, type: 'Bot' },
+    })
+    const payloads = [
+      issueCommentPayload({ pullRequest: true, body: 'ordinary comment' }),
+      issueCommentPayload({ pullRequest: true, body: '@coltrane-review-other 리뷰해줘' }),
+      issueCommentPayload({ pullRequest: true, body: '> @coltrane-review 리뷰해줘' }),
+      issueCommentPayload({ pullRequest: false, body: '@coltrane-review unsupported' }),
+      edited,
+      selfAuthored,
+    ]
+    for (const [index, payload] of payloads.entries()) {
+      await handler(signedRequest(JSON.stringify(payload), 'issue_comment', `noncommand-${index}`))
+    }
+
+    expect(routed).toHaveLength(0)
+    expect(info.filter((message) => message.includes('comment review skipped'))).toEqual([])
+    expect(info.some((message) => message.includes('dropped self-authored'))).toBe(true)
   })
 
   it('routes only an explicit PR comment in comment_requested mode, even with a broad allowlist', async () => {

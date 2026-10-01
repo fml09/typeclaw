@@ -128,10 +128,40 @@ Reviews fire on the event named in `review.on` (default `review_requested`).
 - Team-reviewer requests are honored when the bot is a member of the requested team.
 
 Set `review.on` to `comment_requested` to start a review only from a newly
-created PR conversation comment whose first text is `@<reviewerLogin> review`
-(for example, `@coltrane-review review`). Ordinary comments, GitHub's reviewer
-request UI, review-thread replies, and pushes do not start a session in this
-mode. Include `issue_comment.created` in `eventAllowlist`; keep
+created PR conversation comment that starts with `@<reviewerLogin> <command>`.
+For example, `@coltrane-review review`, `@coltrane-review 리뷰해줘`, and
+`@coltrane-review 리뷰해주세요` all request a review. The mention and command
+are case-insensitive. A command must end or be followed by whitespace or request
+punctuation (`.`, `!`, `?`, `。`, `！`, `？`); additional instructions may follow.
+
+Supported commands:
+
+| Language   | Commands                                                                                                                          |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| English    | `review`                                                                                                                          |
+| Korean     | `리뷰해줘`, `리뷰해주세요`, `리뷰해 주세요`, `리뷰 해줘`, `리뷰 해주세요`, `리뷰 해 주세요`, `리뷰 부탁해요`, `리뷰 부탁드립니다` |
+| Spanish    | `revisa`                                                                                                                          |
+| French     | `relis`, `relisez`                                                                                                                |
+| Italian    | `rivedi`                                                                                                                          |
+| Portuguese | `revise`                                                                                                                          |
+| German     | `prüfe`, `bitte prüfen`                                                                                                           |
+| Russian    | `проверь`                                                                                                                         |
+| Chinese    | `请审查`, `审查一下`                                                                                                              |
+| Japanese   | `レビューして`, `レビューしてください`, `レビューお願いします`                                                                    |
+| Arabic     | `راجع`                                                                                                                            |
+| Hindi      | `समीक्षा करें`, `कृपया समीक्षा करें`                                                                                              |
+| Turkish    | `incele`, `lütfen incele`                                                                                                         |
+| Vietnamese | `xem xét`, `vui lòng xem xét`                                                                                                     |
+| Indonesian | `tinjau`, `tolong tinjau`                                                                                                         |
+
+This is an explicit command grammar. A bare mention, `리뷰`,
+`리뷰해줘서 고마워`, or a quoted command does not request a review. A created
+PR comment starting with the reviewer mention but an unsupported command is
+skipped with an operator log naming the repository, PR, comment ID, and canonical
+`@<reviewerLogin> review` syntax. The log omits the comment body.
+
+Ordinary comments, GitHub's reviewer request UI, review-thread replies, and
+pushes do not start a session in this mode. Include `issue_comment.created` in `eventAllowlist`; keep
 `pull_request.converted_to_draft` if an in-progress review should stop when
 the PR becomes a draft.
 

@@ -34,7 +34,8 @@ export type GithubWebhookHandlerOptions = {
   // review; the github skill keys off that note to downgrade approve→COMMENT.
   allowApprove?: () => boolean
   // Which GitHub event starts a code review. `comment_requested` admits only a
-  // new PR issue comment with an explicit `@reviewerLogin review` command.
+  // new PR issue comment with an explicit leading reviewer mention and a
+  // supported review command (for example `review` or `리뷰해줘`).
   // Orthogonal to eventAllowlist (the outer webhook admission gate).
   reviewOn?: () => GithubReviewOn
   route: (message: InboundMessage) => void
@@ -194,6 +195,7 @@ export async function processVerifiedGithubDelivery(
     authType: options.authType?.() ?? 'pat',
     reviewerLogin: options.reviewerLogin?.(),
     reviewOn: options.reviewOn?.() ?? 'review_requested',
+    logger: options.logger,
     ...(reviewCommentParent !== null ? { reviewCommentParent } : {}),
   })
   if (classified === null) return
@@ -694,6 +696,7 @@ export function classifyGithubInbound(
     reviewerLogin?: string
     reviewOn?: GithubReviewOn
     reviewCommentParent?: ReviewCommentParent
+    logger?: Pick<GithubInboundLogger, 'info'>
   },
 ): InboundMessage | null {
   const repository = readRepository(payload)
@@ -949,7 +952,7 @@ function classifyCommentReviewRequest(
   payload: Record<string, unknown>,
   repository: { owner: string; name: string },
   selfLogin: string | null,
-  options: { authType?: 'pat' | 'app'; reviewerLogin?: string },
+  options: { authType?: 'pat' | 'app'; reviewerLogin?: string; logger?: Pick<GithubInboundLogger, 'info'> },
 ): InboundMessage | null {
   if (readString(payload, 'action') !== 'created' || selfLogin === null) return null
   const issue = readRecord(payload.issue)
@@ -962,7 +965,15 @@ function classifyCommentReviewRequest(
   if (number === null || id === null || author === null || body === null) return null
   const reviewerLogin =
     resolveDecoyReviewerLogin(selfLogin, options.authType ?? 'pat', options.reviewerLogin) ?? selfLogin
-  if (!hasReviewCommand(body, reviewerLogin)) return null
+  const command = readLeadingReviewCommand(body, reviewerLogin)
+  if (command === null) return null
+  if (!hasReviewCommand(command)) {
+    options.logger?.info(
+      `[github] comment review skipped ${repository.owner}/${repository.name}#${number} comment=${id}: ` +
+        `unsupported command in review.on=comment_requested; use "@${reviewerLogin} review"`,
+    )
+    return null
+  }
 
   const title = readString(issue, 'title') ?? `#${number}`
   return buildInbound(
@@ -987,9 +998,71 @@ function classifyCommentReviewRequest(
   )
 }
 
-function hasReviewCommand(body: string, reviewerLogin: string): boolean {
+function readLeadingReviewCommand(body: string, reviewerLogin: string): string | null {
   const escapedLogin = reviewerLogin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`^\\s*@${escapedLogin}\\s+review(?:\\s|$)`, 'i').test(body)
+  const mention = new RegExp(`^\\s*@${escapedLogin}(?:\\s+|$)`, 'i').exec(body)
+  return mention === null ? null : body.slice(mention[0].length)
+}
+
+// Explicit commands, rather than an intent classifier. Keep the English
+// command's existing same-line instructions, and use Unicode-safe separators:
+// an ASCII \b would reject Korean/CJK commands or accept a longer Latin word.
+const REVIEW_COMMAND_ALIASES = [
+  // English
+  'review',
+  // Korean
+  '리뷰해줘',
+  '리뷰해주세요',
+  '리뷰해 주세요',
+  '리뷰 해줘',
+  '리뷰 해주세요',
+  '리뷰 해 주세요',
+  '리뷰 부탁해요',
+  '리뷰 부탁드립니다',
+  // Spanish
+  'revisa',
+  // French
+  'relis',
+  'relisez',
+  // Italian
+  'rivedi',
+  // Portuguese
+  'revise',
+  // German
+  'prüfe',
+  'bitte prüfen',
+  // Russian
+  'проверь',
+  // Chinese
+  '请审查',
+  '审查一下',
+  // Japanese
+  'レビューして',
+  'レビューしてください',
+  'レビューお願いします',
+  // Arabic
+  'راجع',
+  // Hindi
+  'समीक्षा करें',
+  'कृपया समीक्षा करें',
+  // Turkish
+  'incele',
+  'lütfen incele',
+  // Vietnamese
+  'xem xét',
+  'vui lòng xem xét',
+  // Indonesian
+  'tinjau',
+  'tolong tinjau',
+] as const
+
+function hasReviewCommand(command: string): boolean {
+  const normalized = command.normalize('NFC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase()
+  return REVIEW_COMMAND_ALIASES.some((alias) => {
+    if (!normalized.startsWith(alias)) return false
+    const next = normalized[alias.length]
+    return next === undefined || /[\s.!?。！？]/u.test(next)
+  })
 }
 
 type ReviewRequestInput = {

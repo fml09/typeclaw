@@ -5,8 +5,16 @@ import { createServer, type Server } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { normalizeContext, type Context, type Model, type ThinkingLevel } from '@earendil-works/pi-ai'
+import {
+  clampThinkingLevel,
+  getSupportedThinkingLevels,
+  normalizeContext,
+  type Context,
+  type Model,
+  type ThinkingLevel,
+} from '@earendil-works/pi-ai'
 import { streamSimple } from '@earendil-works/pi-ai/api/anthropic-messages'
+import { streamSimple as streamCodexSimple } from '@earendil-works/pi-ai/api/openai-codex-responses'
 import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all'
 
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
@@ -72,6 +80,31 @@ async function captureAnthropicPayload(
     if (captured !== undefined) break
   }
 
+  if (captured === undefined) throw new Error('onPayload never fired — adapter path changed')
+  return captured
+}
+
+async function captureCodexPayload(
+  model: Model<'openai-codex-responses'>,
+  reasoning: ThinkingLevel,
+): Promise<Record<string, unknown>> {
+  const context: Context = {
+    systemPrompt: 'Offline model capability test.',
+    messages: [{ role: 'user', content: 'Hi', timestamp: 0 }],
+    tools: [],
+  }
+  const fakeClaims = { 'https://api.openai.com/auth': { chatgpt_account_id: 'offline-test' } }
+  const apiKey = `offline.${Buffer.from(JSON.stringify(fakeClaims)).toString('base64')}.offline`
+  let captured: Record<string, unknown> | undefined
+  const stream = streamCodexSimple(model, normalizeContext(context), {
+    apiKey,
+    reasoning,
+    onPayload: (payload) => {
+      captured = payload as Record<string, unknown>
+      throw new Error('payload-captured')
+    },
+  })
+  await stream.result()
   if (captured === undefined) throw new Error('onPayload never fired — adapter path changed')
   return captured
 }
@@ -260,6 +293,39 @@ describe('customModels field', () => {
     expect(parsed.customModels['openai/gpt-6-live']?.name).toBe('GPT-6 Live')
     expect(parsed.customModels['openai/gpt-6-live']?.input).toEqual(['text', 'image'])
   })
+
+  test('accepts sparse thinking-level mappings with unsupported levels marked null', () => {
+    const ref = 'openai-codex/gpt-6.1-sol'
+    const parsed = configSchema.parse({
+      models: { default: ref },
+      customModels: { [ref]: { reasoning: true, thinkingLevelMap: { off: null, xhigh: 'xhigh' } } },
+    })
+    expect(parsed.customModels[ref]?.thinkingLevelMap).toEqual({ off: null, xhigh: 'xhigh' })
+  })
+
+  test.each([
+    ['boolean', false],
+    ['number', 42],
+    ['empty string', ''],
+    ['array', []],
+    ['object', {}],
+  ])('rejects invalid thinking-level mapping value (%s)', (_label, value) => {
+    expect(() =>
+      configSchema.parse({
+        models: { default: VALID_MODEL },
+        customModels: { 'openai-codex/gpt-6.1-sol': { thinkingLevelMap: { xhigh: value } } },
+      }),
+    ).toThrow()
+  })
+
+  test('rejects unknown thinking-level mapping keys', () => {
+    expect(() =>
+      configSchema.parse({
+        models: { default: VALID_MODEL },
+        customModels: { 'openai-codex/gpt-6.1-sol': { thinkingLevelMap: { ultra: 'xhigh' } } },
+      }),
+    ).toThrow()
+  })
 })
 
 describe('resolveModel', () => {
@@ -288,6 +354,71 @@ describe('resolveModel', () => {
     expect(model.contextWindow).toBe(400000)
     expect(model.maxTokens).toBe(128000)
   })
+
+  test('preserves explicit xhigh reasoning for an uncatalogued Codex model through the transport', async () => {
+    const ref = 'openai-codex/gpt-6.1-sol'
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-resolve-model-'))
+    const raw = {
+      models: { default: VALID_MODEL, deep: { model: ref, thinkingLevel: 'xhigh' } },
+      customModels: {
+        [ref]: {
+          reasoning: true,
+          thinkingLevelMap: {
+            off: null,
+            minimal: null,
+            low: 'low',
+            medium: 'medium',
+            high: 'high',
+            xhigh: 'xhigh',
+            max: 'max',
+          },
+        },
+      },
+    }
+    try {
+      await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify(raw))
+      reloadConfig(cwd)
+      const model = resolveModel(ref) as Model<'openai-codex-responses'>
+      const thinkingLevel = configSchema.parse(raw).models.deep!.thinkingLevel
+      if (thinkingLevel !== 'xhigh') throw new Error('Expected deep profile to request xhigh')
+
+      expect(getSupportedThinkingLevels(model)).toContain('xhigh')
+      expect(clampThinkingLevel(model, 'off')).toBe('low')
+      expect(clampThinkingLevel(model, 'minimal')).toBe('low')
+      expect(clampThinkingLevel(model, thinkingLevel)).toBe('xhigh')
+      const payload = await captureCodexPayload(model, thinkingLevel)
+      expect(payload.model).toBe('gpt-6.1-sol')
+      expect(payload.reasoning).toEqual({ effort: 'xhigh', summary: 'auto' })
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('explicit thinking-level mappings override catalog mappings including null support markers', async () => {
+    const ref = 'anthropic/claude-sonnet-5-20260701'
+    const catalog = getBuiltinModel('anthropic', 'claude-sonnet-5')
+    expect(getSupportedThinkingLevels(catalog)).toContain('high')
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-resolve-model-'))
+    try {
+      await writeFile(
+        join(cwd, 'typeclaw.json'),
+        JSON.stringify({
+          models: { default: ref },
+          customModels: { [ref]: { thinkingLevelMap: { high: null, xhigh: 'high' } } },
+        }),
+      )
+      reloadConfig(cwd)
+      const model = resolveModel(ref)
+      expect(model.thinkingLevelMap).toEqual({ high: null, xhigh: 'high' })
+      expect(getSupportedThinkingLevels(model)).not.toContain('high')
+      expect(clampThinkingLevel(model, 'high')).toBe('xhigh')
+      expect(model.reasoning).toBe(catalog.reasoning)
+      expect(model.contextWindow).toBe(catalog.contextWindow)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
   test('uses same-transport catalog metadata for dated custom Anthropic refs', () => {
     for (const [ref, catalogId] of [
       ['anthropic/claude-sonnet-5-20260701', 'claude-sonnet-5'],
